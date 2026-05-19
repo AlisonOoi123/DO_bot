@@ -83,10 +83,12 @@ try { & $NSSM remove do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 & $NSSM set     do_bot AppRotateBytes   5242880
 & $NSSM set     do_bot AppNoConsole     1
 
+$envExtra = "PYTHONUTF8=1"
 if ($SITE_PACKAGES) {
-    & $NSSM set do_bot AppEnvironmentExtra "PYTHONPATH=$SITE_PACKAGES"
+    $envExtra = "PYTHONPATH=$SITE_PACKAGES`nPYTHONUTF8=1"
     Write-Host "   PYTHONPATH set to: $SITE_PACKAGES" -ForegroundColor Gray
 }
+& $NSSM set do_bot AppEnvironmentExtra $envExtra
 
 # -- ngrok service --
 $ngrokCmd  = Get-Command ngrok -ErrorAction SilentlyContinue
