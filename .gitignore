@@ -21,3 +21,6 @@ data/ZSDOROUTEWRH-bot.xlsx
 # OS
 .DS_Store
 Thumbs.db
+
+# Log files (keep the directory via logs/.gitkeep)
+logs/*.log
