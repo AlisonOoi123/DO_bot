@@ -1,7 +1,8 @@
 """
 WhatsApp Webhook Server — Meta Cloud API
-Run: python app.py
-Requires: pip install flask requests pandas openpyxl
+Run (dev):        python app.py
+Run (production): gunicorn --workers 1 --threads 8 --timeout 120 app:app
+Requires: pip install -r requirements.txt
 """
 
 import os
@@ -37,7 +38,8 @@ META_VERIFY_TOKEN   = os.environ.get("META_VERIFY_TOKEN", "eslorrybot2026")
 PUBLIC_BASE_URL     = os.environ.get("PUBLIC_BASE_URL", "http://localhost:5000")
 
 if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
-    print("⚠️  WARNING: META_ACCESS_TOKEN or META_PHONE_NUMBER_ID not set in config.txt")
+    print("⚠️  WARNING: META_ACCESS_TOKEN or META_PHONE_NUMBER_ID not set. "
+          "Set them in config.txt (dev) or as environment variables (production).")
 
 
 # ── Webhook verification (GET) — Meta calls this to verify your endpoint ──────
@@ -344,4 +346,5 @@ if __name__ == "__main__":
     # use_reloader=False is CRITICAL — Flask watchdog restarts the server
     # whenever any file in the project dir changes (including Excel writes),
     # which kills in-flight requests and loses all session data.
-    app.run(debug=True, port=5000, use_reloader=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port, use_reloader=False)
