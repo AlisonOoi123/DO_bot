@@ -91,11 +91,39 @@ if ($SITE_PACKAGES) {
 & $NSSM set do_bot AppEnvironmentExtra $envExtra
 
 # -- ngrok service --
-$ngrokCmd  = Get-Command ngrok -ErrorAction SilentlyContinue
-$ngrokPath = if ($ngrokCmd) { $ngrokCmd.Source } else { "$APP_DIR\ngrok.exe" }
-if (-not (Test-Path $ngrokPath)) {
-    Write-Host "   WARNING: ngrok not found at $ngrokPath" -ForegroundColor Yellow
-    Write-Host "   Download from https://ngrok.com/download and extract ngrok.exe to $APP_DIR" -ForegroundColor Yellow
+# Search for ngrok in PATH, then common install locations (Scoop, Chocolatey, WinGet, etc.)
+function Find-NgrokPath {
+    $cmd = Get-Command ngrok -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $fixed = @(
+        "$APP_DIR\ngrok.exe",
+        "$env:USERPROFILE\scoop\shims\ngrok.exe",
+        "$env:USERPROFILE\AppData\Local\ngrok\ngrok.exe",
+        "$env:USERPROFILE\ngrok.exe",
+        "C:\ProgramData\chocolatey\bin\ngrok.exe",
+        "C:\Program Files\ngrok\ngrok.exe",
+        "C:\ngrok\ngrok.exe"
+    )
+    foreach ($c in $fixed) {
+        if (Test-Path $c) { return $c }
+    }
+
+    # WinGet installs into a versioned subdirectory - use wildcard
+    $wingetMatch = Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ngrok.Ngrok*\ngrok.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($wingetMatch) { return $wingetMatch }
+
+    return $null
+}
+
+$ngrokPath = Find-NgrokPath
+if (-not $ngrokPath) {
+    $ngrokPath = "$APP_DIR\ngrok.exe"
+    Write-Host "   WARNING: ngrok not found. Download from https://ngrok.com/download" -ForegroundColor Yellow
+    Write-Host "            and extract ngrok.exe to $APP_DIR, then re-run this script." -ForegroundColor Yellow
+} else {
+    Write-Host "   ngrok found: $ngrokPath" -ForegroundColor Gray
 }
 
 try { & $NSSM stop   ngrok_do_bot         2>$null } catch {}; $LASTEXITCODE = 0

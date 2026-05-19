@@ -81,9 +81,44 @@ if (Test-Path "$APP_DIR\config.txt") {
     Write-Host "   MISSING -- config.txt not found" -ForegroundColor Red
 }
 
-# -- 6. Check ngrok config -----------------------------------------------------
+# -- 6. Check ngrok executable -------------------------------------------------
 Write-Host ""
-Write-Host "[6] ngrok_do_bot.yml" -ForegroundColor Yellow
+Write-Host "[6] ngrok executable" -ForegroundColor Yellow
+$ngrokFound = $null
+$ngrokCmd = Get-Command ngrok -ErrorAction SilentlyContinue
+if ($ngrokCmd) { $ngrokFound = $ngrokCmd.Source }
+if (-not $ngrokFound) {
+    $candidates = @(
+        "$APP_DIR\ngrok.exe",
+        "$env:USERPROFILE\scoop\shims\ngrok.exe",
+        "$env:USERPROFILE\AppData\Local\ngrok\ngrok.exe",
+        "$env:USERPROFILE\ngrok.exe",
+        "C:\ProgramData\chocolatey\bin\ngrok.exe",
+        "C:\Program Files\ngrok\ngrok.exe",
+        "C:\ngrok\ngrok.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { $ngrokFound = $c; break } }
+}
+if (-not $ngrokFound) {
+    $wingetMatch = Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ngrok.Ngrok*\ngrok.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($wingetMatch) { $ngrokFound = $wingetMatch }
+}
+if ($ngrokFound) {
+    Write-Host "   OK -- $ngrokFound" -ForegroundColor Green
+    $ngrokVer = & $ngrokFound version 2>&1 | Select-Object -First 1
+    Write-Host "   Version: $ngrokVer" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "   TIP: If the ngrok_do_bot service was set up before ngrok was found," -ForegroundColor Yellow
+    Write-Host "        re-run setup_windows.ps1 so the service path is updated." -ForegroundColor Yellow
+} else {
+    Write-Host "   MISSING -- ngrok.exe not found in PATH or common locations" -ForegroundColor Red
+    Write-Host "   Download: https://ngrok.com/download  then place ngrok.exe in $APP_DIR" -ForegroundColor Red
+}
+
+# -- 7. Check ngrok config -----------------------------------------------------
+Write-Host ""
+Write-Host "[7] ngrok_do_bot.yml" -ForegroundColor Yellow
 if (Test-Path "$APP_DIR\ngrok_do_bot.yml") {
     Write-Host "   OK -- file exists" -ForegroundColor Green
     $hasToken = Select-String -Path "$APP_DIR\ngrok_do_bot.yml" -Pattern "authtoken:\s*\S+" -Quiet
@@ -96,9 +131,9 @@ if (Test-Path "$APP_DIR\ngrok_do_bot.yml") {
     Write-Host "   MISSING -- copy ngrok_do_bot.yml.example to ngrok_do_bot.yml and fill in your token" -ForegroundColor Red
 }
 
-# -- 7. NSSM service registration ----------------------------------------------
+# -- 8. NSSM service registration ----------------------------------------------
 Write-Host ""
-Write-Host "[7] NSSM service registration" -ForegroundColor Yellow
+Write-Host "[8] NSSM service registration" -ForegroundColor Yellow
 if (Test-Path $NSSM) {
     foreach ($svc in @("do_bot", "ngrok_do_bot")) {
         $status = & $NSSM status $svc 2>&1
@@ -108,9 +143,9 @@ if (Test-Path $NSSM) {
     Write-Host "   nssm.exe not found -- run setup_windows.ps1 first" -ForegroundColor Red
 }
 
-# -- 8. Show recent error logs -------------------------------------------------
+# -- 9. Show recent error logs -------------------------------------------------
 Write-Host ""
-Write-Host "[8] Recent error log output" -ForegroundColor Yellow
+Write-Host "[9] Recent error log output" -ForegroundColor Yellow
 foreach ($log in @("do_bot_error.log", "ngrok_error.log")) {
     $path = "$APP_DIR\logs\$log"
     if (Test-Path $path) {
