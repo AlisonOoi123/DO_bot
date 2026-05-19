@@ -413,7 +413,9 @@ def handle_message(phone: str, text: str = None,
         broken_map2  = get_broken_lorries()
         batch        = sess.get(f"_maint_batch_{action}", [])
 
-        all_items2 = []
+        all_items2   = []   # unselected lorries
+        selected_rows = []  # already-batched lorries (shown at top with toggle)
+
         for _, r in engine2.eligible_lorries.iterrows():
             p2        = str(r["LORRY"]).upper()
             cap2      = float(r["TON"])
@@ -423,7 +425,6 @@ def handle_message(phone: str, text: str = None,
             if action == "RELEASE" and not is_blocked2: continue
             if action == "FIXED"   and not is_broken2:  continue
             if action == "BROKEN"  and is_broken2:  continue
-            if p2 in batch: continue   # already queued — hide from list
             if is_broken2:
                 rep2  = broken_map2[p2]
                 desc2 = f"{cap2}T | Broken->{rep2}" if rep2 != "NONE" else f"{cap2}T | Broken"
@@ -431,11 +432,20 @@ def handle_message(phone: str, text: str = None,
                 desc2 = f"{cap2}T | Blocked"
             else:
                 desc2 = f"{cap2}T | Available"
-            all_items2.append({
-                "id":          f"maint_exec {action} {p2}",
-                "title":       p2,
-                "description": desc2[:72],
-            })
+
+            if p2 in batch:
+                # Already selected — show with checkmark and allow tap-to-deselect
+                selected_rows.append({
+                    "id":          f"maint_toggle {action} {p2}",
+                    "title":       f"[X] {p2}",
+                    "description": f"Tap to deselect | {desc2}"[:72],
+                })
+            else:
+                all_items2.append({
+                    "id":          f"maint_exec {action} {p2}",
+                    "title":       p2,
+                    "description": desc2[:72],
+                })
 
         header_map2 = {
             "BLOCK":   "Block a Lorry",
@@ -452,7 +462,7 @@ def handle_message(phone: str, text: str = None,
                 "BROKEN":  "All lorries already marked as broken.",
             }
             return [
-                f"i {msg_map2.get(action, 'No lorries to show.')}",
+                msg_map2.get(action, "No lorries to show."),
                 {"_type": "buttons", "body": "What would you like to do?",
                  "buttons": [{"id": "lorry_maint", "title": "Back"},
                              {"id": "hi",          "title": "Main Menu"}]},
@@ -460,19 +470,24 @@ def handle_message(phone: str, text: str = None,
 
         list_items2 = []
 
-        # For multi-select actions: if batch non-empty, show Done row first
-        if action in ("RELEASE", "FIXED") and batch:
-            selected_str = ", ".join(batch)
-            list_items2.append({
-                "id":          f"maint_batch_done {action}",
-                "title":       f"Done ({len(batch)} selected)",
-                "description": f"Apply to: {selected_str}"[:72],
-            })
+        # For RELEASE / FIXED: show Done row + selected rows at the top,
+        # then unselected lorries below (paginated)
+        if action in ("RELEASE", "FIXED"):
+            if batch:
+                selected_str = ", ".join(batch)
+                list_items2.append({
+                    "id":          f"maint_batch_done {action}",
+                    "title":       f"Done ({len(batch)} selected)",
+                    "description": f"Confirm: {selected_str}"[:72],
+                })
+            list_items2 += selected_rows   # checked items always visible, no pagination
 
-        # Paginate remaining items (max 9 lorry rows per page to leave room for Done/Next)
-        PER_PAGE2    = 8 if (action in ("RELEASE","FIXED") and batch) else 9
-        total2       = len(all_items2)
-        page2        = int(sess.get("maint_picker_page", {}).get(action, 0))
+        # Paginate unselected items
+        # Reserve rows for: Done (1) + selected rows + Next page (1)
+        reserved    = (1 if batch else 0) + len(selected_rows) + 1   # +1 for possible Next
+        PER_PAGE2   = max(1, 9 - reserved)
+        total2      = len(all_items2)
+        page2       = int(sess.get("maint_picker_page", {}).get(action, 0))
         total_pages2 = max(1, -(-total2 // PER_PAGE2)) if total2 else 1
         page2        = max(0, min(page2, total_pages2 - 1))
         start2       = page2 * PER_PAGE2
@@ -487,12 +502,11 @@ def handle_message(phone: str, text: str = None,
                 "description": f"Showing {start2+1}-{start2+len(chunk2)} of {total2}",
             })
 
-        multi_hint = " (tap multiple, then Done)" if action in ("RELEASE","FIXED") else ""
         body_map2 = {
             "BLOCK":   "Select lorry to block for today:",
             "BROKEN":  "Select lorry to log as broken:",
-            "RELEASE": f"Tap lorries to release{multi_hint}:",
-            "FIXED":   f"Tap lorries to mark as fixed{multi_hint}:",
+            "RELEASE": "Tap lorries to release. [X] = selected. Tap Done when ready:",
+            "FIXED":   "Tap lorries to mark as fixed. [X] = selected. Tap Done when ready:",
         }
 
         return [{
@@ -551,6 +565,19 @@ def handle_message(phone: str, text: str = None,
         }]
         noun = "lorry" if len(batch) == 1 else "lorries"
         return [f"{len(batch)} {noun} {action_label}: {plates_str}"] + follow_up
+
+    # ── Toggle (deselect) a plate that was already queued ────────────────────
+    if cmd_lower.startswith("maint_toggle "):
+        parts = text.strip().split()
+        if len(parts) < 3:
+            return ["Invalid selection."]
+        action    = parts[1].upper()
+        plate     = parts[2].upper()
+        batch_key = f"_maint_batch_{action}"
+        batch     = sess.setdefault(batch_key, [])
+        if plate in batch:
+            batch.remove(plate)
+        return _maint_list(action)
 
     # ── Execute action after tapping a plate ─────────────────────────────────
     if cmd_lower.startswith("maint_exec "):
