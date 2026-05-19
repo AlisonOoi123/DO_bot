@@ -446,3 +446,62 @@ class LorryEngine:
     @staticmethod
     def route_intel(route: str) -> dict:
         return _extract_route_intelligence(route)
+
+    def suggest_largest_available(self, route: str, unavailable=None,
+                                   today_date_str: str = "") -> list:
+        """
+        Last-resort assignment: return the single largest lorry that is still
+        available, ignoring weight constraints.
+
+        Called only when the DO weight exceeds every lorry's capacity AND
+        bin-packing across multiple lorries also failed — i.e. every normal
+        path returned nothing.  Assigning an overloaded lorry is better than
+        leaving the DO completely unassigned.
+
+        Returns a one-element list in the same format as suggest(), or [].
+        """
+        if unavailable is None:
+            unavailable = set()
+
+        eligible = self.eligible_lorries[
+            ~self.eligible_lorries["LORRY"].isin(unavailable)
+        ].copy()
+        if eligible.empty:
+            return []
+
+        # Rule 6: honour the stop-count limit even for last-resort
+        if today_date_str:
+            over = {
+                r["LORRY"] for _, r in eligible.iterrows()
+                if self.get_stop_count_today(r["LORRY"], today_date_str) >= MAX_STOPS_PER_LORRY
+            }
+            eligible = eligible[~eligible["LORRY"].isin(over)]
+        if eligible.empty:
+            return []
+
+        intel      = _extract_route_intelligence(route)
+        freq_route = self.get_route_frequencies(route)
+        merged     = eligible.merge(
+            freq_route[["LICENSE", "FREQ"]].rename(columns={"FREQ": "ROUTE_FREQ"}),
+            left_on="LORRY", right_on="LICENSE", how="left")
+        merged["ROUTE_FREQ"] = merged["ROUTE_FREQ"].fillna(0).astype(int)
+        merged["IS_OWNER"]   = (merged["USER"].str.upper() == self.owner_user).astype(int)
+
+        # Largest capacity first; use history + owner as tiebreakers
+        merged = merged.sort_values(
+            ["TON", "IS_OWNER", "ROUTE_FREQ"],
+            ascending=[False, False, False])
+
+        row = merged.iloc[0]
+        cap = round(float(row["TON"]), 2)
+        return [{
+            "LORRY":        row["LORRY"],
+            "TON_CAPACITY": cap,
+            "SURPLUS":      0.0,
+            "UTIL_PCT":     999.0,   # sentinel: caller knows this is overloaded
+            "USER":         str(row["USER"]),
+            "FREQ":         int(row["ROUTE_FREQ"]),
+            "CLUSTER":      intel["cluster"],
+            "CORRIDOR":     intel["corridor"],
+            "REASON":       f"Largest available lorry ({cap}T) — all others taken or insufficient",
+        }]

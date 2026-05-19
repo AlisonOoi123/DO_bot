@@ -1490,8 +1490,21 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         it["LORRY"]         = "SPLIT"
                         it["SPLIT_LORRIES"] = bins
                 else:
-                    for it in group_items:
-                        it["LORRY"] = "NO_LORRY"
+                    # Bin-pack failed — every lorry is taken or too small.
+                    # Assign the largest still-available lorry as a last resort
+                    # (overloaded is better than unassigned per business rule).
+                    excl_final = sess["unavailable"] | get_assigned_today()
+                    last_resort = engine.suggest_largest_available(
+                        route, excl_final, _today())
+                    if last_resort:
+                        lorry = last_resort[0]["LORRY"]
+                        sess["unavailable"].add(lorry)
+                        for it in group_items:
+                            it["LORRY"] = lorry
+                    else:
+                        # Truly no lorries left at all
+                        for it in group_items:
+                            it["LORRY"] = "NO_LORRY"
 
             for it in group_items:
                 sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
@@ -1720,6 +1733,11 @@ def _pick_replacement(broken: str, replacement: str, item: dict,
         )
         if suggestions:
             return suggestions[0]["LORRY"]
+        # Nothing fits by weight — use largest available as last resort
+        last_resort = engine.suggest_largest_available(
+            item.get("ROUTE", ""), excluded)
+        if last_resort:
+            return last_resort[0]["LORRY"]
 
     return "NO_LORRY"
 
@@ -2058,10 +2076,19 @@ def _build_summary(sess) -> str:
                         cap = float(row.iloc[0]["TON"])
                 if cap and cap > 0:
                     util_pct = round((weight / cap) * 100, 1)
-                    util_icon = ("⚠️" if util_pct < 50
-                                 else "🟡" if util_pct < 75
-                                 else "✅")
-                    lines.append(f"🚛 *{lorry}*  {util_icon} {util_pct}%")
+                    if util_pct > 100:
+                        util_icon = "🔴"
+                        util_str  = f"{util_pct}% ⚠ OVER CAP"
+                    elif util_pct < 50:
+                        util_icon = "⚠️"
+                        util_str  = f"{util_pct}%"
+                    elif util_pct < 75:
+                        util_icon = "🟡"
+                        util_str  = f"{util_pct}%"
+                    else:
+                        util_icon = "✅"
+                        util_str  = f"{util_pct}%"
+                    lines.append(f"🚛 *{lorry}*  {util_icon} {util_str}")
                 else:
                     lines.append(f"🚛 *{lorry}*")
 
