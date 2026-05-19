@@ -86,11 +86,11 @@ Write-Host ""
 Write-Host "[6] ngrok executable" -ForegroundColor Yellow
 $ngrokFound = $null
 $ngrokCmd = Get-Command ngrok -ErrorAction SilentlyContinue
-if ($ngrokCmd) { $ngrokFound = $ngrokCmd.Source }
+# WindowsApps aliases are Store stubs - SYSTEM cannot run them, so don't count them as valid
+if ($ngrokCmd -and $ngrokCmd.Source -notlike "*WindowsApps*") { $ngrokFound = $ngrokCmd.Source }
 if (-not $ngrokFound) {
     $candidates = @(
         "$APP_DIR\ngrok.exe",
-        "$env:LOCALAPPDATA\Microsoft\WindowsApps\ngrok.exe",
         "$env:USERPROFILE\scoop\shims\ngrok.exe",
         "$env:USERPROFILE\AppData\Local\ngrok\ngrok.exe",
         "$env:USERPROFILE\ngrok.exe",
@@ -99,6 +99,19 @@ if (-not $ngrokFound) {
         "C:\ngrok\ngrok.exe"
     )
     foreach ($c in $candidates) { if (Test-Path $c) { $ngrokFound = $c; break } }
+}
+# Check WinGet versioned path (exclude WindowsApps stubs)
+if (-not $ngrokFound) {
+    $wg = Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ngrok.Ngrok*\ngrok.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($wg -and $wg -notlike "*WindowsApps*") { $ngrokFound = $wg }
+}
+# Detect WindowsApps alias separately for a targeted warning
+$windowsAppsNgrok = $null
+if ($ngrokCmd -and $ngrokCmd.Source -like "*WindowsApps*") {
+    $windowsAppsNgrok = $ngrokCmd.Source
+} elseif (Test-Path "$env:LOCALAPPDATA\Microsoft\WindowsApps\ngrok.exe") {
+    $windowsAppsNgrok = "$env:LOCALAPPDATA\Microsoft\WindowsApps\ngrok.exe"
 }
 if (-not $ngrokFound) {
     $wingetMatch = Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ngrok.Ngrok*\ngrok.exe" `
@@ -122,8 +135,18 @@ if ($ngrokFound) {
         Write-Host "        re-run setup_windows.ps1 so the service path is updated." -ForegroundColor Yellow
     }
 } else {
-    Write-Host "   MISSING -- ngrok.exe not found in PATH or common locations" -ForegroundColor Red
-    Write-Host "   Download: https://ngrok.com/download  then place ngrok.exe in $APP_DIR" -ForegroundColor Red
+    if ($windowsAppsNgrok) {
+        Write-Host "   Store alias found: $windowsAppsNgrok" -ForegroundColor Yellow
+        Write-Host "   This is a Windows Store stub -- SYSTEM services cannot execute it." -ForegroundColor Yellow
+    } else {
+        Write-Host "   MISSING -- ngrok.exe not found in PATH or common locations" -ForegroundColor Red
+    }
+    Write-Host ""
+    Write-Host "   FIX: Run setup_windows.ps1 -- it will download ngrok.exe automatically." -ForegroundColor Cyan
+    Write-Host "   If the download is blocked by Defender:" -ForegroundColor Yellow
+    Write-Host "     1. Windows Security > Virus & threat protection > Manage settings" -ForegroundColor Yellow
+    Write-Host "        > Exclusions > Add exclusion > Folder > $APP_DIR" -ForegroundColor Yellow
+    Write-Host "     2. Re-run setup_windows.ps1" -ForegroundColor Yellow
 }
 
 # -- 7. Check ngrok config -----------------------------------------------------
