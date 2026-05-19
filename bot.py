@@ -1120,12 +1120,21 @@ def _handle_user_id(phone, sess, text):
 
     lorries = sess["engine"].get_eligible_lorry_list()
 
-    # Show which lorries are already taken today
-    taken_today = get_assigned_today()
+    taken_today  = get_assigned_today()
+    broken_today = get_broken_lorries()   # {plate: replacement}
     lines = []
     for _, r in lorries.iterrows():
-        tag = " ⛔ assigned today" if r["LORRY"] in taken_today else ""
-        lines.append(f"  • {r['LORRY']} — {r['TON']}T ({r['USER']}){tag}")
+        plate = r["LORRY"]
+        ton   = r["TON"]
+        user  = r["USER"]
+        if plate in broken_today:
+            rep = broken_today[plate]
+            tag = f" 🔴 Broken→{rep}" if rep != "NONE" else " 🔴 Broken"
+        elif plate in taken_today:
+            tag = " ⛔ Assigned today"
+        else:
+            tag = " ✅ Available"
+        lines.append(f"  • {plate} — {ton}T ({user}){tag}")
 
     lorry_text = (
         f"✅ Logged in as *{user}*\n\n"
@@ -1345,87 +1354,34 @@ def _handle_excel_upload(phone, sess, file_bytes):
         eligible_caps   = sorted(engine.eligible_lorries["TON"].tolist())
         smallest_cap    = eligible_caps[0] if eligible_caps else 1.0
 
-        # ── Rule 1: Group items by exact ROUTE (Same Route Same Day) ───────────
-        # Items sharing the same route string travel together on one lorry.
+        # ── Rule 1: One route = one lorry (Same Route Same Day) ─────────────────
+        # Each distinct route is a separate delivery run departing from and
+        # returning to the same warehouse on the same day.  Merging different
+        # routes onto one lorry is physically impossible without geo-distance
+        # data, so we keep each route as its own group.
+        # Rule 6 (max 8 stops) is enforced inside engine.suggest().
         from collections import defaultdict
         route_groups: dict[str, list] = defaultdict(list)
         for it in items:
             key = it["ROUTE"].strip().upper()
             route_groups[key].append(it)
 
-        # ── Rule 2 + Rule 7: Merge adjacent-corridor route groups ──────────────
-        # Routes in the same cluster with adjacent corridors can share a lorry
-        # (e.g. KV_NORTH + KV_WEST_NORTH) provided:
-        #   • combined weight still fits a single available lorry (Rule 3)
-        #   • corridors are recognised as adjacent (Rule 2)
-        #   • merging doesn't exceed 25% extra distance (Rule 7, checked inside
-        #     engine.can_merge_routes)
-        max_lorry_cap = (
-            engine.eligible_lorries["TON"].max()
-            if not engine.eligible_lorries.empty else 99.0
-        )
-        raw_groups = list(route_groups.values())
-        # Heaviest routes claim lorries first and anchor corridor merges
-        raw_groups.sort(key=lambda g: sum(i["WEIGHT"] for i in g), reverse=True)
-
-        used_idx: set[int] = set()
-        merged_groups: list[list] = []
-
-        for i, grp_a in enumerate(raw_groups):
-            if i in used_idx:
-                continue
-            route_a = grp_a[0]["ROUTE"]
-            combined = list(grp_a)
-            total_w  = sum(it["WEIGHT"] for it in combined)
-            used_idx.add(i)
-
-            for j, grp_b in enumerate(raw_groups):
-                if j in used_idx:
-                    continue
-                route_b = grp_b[0]["ROUTE"]
-                w_b = sum(it["WEIGHT"] for it in grp_b)
-                if (total_w + w_b <= max_lorry_cap
-                        and engine.can_merge_routes(route_a, route_b)):
-                    combined.extend(grp_b)
-                    total_w += w_b
-                    used_idx.add(j)
-
-            merged_groups.append(combined)
-
-        # Sort merged groups heaviest-first so heavy loads claim lorries early
+        # Sort heaviest-route groups first so they claim the best-fit lorry
+        # before lighter routes do (avoids a 14T lorry being grabbed by a
+        # 0.5T route when a heavy route also needs it).
         sorted_groups = sorted(
-            merged_groups,
+            route_groups.values(),
             key=lambda grp: sum(it["WEIGHT"] for it in grp),
             reverse=True,
         )
 
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
-
-            When items span multiple routes (corridor merge, Rule 2), pick
-            the route with the strongest historical frequency as the primary
-            route for engine scoring so Rule 4 history matching still works.
+            All items in the group share the same route (one route = one lorry).
             """
-            total_w = sum(it["WEIGHT"] for it in group_items)
-
-            # Choose the best representative route for history scoring:
-            # prefer the route with the most historical hits; fall back to
-            # the heaviest-weight route when history is tied or absent.
-            route_weights: dict[str, float] = defaultdict(float)
-            for it in group_items:
-                route_weights[it["ROUTE"]] += it["WEIGHT"]
-
-            # Score each unique route by history frequency (Rule 4)
-            def _route_score(r):
-                freq_df = engine.get_route_frequencies(r)
-                hist    = int(freq_df["FREQ"].sum()) if not freq_df.empty else 0
-                weight  = route_weights[r]
-                return (hist, weight)  # history first, weight as tiebreaker
-
-            route    = max(route_weights, key=_route_score)
-            # Customer: use the one that appears most in this group
-            from collections import Counter
-            customer = Counter(it["CUSTOMER NAME"] for it in group_items).most_common(1)[0][0]
+            total_w  = sum(it["WEIGHT"] for it in group_items)
+            route    = group_items[0]["ROUTE"]
+            customer = group_items[0]["CUSTOMER NAME"]
 
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
