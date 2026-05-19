@@ -1,72 +1,81 @@
 #!/bin/bash
-# DO Bot — One-time production server setup script
-# Run as root (or with sudo) on a fresh Ubuntu/Debian server.
-# Usage: bash setup_server.sh YOUR_DOMAIN
+# DO Bot — Production server setup (ngrok static tunnel, no domain needed)
+# Run as root on Ubuntu 20.04+ / Debian 11+
+# Usage: bash setup_server.sh
 
 set -e
-DOMAIN=${1:?'Usage: bash setup_server.sh YOUR_DOMAIN'}
 APP_DIR=/opt/do_bot
 LOG_DIR=/var/log/do_bot
 
-echo "=== [1/7] Installing system packages ==="
+echo "=== [1/6] Installing system packages ==="
 apt-get update -q
-apt-get install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx
+apt-get install -y python3 python3-venv python3-pip curl unzip
 
-echo "=== [2/7] Creating app directory ==="
+echo "=== [2/6] Installing ngrok ==="
+if ! command -v ngrok &>/dev/null; then
+    curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+        | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+    echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+        > /etc/apt/sources.list.d/ngrok.list
+    apt-get update -q && apt-get install -y ngrok
+fi
+
+echo "=== [3/6] Creating directories ==="
 mkdir -p "$APP_DIR" "$LOG_DIR"
 chown www-data:www-data "$LOG_DIR"
 
-echo "=== [3/7] Cloning / copying code ==="
-# If running from the repo directory, copy files over.
+echo "=== [4/6] Copying code ==="
 rsync -av --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' \
     --exclude='config.txt' --exclude='data/*.xlsx' \
     ./ "$APP_DIR/"
 chown -R www-data:www-data "$APP_DIR"
 
-echo "=== [4/7] Creating Python virtual environment ==="
+echo "=== [5/6] Creating Python virtual environment ==="
 python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --upgrade pip -q
 "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
 
-echo "=== [5/7] Creating data directory and .env file ==="
+echo "=== [6/6] Creating data directory and config files ==="
 mkdir -p "$APP_DIR/data"
-chown www-data:www-data "$APP_DIR/data"
+chown -R www-data:www-data "$APP_DIR/data"
 
+# Create .env if not present
 ENV_FILE="$APP_DIR/.env"
 if [ ! -f "$ENV_FILE" ]; then
     cp "$APP_DIR/.env.example" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-    echo ""
-    echo ">>> IMPORTANT: Edit $ENV_FILE and fill in your real credentials:"
-    echo "    META_ACCESS_TOKEN, META_PHONE_NUMBER_ID, PUBLIC_BASE_URL"
-    echo ""
 fi
 
-echo "=== [6/7] Installing systemd service ==="
-# Replace placeholder domain in service file (already correct — no domain there)
-cp "$APP_DIR/do_bot.service" /etc/systemd/system/do_bot.service
+# Install systemd services
+cp "$APP_DIR/do_bot.service"       /etc/systemd/system/do_bot.service
+cp "$APP_DIR/ngrok_do_bot.service" /etc/systemd/system/ngrok_do_bot.service
 systemctl daemon-reload
-systemctl enable do_bot
-
-echo "=== [7/7] Setting up Nginx + SSL ==="
-# Replace placeholder in nginx config
-sed "s/YOUR_DOMAIN_HERE/$DOMAIN/g" "$APP_DIR/nginx_do_bot.conf" \
-    > "/etc/nginx/sites-available/do_bot"
-ln -sf /etc/nginx/sites-available/do_bot /etc/nginx/sites-enabled/do_bot
-rm -f /etc/nginx/sites-enabled/default
-
-# Obtain SSL certificate (requires domain DNS already pointing to this server)
-certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN"
-
-nginx -t && systemctl reload nginx
+systemctl enable do_bot ngrok_do_bot
 
 echo ""
-echo "=== Setup complete ==="
-echo "Next steps:"
-echo "  1. Copy your data files to $APP_DIR/data/:"
-echo "       ZSDOROUTEWRH.xlsx"
-echo "  2. Copy master lorry.xlsx to $APP_DIR/"
-echo "  3. Edit $ENV_FILE with real credentials"
-echo "  4. Start the bot: systemctl start do_bot"
-echo "  5. Check logs:   journalctl -u do_bot -f"
-echo "  6. Update Meta webhook URL to: https://$DOMAIN/webhook"
+echo "=== Setup complete! ==="
+echo ""
+echo "Before starting, complete these steps:"
+echo ""
+echo "  1. Copy your data files:"
+echo "       cp ZSDOROUTEWRH.xlsx       $APP_DIR/data/"
+echo "       cp 'master lorry.xlsx'     $APP_DIR/"
+echo ""
+echo "  2. Fill in credentials:"
+echo "       nano $APP_DIR/.env"
+echo "       (set META_ACCESS_TOKEN, META_PHONE_NUMBER_ID)"
+echo ""
+echo "  3. Fill in your ngrok authtoken:"
+echo "       nano $APP_DIR/ngrok_do_bot.yml"
+echo "       (replace YOUR_NGROK_AUTHTOKEN_HERE)"
+echo ""
+echo "  4. Start both services:"
+echo "       systemctl start do_bot"
+echo "       systemctl start ngrok_do_bot"
+echo ""
+echo "  5. Check they are running:"
+echo "       journalctl -u do_bot        -f"
+echo "       journalctl -u ngrok_do_bot  -f"
+echo ""
+echo "  6. Meta webhook URL (already set, no change needed):"
+echo "       https://degraded-sincerity-glue.ngrok-free.dev/webhook"

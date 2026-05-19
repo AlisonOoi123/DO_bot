@@ -340,11 +340,17 @@ def _send_do_list(to: str, header: str, body: str, button: str, items: list[dict
 
 
 if __name__ == "__main__":
+    import platform
     print(f"🚀 Starting Meta WhatsApp Bot server...")
     print(f"   Webhook URL: {PUBLIC_BASE_URL}/webhook")
     print(f"   Verify token: {META_VERIFY_TOKEN}")
-    # use_reloader=False is CRITICAL — Flask watchdog restarts the server
-    # whenever any file in the project dir changes (including Excel writes),
-    # which kills in-flight requests and loses all session data.
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, host="0.0.0.0", port=port, use_reloader=False)
+    if platform.system() == "Windows":
+        from waitress import serve
+        print(f"   Server: waitress (Windows) on port {port}")
+        serve(app, host="0.0.0.0", port=port, threads=8)
+    else:
+        # use_reloader=False is CRITICAL — Flask watchdog restarts the server
+        # whenever any file in the project dir changes (including Excel writes),
+        # which kills in-flight requests and loses all session data.
+        app.run(debug=False, host="0.0.0.0", port=port, use_reloader=False)

@@ -1,0 +1,17 @@
+[Unit]
+Description=ngrok tunnel for DO Bot
+After=network.target do_bot.service
+Requires=do_bot.service
+
+[Service]
+Type=simple
+User=www-data
+ExecStart=/usr/local/bin/ngrok start do_bot --config /opt/do_bot/ngrok_do_bot.yml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ngrok_do_bot
+
+[Install]
+WantedBy=multi-user.target
