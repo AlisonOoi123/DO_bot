@@ -1318,29 +1318,87 @@ def _handle_excel_upload(phone, sess, file_bytes):
         eligible_caps   = sorted(engine.eligible_lorries["TON"].tolist())
         smallest_cap    = eligible_caps[0] if eligible_caps else 1.0
 
-        # ── Group items by ROUTE only ───────────────────────────────────────────
-        # Same route = same lorry when capacity allows (even different customers).
-        # This reflects real-world practice: one lorry does multiple stops on
-        # the same route regardless of who ordered.
-        # Within a route group, items are sorted heaviest-first.
+        # ── Rule 1: Group items by exact ROUTE (Same Route Same Day) ───────────
+        # Items sharing the same route string travel together on one lorry.
         from collections import defaultdict
-        route_groups = defaultdict(list)
+        route_groups: dict[str, list] = defaultdict(list)
         for it in items:
             key = it["ROUTE"].strip().upper()
             route_groups[key].append(it)
 
-        # Sort route groups by total weight DESC — heaviest routes get first pick
+        # ── Rule 2 + Rule 7: Merge adjacent-corridor route groups ──────────────
+        # Routes in the same cluster with adjacent corridors can share a lorry
+        # (e.g. KV_NORTH + KV_WEST_NORTH) provided:
+        #   • combined weight still fits a single available lorry (Rule 3)
+        #   • corridors are recognised as adjacent (Rule 2)
+        #   • merging doesn't exceed 25% extra distance (Rule 7, checked inside
+        #     engine.can_merge_routes)
+        max_lorry_cap = (
+            engine.eligible_lorries["TON"].max()
+            if not engine.eligible_lorries.empty else 99.0
+        )
+        raw_groups = list(route_groups.values())
+        # Heaviest routes claim lorries first and anchor corridor merges
+        raw_groups.sort(key=lambda g: sum(i["WEIGHT"] for i in g), reverse=True)
+
+        used_idx: set[int] = set()
+        merged_groups: list[list] = []
+
+        for i, grp_a in enumerate(raw_groups):
+            if i in used_idx:
+                continue
+            route_a = grp_a[0]["ROUTE"]
+            combined = list(grp_a)
+            total_w  = sum(it["WEIGHT"] for it in combined)
+            used_idx.add(i)
+
+            for j, grp_b in enumerate(raw_groups):
+                if j in used_idx:
+                    continue
+                route_b = grp_b[0]["ROUTE"]
+                w_b = sum(it["WEIGHT"] for it in grp_b)
+                if (total_w + w_b <= max_lorry_cap
+                        and engine.can_merge_routes(route_a, route_b)):
+                    combined.extend(grp_b)
+                    total_w += w_b
+                    used_idx.add(j)
+
+            merged_groups.append(combined)
+
+        # Sort merged groups heaviest-first so heavy loads claim lorries early
         sorted_groups = sorted(
-            route_groups.values(),
+            merged_groups,
             key=lambda grp: sum(it["WEIGHT"] for it in grp),
             reverse=True,
         )
 
         def _assign_group(group_items):
-            """Assign ONE lorry (or split) to cover ALL items in the group."""
-            route    = group_items[0]["ROUTE"]
-            customer = group_items[0]["CUSTOMER NAME"]
-            total_w  = sum(it["WEIGHT"] for it in group_items)
+            """Assign ONE lorry (or split) to cover ALL items in the group.
+
+            When items span multiple routes (corridor merge, Rule 2), pick
+            the route with the strongest historical frequency as the primary
+            route for engine scoring so Rule 4 history matching still works.
+            """
+            total_w = sum(it["WEIGHT"] for it in group_items)
+
+            # Choose the best representative route for history scoring:
+            # prefer the route with the most historical hits; fall back to
+            # the heaviest-weight route when history is tied or absent.
+            route_weights: dict[str, float] = defaultdict(float)
+            for it in group_items:
+                route_weights[it["ROUTE"]] += it["WEIGHT"]
+
+            # Score each unique route by history frequency (Rule 4)
+            def _route_score(r):
+                freq_df = engine.get_route_frequencies(r)
+                hist    = int(freq_df["FREQ"].sum()) if not freq_df.empty else 0
+                weight  = route_weights[r]
+                return (hist, weight)  # history first, weight as tiebreaker
+
+            route    = max(route_weights, key=_route_score)
+            # Customer: use the one that appears most in this group
+            from collections import Counter
+            customer = Counter(it["CUSTOMER NAME"] for it in group_items).most_common(1)[0][0]
 
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
