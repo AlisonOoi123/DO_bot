@@ -7,7 +7,15 @@
 $ErrorActionPreference = "Stop"
 $APP_DIR = "C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot"
 $NSSM    = "$APP_DIR\nssm.exe"
-$PYTHON  = (Get-Command python).Source
+
+# Use sys.executable to get the real python.exe, not the Windows Store alias
+# (the Store alias at WindowsApps\python.exe is inaccessible to the SYSTEM account)
+$PYTHON = python -c "import sys; print(sys.executable)"
+if (-not $PYTHON -or -not (Test-Path $PYTHON)) {
+    Write-Host "ERROR: Could not locate real python.exe. Got: $PYTHON" -ForegroundColor Red
+    exit 1
+}
+Write-Host "Using Python: $PYTHON" -ForegroundColor Gray
 
 Set-Location $APP_DIR
 
@@ -54,7 +62,15 @@ try { & $NSSM remove do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 & $NSSM set     do_bot AppRotateBytes   5242880
 & $NSSM set     do_bot AppNoConsole     1
 
-# Pass Python's site-packages path so the SYSTEM account can import dependencies
+# Run as the current user so it can access user-scoped Python and packages.
+# Services default to SYSTEM which cannot reach AppData\Local installs.
+$svcUser = ".\$env:USERNAME"
+Write-Host "   Service account: $svcUser" -ForegroundColor Gray
+Write-Host "   Enter your Windows login password when prompted:" -ForegroundColor Yellow
+$svcCred = Get-Credential -UserName $svcUser -Message "Password for DO Bot service account ($svcUser)"
+& $NSSM set do_bot ObjectName $svcCred.UserName $svcCred.GetNetworkCredential().Password
+
+# Pass Python's site-packages path as an extra safety net
 if ($SITE_PACKAGES) {
     & $NSSM set do_bot AppEnvironmentExtra "PYTHONPATH=$SITE_PACKAGES"
     Write-Host "   PYTHONPATH set to: $SITE_PACKAGES" -ForegroundColor Gray
@@ -83,6 +99,7 @@ try { & $NSSM remove ngrok_do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 & $NSSM set     ngrok_do_bot AppStderr       "$APP_DIR\logs\ngrok_error.log"
 & $NSSM set     ngrok_do_bot AppNoConsole    1
 & $NSSM set     ngrok_do_bot DependOnService do_bot
+& $NSSM set     ngrok_do_bot ObjectName      $svcCred.UserName $svcCred.GetNetworkCredential().Password
 
 Write-Host "`n=== Setup complete! ===" -ForegroundColor Green
 Write-Host ""
