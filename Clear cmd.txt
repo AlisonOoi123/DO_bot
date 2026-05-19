@@ -1,0 +1,23 @@
+# STEP 1
+cd "C:\Users\Administrator\OneDrive\DO whatsapp bot"
+python test_bot.py
+
+# MANUAL clear assigned lorry [use when needed]
+clear daily log
+
+=============================================================================
+# STEP 2
+ngrok http 5000
+
+=============================================================================
+# STEP 3
+cd "C:\Users\Administrator\OneDrive\DO whatsapp bot"
+python -m pip install flask twilio
+python app.py
+
+=============================================================================
+# FB - ES DO LorryBot
+https://developers.facebook.com/apps/1304522128292891/use_cases/customize/wa-dev-console/?use_case_enum=WHATSAPP_BUSINESS_MESSAGING&product_route=whatsapp-business&business_id=1511324183994133&selected_tab=wa-dev-console
+
+# FB - Meta Business Suite
+https://business.facebook.com/latest/settings/system_users/?business_id=1511324183994133&nav_ref=bm_settings_redirect_migration&bm_redirect_migration=true&selected_user_id=61589765244973

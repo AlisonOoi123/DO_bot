@@ -1,0 +1,7 @@
+# Meta Cloud API credentials
+# Get Access Token from: developers.facebook.com -> Your App -> API Setup -> Generate access token
+
+META_ACCESS_TOKEN=EAASidLoOZCBsBRXKmgBmUvkrnNrh1NlIQ53FMToBjXsLBJr8NbnRHwM5yPEZCOoh9BEZA9e2kXqzsNyn7ckfs6jB3GBALv0QFrdaAaZAbpk4Jx0l08BQHmA6I3i7OUFDyOR3nzPvbTZBWsfswfQE813A42wTEusQAwPnVvGX3iMNO41G0IyiuLSFwHaTsXQZDZD
+META_PHONE_NUMBER_ID=1089588587573422
+META_VERIFY_TOKEN=eslorrybot2026
+PUBLIC_BASE_URL=https://degraded-sincerity-glue.ngrok-free.dev
