@@ -1,6 +1,6 @@
-# DO Bot — Windows Production Setup
+# DO Bot -- Windows Production Setup
 # Run this script ONCE in PowerShell as Administrator
-# Usage: Right-click PowerShell → "Run as Administrator", then:
+# Usage: Right-click PowerShell -> "Run as Administrator", then:
 #   cd "C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot"
 #   .\setup_windows.ps1
 
@@ -9,7 +9,7 @@ $APP_DIR = "C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot"
 $NSSM    = "$APP_DIR\nssm.exe"
 
 # Use sys.executable to get the real python.exe, not the Windows Store alias
-# (the Store alias at WindowsApps\python.exe is inaccessible to the SYSTEM account)
+# (WindowsApps\python.exe is an app alias that the SYSTEM account cannot execute)
 $PYTHON = python -c "import sys; print(sys.executable)"
 if (-not $PYTHON -or -not (Test-Path $PYTHON)) {
     Write-Host "ERROR: Could not locate real python.exe. Got: $PYTHON" -ForegroundColor Red
@@ -17,24 +17,43 @@ if (-not $PYTHON -or -not (Test-Path $PYTHON)) {
 }
 Write-Host "Using Python: $PYTHON" -ForegroundColor Gray
 
+# Derive the Python install root (two levels up from python.exe)
+$PYTHON_DIR = Split-Path $PYTHON
+
 Set-Location $APP_DIR
 
-# ── Create logs directory FIRST (NSSM needs it before starting the service) ───
+# -- Create logs directory FIRST (NSSM needs it before starting the service) --
 New-Item -ItemType Directory -Force -Path "$APP_DIR\logs" | Out-Null
 Write-Host "   Logs directory: $APP_DIR\logs" -ForegroundColor Gray
 
-# ── Step 1: Install Python dependencies ──────────────────────────────────────
+# -- Step 1: Install Python dependencies --------------------------------------
 Write-Host "`n=== [1/4] Installing Python dependencies ===" -ForegroundColor Cyan
 python -m pip install -r requirements.txt
 
-# Resolve the Python site-packages path so NSSM services can import them
+# Resolve site-packages so it can be passed to the service environment
 $SITE_PACKAGES = python -c "import site; print(site.getsitepackages()[0])" 2>$null
 if (-not $SITE_PACKAGES) {
     $SITE_PACKAGES = python -c "import site; print(site.getusersitepackages())" 2>$null
 }
 
-# ── Step 2: Download NSSM (service manager) ───────────────────────────────────
-Write-Host "`n=== [2/4] Downloading NSSM ===" -ForegroundColor Cyan
+# -- Step 2: Grant SYSTEM access to the user-scoped Python install ------------
+# Services run as SYSTEM by default, which has no access to AppData\Local.
+# icacls grants read+execute recursively without needing a password.
+Write-Host "`n=== [2/4] Granting SYSTEM access to Python install ===" -ForegroundColor Cyan
+$paths = @($PYTHON_DIR)
+if ($SITE_PACKAGES -and (Test-Path $SITE_PACKAGES)) {
+    $paths += $SITE_PACKAGES
+}
+foreach ($p in $paths) {
+    Write-Host "   icacls: $p" -ForegroundColor Gray
+    icacls $p /grant "NT AUTHORITY\SYSTEM:(OI)(CI)RX" /T /Q
+}
+# Also grant SYSTEM full access to the app directory (for writing logs, data files)
+icacls $APP_DIR /grant "NT AUTHORITY\SYSTEM:(OI)(CI)F" /T /Q
+Write-Host "   Done." -ForegroundColor Green
+
+# -- Step 3: Download NSSM ----------------------------------------------------
+Write-Host "`n=== [3/4] Downloading NSSM ===" -ForegroundColor Cyan
 if (-not (Test-Path $NSSM)) {
     $nssmZip = "$env:TEMP\nssm.zip"
     Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip
@@ -45,8 +64,10 @@ if (-not (Test-Path $NSSM)) {
     Write-Host "   nssm.exe already present, skipping."
 }
 
-# ── Step 3: Install DO Bot as Windows Service ─────────────────────────────────
-Write-Host "`n=== [3/4] Installing DO Bot service ===" -ForegroundColor Cyan
+# -- Step 4: Install services -------------------------------------------------
+Write-Host "`n=== [4/4] Installing services ===" -ForegroundColor Cyan
+
+# -- DO Bot service --
 try { & $NSSM stop   do_bot         2>$null } catch {}; $LASTEXITCODE = 0
 try { & $NSSM remove do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 
@@ -62,29 +83,17 @@ try { & $NSSM remove do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 & $NSSM set     do_bot AppRotateBytes   5242880
 & $NSSM set     do_bot AppNoConsole     1
 
-# Run as the current user so it can access user-scoped Python and packages.
-# Services default to SYSTEM which cannot reach AppData\Local installs.
-$svcUser = ".\$env:USERNAME"
-Write-Host "   Service account: $svcUser" -ForegroundColor Gray
-Write-Host "   Enter your Windows login password when prompted:" -ForegroundColor Yellow
-$svcCred = Get-Credential -UserName $svcUser -Message "Password for DO Bot service account ($svcUser)"
-& $NSSM set do_bot ObjectName $svcCred.UserName $svcCred.GetNetworkCredential().Password
-
-# Pass Python's site-packages path as an extra safety net
 if ($SITE_PACKAGES) {
     & $NSSM set do_bot AppEnvironmentExtra "PYTHONPATH=$SITE_PACKAGES"
     Write-Host "   PYTHONPATH set to: $SITE_PACKAGES" -ForegroundColor Gray
 }
 
-# ── Step 4: Install ngrok as Windows Service ──────────────────────────────────
-Write-Host "`n=== [4/4] Installing ngrok service ===" -ForegroundColor Cyan
-
+# -- ngrok service --
 $ngrokCmd  = Get-Command ngrok -ErrorAction SilentlyContinue
-$ngrokPath = if ($ngrokCmd) { $ngrokCmd.Source } else { $null }
-if (-not $ngrokPath) {
-    Write-Host "   ngrok not found in PATH." -ForegroundColor Yellow
-    Write-Host "   Download from https://ngrok.com/download, extract ngrok.exe to $APP_DIR" -ForegroundColor Yellow
-    $ngrokPath = "$APP_DIR\ngrok.exe"
+$ngrokPath = if ($ngrokCmd) { $ngrokCmd.Source } else { "$APP_DIR\ngrok.exe" }
+if (-not (Test-Path $ngrokPath)) {
+    Write-Host "   WARNING: ngrok not found at $ngrokPath" -ForegroundColor Yellow
+    Write-Host "   Download from https://ngrok.com/download and extract ngrok.exe to $APP_DIR" -ForegroundColor Yellow
 }
 
 try { & $NSSM stop   ngrok_do_bot         2>$null } catch {}; $LASTEXITCODE = 0
@@ -99,7 +108,6 @@ try { & $NSSM remove ngrok_do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 & $NSSM set     ngrok_do_bot AppStderr       "$APP_DIR\logs\ngrok_error.log"
 & $NSSM set     ngrok_do_bot AppNoConsole    1
 & $NSSM set     ngrok_do_bot DependOnService do_bot
-& $NSSM set     ngrok_do_bot ObjectName      $svcCred.UserName $svcCred.GetNetworkCredential().Password
 
 Write-Host "`n=== Setup complete! ===" -ForegroundColor Green
 Write-Host ""
