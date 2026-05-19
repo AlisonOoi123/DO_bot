@@ -29,8 +29,8 @@ if (-not (Test-Path $NSSM)) {
 
 # ── Step 3: Install DO Bot as Windows Service ─────────────────────────────────
 Write-Host "`n=== [3/4] Installing DO Bot service ===" -ForegroundColor Cyan
-& $NSSM stop  do_bot 2>$null
-& $NSSM remove do_bot confirm 2>$null
+try { & $NSSM stop   do_bot         2>$null } catch {}; $LASTEXITCODE = 0
+try { & $NSSM remove do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 
 & $NSSM install do_bot $PYTHON "$APP_DIR\app.py"
 & $NSSM set     do_bot AppDirectory   $APP_DIR
@@ -45,15 +45,16 @@ Write-Host "`n=== [3/4] Installing DO Bot service ===" -ForegroundColor Cyan
 # ── Step 4: Install ngrok as Windows Service ──────────────────────────────────
 Write-Host "`n=== [4/4] Installing ngrok service ===" -ForegroundColor Cyan
 
-$ngrokPath = (Get-Command ngrok -ErrorAction SilentlyContinue)?.Source
+$ngrokCmd  = Get-Command ngrok -ErrorAction SilentlyContinue
+$ngrokPath = if ($ngrokCmd) { $ngrokCmd.Source } else { $null }
 if (-not $ngrokPath) {
     Write-Host "   ngrok not found in PATH." -ForegroundColor Yellow
     Write-Host "   Download from https://ngrok.com/download, extract ngrok.exe to $APP_DIR" -ForegroundColor Yellow
     $ngrokPath = "$APP_DIR\ngrok.exe"
 }
 
-& $NSSM stop   ngrok_do_bot 2>$null
-& $NSSM remove ngrok_do_bot confirm 2>$null
+try { & $NSSM stop   ngrok_do_bot         2>$null } catch {}; $LASTEXITCODE = 0
+try { & $NSSM remove ngrok_do_bot confirm 2>$null } catch {}; $LASTEXITCODE = 0
 
 & $NSSM install ngrok_do_bot $ngrokPath "start do_bot --config `"$APP_DIR\ngrok_do_bot.yml`""
 & $NSSM set     ngrok_do_bot AppDirectory $APP_DIR
