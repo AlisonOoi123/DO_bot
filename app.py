@@ -366,12 +366,20 @@ def _send_do_list(to: str, header: str, body: str, button: str, items: list[dict
 
 if __name__ == "__main__":
     import platform, sys, io
-    # Windows services use cp1252 by default; reconfigure to UTF-8 so emoji
-    # in log output doesn't crash the process before waitress even starts.
+    # Force UTF-8 output early — must happen before any print().
+    # PYTHONUTF8=1 is the cleanest fix but may not be set on the service yet.
+    # The TextIOWrapper fallback handles interactive terminals.
+    # errors="replace" ensures unknown chars never crash the process.
+    os.environ.setdefault("PYTHONUTF8", "1")
     if sys.platform == "win32":
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    print("Starting Meta WhatsApp Bot server...")
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+        except AttributeError:
+            # NSSM redirects stdout to a raw file; .buffer is unavailable.
+            # PYTHONUTF8=1 above handles encoding for that case.
+            pass
+    print("Starting DO Bot server...")
     print(f"   Webhook URL: {PUBLIC_BASE_URL}/webhook")
     print(f"   Verify token: {META_VERIFY_TOKEN}")
     port = int(os.environ.get("PORT", 5000))
