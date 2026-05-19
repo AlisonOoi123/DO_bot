@@ -4,4 +4,5 @@ tunnels:
   do_bot:
     proto: http
     addr: 5000
-    hostname: degraded-sincerity-glue.ngrok-free.dev
+    # ngrok v3+: use "domain:" instead of the old "hostname:"
+    domain: degraded-sincerity-glue.ngrok-free.dev
