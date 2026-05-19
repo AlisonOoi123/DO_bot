@@ -142,21 +142,46 @@ def webhook():
 # ── Meta API helpers ──────────────────────────────────────────────────────────
 
 def _send_text(to: str, body: str):
-    """Send a plain text WhatsApp message via Meta Cloud API."""
+    """Send a plain text WhatsApp message via Meta Cloud API.
+    Splits messages longer than 4096 chars at newline boundaries so the
+    Meta API never rejects an oversized payload.
+    """
+    WA_MAX = 4096
+    # Split at newline boundaries to avoid breaking mid-line
+    if len(body) > WA_MAX:
+        chunks = []
+        current = []
+        current_len = 0
+        for line in body.split("\n"):
+            # +1 for the newline character
+            segment_len = len(line) + 1
+            if current_len + segment_len > WA_MAX and current:
+                chunks.append("\n".join(current))
+                current = [line]
+                current_len = segment_len
+            else:
+                current.append(line)
+                current_len += segment_len
+        if current:
+            chunks.append("\n".join(current))
+    else:
+        chunks = [body]
+
     url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": body},
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=10)
-    if not r.ok:
-        print(f"❌ Send text failed: {r.status_code} {r.text}")
+    for chunk in chunks:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": chunk},
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if not r.ok:
+            print(f"❌ Send text failed: {r.status_code} {r.text}")
 
 
 def _send_buttons(to: str, body: str, buttons: list[dict]):
