@@ -1,0 +1,21 @@
+# Credentials — never commit real tokens
+config.txt
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime state files
+data/daily_assignments.json
+daily_assignments.json
+
+# Large data files — store on server or object storage
+data/ZSDOROUTEWRH.xlsx
+data/ZSDOROUTEWRH-bot.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
