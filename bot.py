@@ -1354,26 +1354,80 @@ def _handle_excel_upload(phone, sess, file_bytes):
         eligible_caps   = sorted(engine.eligible_lorries["TON"].tolist())
         smallest_cap    = eligible_caps[0] if eligible_caps else 1.0
 
-        # ── Rule 1: One route = one lorry (Same Route Same Day) ─────────────────
-        # Each distinct route is a separate delivery run departing from and
-        # returning to the same warehouse on the same day.  Merging different
-        # routes onto one lorry is physically impossible without geo-distance
-        # data, so we keep each route as its own group.
-        # Rule 6 (max 8 stops) is enforced inside engine.suggest().
+        # ── Route grouping with same-corridor merging ──────────────────────────
+        # Pass 1: group by exact route (Rule 1 — same route, same lorry).
+        # Pass 2: merge non-heaviest groups that share the same cluster AND the
+        #   same exact corridor direction (e.g. both "NORTH"), provided the
+        #   merged group's distinct-route count stays ≤ MAX_STOPS_PER_LORRY and
+        #   combined weight still fits the largest available lorry.
+        # The single heaviest route is never merged — it gets its own lorry.
         from collections import defaultdict
+        from lorry_engine import _extract_route_intelligence, MAX_STOPS_PER_LORRY as _MAX_STOPS
+
         route_groups: dict[str, list] = defaultdict(list)
         for it in items:
             key = it["ROUTE"].strip().upper()
             route_groups[key].append(it)
 
-        # Sort heaviest-route groups first so they claim the best-fit lorry
-        # before lighter routes do (avoids a 14T lorry being grabbed by a
-        # 0.5T route when a heavy route also needs it).
-        sorted_groups = sorted(
+        # Sort all route groups heaviest first
+        raw_groups = sorted(
             route_groups.values(),
             key=lambda grp: sum(it["WEIGHT"] for it in grp),
             reverse=True,
         )
+
+        if len(raw_groups) <= 1:
+            sorted_groups = raw_groups
+        else:
+            max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
+                if not engine.eligible_lorries.empty else 99.0
+
+            # Heaviest route stands alone — no merging
+            heaviest_group = raw_groups[0]
+            rest = raw_groups[1:]
+
+            # Greedy forward merge among the lighter groups
+            merged_groups: list[list] = []
+            used = [False] * len(rest)
+
+            for i in range(len(rest)):
+                if used[i]:
+                    continue
+                base = list(rest[i])
+                base_intel = _extract_route_intelligence(base[0]["ROUTE"])
+
+                for j in range(i + 1, len(rest)):
+                    if used[j]:
+                        continue
+                    cand = rest[j]
+                    cand_intel = _extract_route_intelligence(cand[0]["ROUTE"])
+
+                    combined_routes = (
+                        len({it["ROUTE"] for it in base})
+                        + len({it["ROUTE"] for it in cand})
+                    )
+                    combined_weight = (
+                        sum(it["WEIGHT"] for it in base)
+                        + sum(it["WEIGHT"] for it in cand)
+                    )
+
+                    if (
+                        base_intel["cluster"]  == cand_intel["cluster"]
+                        and base_intel["corridor"] == cand_intel["corridor"]
+                        and base_intel["corridor"] != "GENERAL"
+                        and combined_routes <= _MAX_STOPS
+                        and combined_weight <= max_lorry_cap
+                    ):
+                        base = base + list(cand)
+                        used[j] = True
+
+                merged_groups.append(base)
+
+            # Re-sort merged groups heaviest first so they claim lorries first
+            merged_groups.sort(
+                key=lambda g: sum(it["WEIGHT"] for it in g), reverse=True
+            )
+            sorted_groups = [heaviest_group] + merged_groups
 
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
