@@ -1,0 +1,7 @@
+version: "2"
+authtoken: YOUR_NGROK_AUTHTOKEN_HERE
+tunnels:
+  do_bot:
+    proto: http
+    addr: 5000
+    hostname: degraded-sincerity-glue.ngrok-free.dev

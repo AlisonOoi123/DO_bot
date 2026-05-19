@@ -1,6 +1,7 @@
 # Credentials — never commit real tokens
 config.txt
 .env
+ngrok_do_bot.yml
 # .env.example is safe to commit (no real values)
 
 # Python cache
