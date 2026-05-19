@@ -1445,12 +1445,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 single_cap  = suggestions[0]["TON_CAPACITY"]
                 single_util = total_w / single_cap if single_cap > 0 else 0
                 split_option = None
-                if single_util < 0.70:
+                if single_util < 0.60:
                     split_option = engine.suggest_split(
                         route=route,
                         total_ton=total_w,
                         unavailable=excluded,
-                        single_util_threshold=0.70,
+                        single_util_threshold=0.60,
                     )
                 if split_option is not None:
                     # Distribute items across split lorries

@@ -316,15 +316,30 @@ class LorryEngine:
             merged["CLUSTER_FREQ"] = 0
         merged["CLUSTER_FREQ"] = merged["CLUSTER_FREQ"].fillna(0).astype(int)
 
-        # Utilisation score (Rule 3)
+        # Utilisation (Rule 3)
         merged["UTIL"] = total_ton / merged["TON"]
         merged["UTIL_SCORE"] = merged["UTIL"].apply(
             lambda u: 1.0 if u >= CAPACITY_TARGET else u / CAPACITY_TARGET)
         merged["IS_OWNER"] = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
+        # Two-tier sort (Rules 3 + 4):
+        #
+        # Tier 1 (UTIL_GOOD=1): lorries where this load uses ≥60% of capacity.
+        #   These are "good fits" — within this tier, history breaks the tie.
+        #
+        # Tier 2 (UTIL_GOOD=0): lorries that are too big (utilisation <60%).
+        #   Sorted by tightest fit (SURPLUS ASC) so we waste the least space,
+        #   then by history as a secondary tiebreaker.
+        #
+        # This means: a 5T lorry at 70% util always beats a 10.5T lorry at 34%
+        # util even if the 10.5T has historical frequency for that route.
+        UTIL_GOOD_THRESHOLD = 0.60
+        merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
+
         merged = merged.sort_values(
-            ["CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"],
-            ascending=[False, False, False, True, False, False])
+            ["UTIL_GOOD", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE",
+             "SURPLUS", "IS_OWNER", "ROUTE_FREQ"],
+            ascending=[False, False, False, False, True, False, False])
 
         results = []
         for _, row in merged.head(top_n).iterrows():
