@@ -1,6 +1,7 @@
 # Credentials — never commit real tokens
 config.txt
 .env
+# .env.example is safe to commit (no real values)
 
 # Python cache
 __pycache__/

@@ -1,0 +1,26 @@
+[Unit]
+Description=DO Bot — WhatsApp Lorry Assignment Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/do_bot
+EnvironmentFile=/opt/do_bot/.env
+ExecStart=/opt/do_bot/venv/bin/gunicorn \
+    --workers 1 \
+    --threads 8 \
+    --timeout 120 \
+    --bind 127.0.0.1:5000 \
+    --access-logfile /var/log/do_bot/access.log \
+    --error-logfile /var/log/do_bot/error.log \
+    app:app
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=do_bot
+
+[Install]
+WantedBy=multi-user.target
