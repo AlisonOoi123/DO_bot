@@ -90,6 +90,7 @@ if ($ngrokCmd) { $ngrokFound = $ngrokCmd.Source }
 if (-not $ngrokFound) {
     $candidates = @(
         "$APP_DIR\ngrok.exe",
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps\ngrok.exe",
         "$env:USERPROFILE\scoop\shims\ngrok.exe",
         "$env:USERPROFILE\AppData\Local\ngrok\ngrok.exe",
         "$env:USERPROFILE\ngrok.exe",
@@ -105,12 +106,21 @@ if (-not $ngrokFound) {
     if ($wingetMatch) { $ngrokFound = $wingetMatch }
 }
 if ($ngrokFound) {
-    Write-Host "   OK -- $ngrokFound" -ForegroundColor Green
+    Write-Host "   Found: $ngrokFound" -ForegroundColor Green
     $ngrokVer = & $ngrokFound version 2>&1 | Select-Object -First 1
     Write-Host "   Version: $ngrokVer" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "   TIP: If the ngrok_do_bot service was set up before ngrok was found," -ForegroundColor Yellow
-    Write-Host "        re-run setup_windows.ps1 so the service path is updated." -ForegroundColor Yellow
+    if ($ngrokFound -like "*WindowsApps*") {
+        Write-Host ""
+        Write-Host "   WARNING: WindowsApps alias detected. NSSM services run as SYSTEM" -ForegroundColor Yellow
+        Write-Host "            and cannot execute Windows Store app aliases -- the" -ForegroundColor Yellow
+        Write-Host "            ngrok_do_bot service will fail to start with this path." -ForegroundColor Yellow
+        Write-Host "            Fix: download the standalone zip from https://ngrok.com/download" -ForegroundColor Yellow
+        Write-Host "            and extract ngrok.exe to $APP_DIR, then re-run setup_windows.ps1." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "   TIP: If the ngrok_do_bot service was set up before ngrok was found," -ForegroundColor Yellow
+        Write-Host "        re-run setup_windows.ps1 so the service path is updated." -ForegroundColor Yellow
+    }
 } else {
     Write-Host "   MISSING -- ngrok.exe not found in PATH or common locations" -ForegroundColor Red
     Write-Host "   Download: https://ngrok.com/download  then place ngrok.exe in $APP_DIR" -ForegroundColor Red

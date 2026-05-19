@@ -98,6 +98,7 @@ function Find-NgrokPath {
 
     $fixed = @(
         "$APP_DIR\ngrok.exe",
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps\ngrok.exe",
         "$env:USERPROFILE\scoop\shims\ngrok.exe",
         "$env:USERPROFILE\AppData\Local\ngrok\ngrok.exe",
         "$env:USERPROFILE\ngrok.exe",
@@ -124,6 +125,12 @@ if (-not $ngrokPath) {
     Write-Host "            and extract ngrok.exe to $APP_DIR, then re-run this script." -ForegroundColor Yellow
 } else {
     Write-Host "   ngrok found: $ngrokPath" -ForegroundColor Gray
+    if ($ngrokPath -like "*WindowsApps*") {
+        Write-Host "   WARNING: This is a Windows Store app alias. NSSM services run as SYSTEM" -ForegroundColor Yellow
+        Write-Host "            and cannot execute WindowsApps aliases." -ForegroundColor Yellow
+        Write-Host "            Download the standalone ngrok.exe from https://ngrok.com/download" -ForegroundColor Yellow
+        Write-Host "            and extract it to $APP_DIR, then re-run this script." -ForegroundColor Yellow
+    }
 }
 
 try { & $NSSM stop   ngrok_do_bot         2>$null } catch {}; $LASTEXITCODE = 0
