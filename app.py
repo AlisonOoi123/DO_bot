@@ -340,8 +340,13 @@ def _send_do_list(to: str, header: str, body: str, button: str, items: list[dict
 
 
 if __name__ == "__main__":
-    import platform
-    print(f"🚀 Starting Meta WhatsApp Bot server...")
+    import platform, sys, io
+    # Windows services use cp1252 by default; reconfigure to UTF-8 so emoji
+    # in log output doesn't crash the process before waitress even starts.
+    if sys.platform == "win32":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    print("Starting Meta WhatsApp Bot server...")
     print(f"   Webhook URL: {PUBLIC_BASE_URL}/webhook")
     print(f"   Verify token: {META_VERIFY_TOKEN}")
     port = int(os.environ.get("PORT", 5000))
@@ -350,7 +355,7 @@ if __name__ == "__main__":
         print(f"   Server: waitress (Windows) on port {port}")
         serve(app, host="0.0.0.0", port=port, threads=8)
     else:
-        # use_reloader=False is CRITICAL — Flask watchdog restarts the server
+        # use_reloader=False is CRITICAL -- Flask watchdog restarts the server
         # whenever any file in the project dir changes (including Excel writes),
         # which kills in-flight requests and loses all session data.
         app.run(debug=False, host="0.0.0.0", port=port, use_reloader=False)
