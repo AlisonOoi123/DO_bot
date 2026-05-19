@@ -128,7 +128,10 @@ function Install-NgrokStandalone {
         Write-Host "   Could not add Defender exclusion (non-fatal): $_" -ForegroundColor Gray
     }
 
-    $zipPath = "$env:TEMP\ngrok-standalone.zip"
+    # Download directly into APP_DIR (which has the Defender exclusion).
+    # Do NOT use $env:TEMP -- Defender scans it and quarantines the file there
+    # before it can be moved to the excluded folder.
+    $zipPath = "$APP_DIR\ngrok-standalone.zip"
     try {
         Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
             -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
