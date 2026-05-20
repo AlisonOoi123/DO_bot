@@ -283,10 +283,22 @@ def _bearing_diff(b1: float, b2: float) -> float:
 # Depot: Eng Sheng HQ — No 11 Persiaran Sabak Bernam, Section 26 (HICOM), 40400 Shah Alam
 _DEPOT = (3.0340, 101.5563)
 
+# Per-route GPS centroids derived from the LONGITUD column in the history file.
+# Populated by LorryEngine._load_history(); takes priority over waypoint geocoding.
+_HISTORY_CENTROIDS: dict[str, tuple] = {}
+
 def _route_centroid(route: str) -> tuple | None:
     """Geographic centroid (lat, lng) of a route's destinations.
-    Uses extracted waypoints; falls back to the cluster's capital city.
+
+    Priority:
+      1. GPS coordinates from the history LONGITUD column (most accurate).
+      2. Waypoint geocoding via _MY_COORDS / Nominatim.
+      3. Cluster capital city as last resort.
     """
+    key = route.strip().upper()
+    if key in _HISTORY_CENTROIDS:
+        return _HISTORY_CENTROIDS[key]
+
     waypoints = list(_extract_waypoints(route))
     if not waypoints:
         intel = _extract_route_intelligence(route)
@@ -483,15 +495,49 @@ class LorryEngine:
         self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
         self.all_lorries = df.copy()
 
+    @staticmethod
+    def _parse_longitud_centroids(df: pd.DataFrame) -> dict:
+        """Build {ROUTE_KEY: (lat, lon)} from the LONGITUD column.
+        Each row may have one 'lat lon' pair; we average all pairs per route.
+        """
+        if "LONGITUD" not in df.columns or "ROUTE" not in df.columns:
+            return {}
+        out: dict[str, tuple] = {}
+        for route, grp in df.groupby("ROUTE"):
+            coords = []
+            for val in grp["LONGITUD"].dropna():
+                try:
+                    parts = str(val).strip().split()
+                    if len(parts) >= 2:
+                        lat, lon = float(parts[0]), float(parts[1])
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            coords.append((lat, lon))
+                except (ValueError, IndexError):
+                    continue
+            if coords:
+                out[str(route).strip().upper()] = (
+                    sum(c[0] for c in coords) / len(coords),
+                    sum(c[1] for c in coords) / len(coords),
+                )
+        return out
+
     def _load_history(self, path):
         import os, glob
+        global _HISTORY_CENTROIDS
         paths = [path] if os.path.isfile(path) else (glob.glob(path + "*") or [path])
         frames = []
         for p in paths:
             try:
                 eng = "xlrd" if str(p).lower().endswith(".xls") else "openpyxl"
                 df  = pd.read_excel(p, engine=eng)
-                df.columns = [c.strip().upper() for c in df.columns]
+                df.columns = [str(c).strip().upper() for c in df.columns]
+                # Some exports have a metadata row before the real header row.
+                # Detect this: if "ROUTE" is missing but appears in the first data row.
+                if "ROUTE" not in df.columns and len(df) > 0:
+                    first_row = df.iloc[0].astype(str).str.strip().str.upper()
+                    if "ROUTE" in first_row.values:
+                        df = pd.read_excel(p, engine=eng, header=1)
+                        df.columns = [str(c).strip().upper() for c in df.columns]
                 if "GROSS WEIGHT" in df.columns and "WEIGHT(T)" not in df.columns:
                     df["WEIGHT(T)"] = pd.to_numeric(df["GROSS WEIGHT"], errors="coerce").fillna(0) / 1000.0
                 if "LICENSE" in df.columns:
@@ -504,6 +550,9 @@ class LorryEngine:
                     df["CLUSTER"]    = intel.apply(lambda x: x["cluster"])
                     df["CORRIDOR"]   = intel.apply(lambda x: x["corridor"])
                     df["ROUTE_CODE"] = intel.apply(lambda x: x["route_code"])
+                    # Build GPS centroid cache from LONGITUD column
+                    new_centroids = self._parse_longitud_centroids(df)
+                    _HISTORY_CENTROIDS.update(new_centroids)
                 if "DISTANCE" in df.columns:
                     df["DISTANCE_KM"] = df["DISTANCE"].apply(_distance_km)
                 frames.append(df)

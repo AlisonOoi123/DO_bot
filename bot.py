@@ -23,14 +23,17 @@ _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
 MASTER_PATH    = os.path.join(_HERE, "master lorry.xlsx")      # read-only, stays in root
-# History paths — engine merges both files automatically for maximum frequency data
+# History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
+HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
 
 def _resolve_history_path() -> str:
-    """Return the best available history file, preferring new format."""
-    for p in [HISTORY_PATH, HISTORY_PATH_ALT, HISTORY_PATH_OLD]:
+    """Return the best available history file.
+    Prefers the .xls version (has LONGITUD GPS column) over .xlsx fallbacks.
+    """
+    for p in [HISTORY_PATH_XLS, HISTORY_PATH, HISTORY_PATH_ALT, HISTORY_PATH_OLD]:
         if os.path.exists(p):
             return p
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
