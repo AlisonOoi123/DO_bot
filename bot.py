@@ -1368,8 +1368,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
         from lorry_engine import (
             _extract_route_intelligence,
             _routes_on_same_way,
+            can_share_cross_cluster,
             MAX_STOPS_PER_LORRY as _MAX_STOPS,
         )
+        _GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 
         # Step 1 — exact-route buckets
         route_buckets: dict[str, list] = defaultdict(list)
@@ -1445,6 +1447,57 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     current_w   += w
             if current_sub:
                 sorted_groups.append(current_sub)
+
+        # ── Step 4: geographic cross-cluster merge ─────────────────────────────
+        # Same-cluster corridor merging (Step 2) only joins routes within the
+        # same region.  For groups whose combined weight still leaves a lorry
+        # very under-utilised, try to join them with groups from OTHER clusters
+        # if Google Geocoding confirms their destinations are within 300 km.
+        #
+        # Example: PH01-03 (Pahang/Bentong, 0.275T) + TR02 (Terengganu, 6T)
+        # both travel the KL→East highway and share waypoints ≈160 km apart.
+        # Without a Google API key this step is skipped entirely.
+        if _GMAPS_KEY:
+            _cross_merged = [False] * len(sorted_groups)
+            _new_groups: list[list] = []
+
+            for i, base_sg in enumerate(sorted_groups):
+                if _cross_merged[i]:
+                    continue
+                merged = list(base_sg)
+                base_route = base_sg[0]["ROUTE"]
+
+                for j in range(i + 1, len(sorted_groups)):
+                    if _cross_merged[j]:
+                        continue
+                    cand_sg    = sorted_groups[j]
+                    cand_route = cand_sg[0]["ROUTE"]
+
+                    # Skip if same cluster — already handled by corridor merge
+                    intel_base = _extract_route_intelligence(base_route)
+                    intel_cand = _extract_route_intelligence(cand_route)
+                    if intel_base["cluster"] == intel_cand["cluster"]:
+                        continue
+
+                    combined_w  = sum(it["WEIGHT"] for it in merged) + \
+                                  sum(it["WEIGHT"] for it in cand_sg)
+                    n_routes    = len({it["ROUTE"] for it in merged}) + \
+                                  len({it["ROUTE"] for it in cand_sg})
+
+                    if combined_w > max_lorry_cap:
+                        continue
+                    if n_routes > _MAX_STOPS:
+                        continue
+                    if not can_share_cross_cluster(base_route, cand_route,
+                                                   _GMAPS_KEY, max_km=300.0):
+                        continue
+
+                    merged += list(cand_sg)
+                    _cross_merged[j] = True
+
+                _new_groups.append(merged)
+
+            sorted_groups = _new_groups
 
         # Heaviest groups first so they claim the best-fit lorries first
         sorted_groups.sort(

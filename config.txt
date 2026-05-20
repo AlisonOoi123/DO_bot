@@ -5,3 +5,9 @@ META_ACCESS_TOKEN=EAASidLoOZCBsBRXKmgBmUvkrnNrh1NlIQ53FMToBjXsLBJr8NbnRHwM5yPEZC
 META_PHONE_NUMBER_ID=1089588587573422
 META_VERIFY_TOKEN=eslorrybot2026
 PUBLIC_BASE_URL=https://degraded-sincerity-glue.ngrok-free.dev
+
+# Google Maps Geocoding API key — used for cross-cluster route merging.
+# Get one at: console.cloud.google.com -> APIs & Services -> Credentials
+# Enable: Geocoding API
+# Leave blank to disable geographic cross-cluster merging.
+GOOGLE_MAPS_API_KEY=

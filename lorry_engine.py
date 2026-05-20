@@ -14,7 +14,11 @@ Implements requirements from WhatsApp AI Logistics Suggestion System:
 """
 
 import re
+import os
+import json
+import requests
 import pandas as pd
+from math import radians, cos, sin, asin, sqrt
 from typing import Optional
 
 
@@ -58,6 +62,139 @@ _ADJACENT_CORRIDORS = {
 MAX_STOPS_PER_LORRY   = 8     # Rule 6
 MERGE_DIST_THRESHOLD  = 0.25  # Rule 7: reject if extra dist > 25%
 CAPACITY_TARGET       = 0.80  # Rule 3: target >= 80% utilisation
+
+# ── Geographic cross-cluster merging (Google Geocoding + Haversine) ───────────
+
+_GEOCACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "geocode_cache.json")
+_geocode_cache: dict = {}
+_geocache_dirty = False
+
+def _load_geocache():
+    global _geocode_cache
+    if os.path.exists(_GEOCACHE_PATH):
+        try:
+            with open(_GEOCACHE_PATH) as f:
+                _geocode_cache = json.load(f)
+        except Exception:
+            _geocode_cache = {}
+
+def _save_geocache():
+    global _geocache_dirty
+    if not _geocache_dirty:
+        return
+    os.makedirs(os.path.dirname(_GEOCACHE_PATH), exist_ok=True)
+    with open(_GEOCACHE_PATH, "w") as f:
+        json.dump(_geocode_cache, f, indent=2)
+    _geocache_dirty = False
+
+_load_geocache()
+
+def _geocode(place: str, api_key: str) -> tuple | None:
+    """Geocode a place name to (lat, lng) using Google Geocoding API.
+    Results are cached to data/geocode_cache.json to avoid repeated API calls.
+    """
+    key = place.strip().upper()
+    if key in _geocode_cache:
+        cached = _geocode_cache[key]
+        return tuple(cached) if cached else None
+    if not api_key:
+        return None
+    global _geocache_dirty
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": f"{place}, Malaysia", "key": api_key},
+            timeout=5,
+        )
+        data = resp.json()
+        if data.get("status") == "OK":
+            loc = data["results"][0]["geometry"]["location"]
+            coords = [loc["lat"], loc["lng"]]
+            _geocode_cache[key] = coords
+            _geocache_dirty = True
+            _save_geocache()
+            return tuple(coords)
+    except Exception:
+        pass
+    # Cache the miss so we don't retry every time
+    _geocode_cache[key] = None
+    _geocache_dirty = True
+    _save_geocache()
+    return None
+
+# Fallback city for each cluster when no waypoints can be extracted
+_CLUSTER_CITY = {
+    "KL_VALLEY":       "Petaling Jaya",
+    "KL_CITY":         "Kuala Lumpur City Centre",
+    "JOHOR":           "Johor Bahru",
+    "PAHANG":          "Kuantan",
+    "PERAK":           "Ipoh",
+    "MELAKA":          "Melaka",
+    "SABAH":           "Kota Kinabalu",
+    "SARAWAK":         "Kuching",
+    "KEDAH":           "Alor Setar",
+    "PENANG":          "George Town Penang",
+    "TERENGGANU":      "Kuala Terengganu",
+    "KELANTAN":        "Kota Bharu",
+    "NEGERI_SEMBILAN": "Seremban",
+}
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    return 2 * R * asin(sqrt(a))
+
+def _route_centroid(route: str, api_key: str) -> tuple | None:
+    """Return the geographic centroid (lat, lng) of a route's destinations.
+    Uses waypoints from the route description; falls back to cluster capital city.
+    """
+    waypoints = list(_extract_waypoints(route))
+    if not waypoints:
+        intel = _extract_route_intelligence(route)
+        city  = _CLUSTER_CITY.get(intel.get("cluster", "UNKNOWN"))
+        return _geocode(city, api_key) if city else None
+
+    coords = []
+    for wp in waypoints[:6]:  # cap at 6 to limit API calls
+        c = _geocode(wp, api_key)
+        if c:
+            coords.append(c)
+    if not coords:
+        # Fallback to cluster city if no waypoints resolved
+        intel = _extract_route_intelligence(route)
+        city  = _CLUSTER_CITY.get(intel.get("cluster", "UNKNOWN"))
+        return _geocode(city, api_key) if city else None
+    return (
+        sum(c[0] for c in coords) / len(coords),
+        sum(c[1] for c in coords) / len(coords),
+    )
+
+def routes_distance_km(route1: str, route2: str, api_key: str) -> float | None:
+    """Straight-line km between the geographic centroids of two routes.
+    Returns None if either route cannot be geocoded.
+    """
+    c1 = _route_centroid(route1, api_key)
+    c2 = _route_centroid(route2, api_key)
+    if c1 is None or c2 is None:
+        return None
+    return _haversine_km(c1[0], c1[1], c2[0], c2[1])
+
+def can_share_cross_cluster(route1: str, route2: str, api_key: str,
+                             max_km: float = 300.0) -> bool:
+    """Two routes from different clusters can share a lorry if their geographic
+    centroids are within max_km straight-line distance of each other.
+    300 km covers all intra-Peninsular combinations; East Malaysia (Sabah/Sarawak)
+    is ~1 500 km from KL and will always be rejected.
+    """
+    if not api_key:
+        return False
+    dist = routes_distance_km(route1, route2, api_key)
+    if dist is None:
+        return False
+    return dist <= max_km
 
 
 def _extract_route_intelligence(route: str) -> dict:
