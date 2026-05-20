@@ -440,18 +440,24 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
     if ia["cluster"] == "UNKNOWN":
         return False
 
-    # Path A: both have a named directional corridor
+    # Path A: both have a named directional corridor — they must match
     if ia["corridor"] != "GENERAL" and ib["corridor"] != "GENERAL":
         if ia["corridor"] != ib["corridor"]:
             return False
-    else:
-        # Path B: at least one is GENERAL → need shared waypoints
+    elif ia["corridor"] == "GENERAL" and ib["corridor"] == "GENERAL":
+        # Path B: BOTH are GENERAL → need shared waypoints to confirm direction
         wp1 = _extract_waypoints(route1)
         wp2 = _extract_waypoints(route2)
         if not wp1 or not wp2:
             return False
         if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
             return False
+    # else: one has a named corridor and the other is GENERAL (same cluster).
+    # The named corridor gives directional context; let the bearing check below
+    # decide whether they actually point the same way.  This handles routes like
+    # KV09A whose suffix contains extra text ("** START UKAY") that shifts
+    # corridor parsing to GENERAL even though the route is in the same direction
+    # as the adjacent NORTHEAST routes.
 
     # Bearing check: even same-corridor routes can go in opposite directions
     # (the "CENTRAL" code is reused for both E and W sub-routes in KV cluster).

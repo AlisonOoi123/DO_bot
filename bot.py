@@ -1575,6 +1575,25 @@ def _handle_excel_upload(phone, sess, file_bytes):
             """Assign ONE lorry (or split) to cover ALL items in the group.
             All items in the group share the same route (one route = one lorry).
             """
+            # Pre-filter: mark items exceeding every available lorry's capacity as
+            # NO_LORRY before computing total_w.  Without this a 27T item in a 35T
+            # group inflates total_w so a 20T lorry ends up with only 8T of feasible
+            # cargo at 44% utilisation instead of the correct 10.5T lorry at 85%.
+            _max_cap = (float(engine.eligible_lorries["TON"].max())
+                        if not engine.eligible_lorries.empty else 0.0)
+            _all_group = list(group_items)
+            if _max_cap > 0:
+                for it in _all_group:
+                    if it.get("LORRY") is None and it["WEIGHT"] > _max_cap:
+                        it["LORRY"] = "NO_LORRY"
+                group_items = [it for it in _all_group if it.get("LORRY") != "NO_LORRY"]
+            else:
+                _all_group = list(group_items)
+            if not group_items:
+                for it in _all_group:
+                    sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
+                return
+
             total_w  = sum(it["WEIGHT"] for it in group_items)
             route    = group_items[0]["ROUTE"]
             customer = group_items[0]["CUSTOMER NAME"]
@@ -1721,7 +1740,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         for it in group_items:
                             it["LORRY"] = "NO_LORRY"
 
-            for it in group_items:
+            for it in _all_group:
                 sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
 
         for group in sorted_groups:
