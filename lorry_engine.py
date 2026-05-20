@@ -395,24 +395,33 @@ class LorryEngine:
             lambda u: 1.0 if u >= CAPACITY_TARGET else u / CAPACITY_TARGET)
         merged["IS_OWNER"] = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
-        # Two-tier sort (Rules 3 + 4):
+        # Three-tier utilisation sort (Rules 3 + 4):
         #
-        # Tier 1 (UTIL_GOOD=1): lorries where this load uses ≥60% of capacity.
-        #   These are "good fits" — within this tier, history breaks the tie.
+        # Tier 2 (UTIL_GOOD=1): load uses ≥60% of capacity → "good fit".
+        #   Within tier: history (CUST/CLUSTER/ROUTE_FREQ) breaks the tie,
+        #   then SURPLUS (tightest fit), then owner preference.
         #
-        # Tier 2 (UTIL_GOOD=0): lorries that are too big (utilisation <60%).
-        #   Sorted by tightest fit (SURPLUS ASC) so we waste the least space,
-        #   then by history as a secondary tiebreaker.
+        # Tier 1 (UTIL_OK=1, UTIL_GOOD=0): 40–60% util → "acceptable".
+        #   Within tier: SURPLUS first (prefer smaller lorry = less waste),
+        #   then history as tiebreaker.  This prevents a 20T lorry with high
+        #   history beating a 5T lorry just because it's driven that route before.
         #
-        # This means: a 5T lorry at 70% util always beats a 10.5T lorry at 34%
-        # util even if the 10.5T has historical frequency for that route.
+        # Tier 0 (UTIL_OK=0): <40% util → "poor fit".
+        #   Within tier: SURPLUS first, then history.
+        #
+        # Cross-tier: Tier 2 always beats Tier 1 always beats Tier 0.
         UTIL_GOOD_THRESHOLD = 0.60
+        UTIL_OK_THRESHOLD   = 0.40
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
+        merged["UTIL_OK"]   = (merged["UTIL"] >= UTIL_OK_THRESHOLD).astype(int)
 
         merged = merged.sort_values(
-            ["UTIL_GOOD", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE",
-             "SURPLUS", "IS_OWNER", "ROUTE_FREQ"],
-            ascending=[False, False, False, False, True, False, False])
+            # Primary: utilisation tier (2 > 1 > 0)
+            ["UTIL_GOOD", "UTIL_OK",
+             # Within Tier 2 (good fit): history-first, then tightest-fit
+             "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"],
+            ascending=[False, False,
+                       False, False, False, True, False, False])
 
         results = []
         for _, row in merged.head(top_n).iterrows():
@@ -528,6 +537,12 @@ class LorryEngine:
         if remain > 0:
             return None
         if sum(c["SURPLUS"] for c in chosen) >= best_surplus:
+            return None
+        # Reject if any lorry in the split would be severely underutilised.
+        # (e.g. VEA2818 1.07T carrying 58 kg overflow = 5% — better to use a
+        # single slightly-large lorry at 59% than two lorries where one is empty)
+        _MIN_SPLIT_UTIL = 40.0   # each split lorry must carry ≥ 40% of its capacity
+        if any(c["UTIL_PCT"] < _MIN_SPLIT_UTIL for c in chosen):
             return None
         return chosen
 

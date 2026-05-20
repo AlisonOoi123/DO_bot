@@ -1485,38 +1485,42 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         single_util_threshold=0.60,
                     )
                 if split_option is not None:
-                    # Distribute items across split lorries
+                    # Each lorry in the split carries a portion of the items.
+                    # Build bins with their allotted weight (PORTION).
                     bins = [
                         {"lorry": s["LORRY"],
                          "rows":  [],
-                         "cap":   s["TON_CAPACITY"] - s["PORTION"],
-                         "remain": s["PORTION"]}
+                         "remain": s["PORTION"]}   # how much this bin can take
                         for s in split_option
                     ]
                     for s in split_option:
                         sess["unavailable"].add(s["LORRY"])
-                    # Assign each item to a bin that still has capacity
+                    # Assign each item to exactly ONE bin (greedy, heaviest first)
+                    item_bin: dict[str, str] = {}
                     for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
                         placed = False
                         for bin_ in bins:
                             if bin_["remain"] >= it["WEIGHT"] - 0.001:
                                 bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
                                 bin_["remain"] -= it["WEIGHT"]
+                                item_bin[it["DO NUMBER"]] = bin_["lorry"]
                                 placed = True
                                 break
                         if not placed:
                             bins[0]["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
-                    # Write to each item
+                            item_bin[it["DO NUMBER"]] = bins[0]["lorry"]
+                    # Each item gets ONE lorry plate — no more "VEA2818, W3618U" for all
                     for it in group_items:
-                        it["LORRY"]         = "SPLIT"
-                        it["SPLIT_LORRIES"] = [b for b in bins if b["rows"]]
+                        it["LORRY"] = item_bin.get(it["DO NUMBER"], bins[0]["lorry"])
+                        it.pop("SPLIT_LORRIES", None)
                 else:
                     lorry = suggestions[0]["LORRY"]
                     sess["unavailable"].add(lorry)
                     for it in group_items:
                         it["LORRY"] = lorry
             else:
-                # No single lorry — bin-pack across multiple lorries
+                # No single lorry fits — bin-pack across multiple lorries.
+                # Each item is assigned to exactly ONE lorry.
                 remain = total_w
                 bins   = []
                 for _ in range(10):
@@ -1532,22 +1536,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if not sug:
                         break
                     sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
-                    lorry = sug[0]["LORRY"]
-                    cap   = sug[0]["TON_CAPACITY"]
+                    lorry   = sug[0]["LORRY"]
+                    cap     = sug[0]["TON_CAPACITY"]
                     portion = min(cap, remain)
-                    bins.append({"lorry": lorry, "rows": [], "cap": cap - portion})
+                    bins.append({"lorry": lorry, "rows": [], "remain": portion})
                     sess["unavailable"].add(lorry)
                     remain = round(remain - cap, 6)
 
                 if remain <= 0 and bins:
-                    # Distribute items into bins
+                    # Distribute items into bins (each item → one bin)
+                    item_bin2: dict[str, str] = {}
                     for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
+                        placed = False
                         for bin_ in bins:
-                            bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
-                            break
+                            if bin_["remain"] >= it["WEIGHT"] - 0.001:
+                                bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                bin_["remain"] -= it["WEIGHT"]
+                                item_bin2[it["DO NUMBER"]] = bin_["lorry"]
+                                placed = True
+                                break
+                        if not placed:
+                            bins[0]["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                            item_bin2[it["DO NUMBER"]] = bins[0]["lorry"]
                     for it in group_items:
-                        it["LORRY"]         = "SPLIT"
-                        it["SPLIT_LORRIES"] = bins
+                        it["LORRY"] = item_bin2.get(it["DO NUMBER"], bins[0]["lorry"])
+                        it.pop("SPLIT_LORRIES", None)
                 else:
                     # Bin-pack failed — all lorries taken or too small.
                     # Last resort: find the tightest-fitting available lorry
