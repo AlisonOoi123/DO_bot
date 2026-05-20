@@ -1354,80 +1354,102 @@ def _handle_excel_upload(phone, sess, file_bytes):
         eligible_caps   = sorted(engine.eligible_lorries["TON"].tolist())
         smallest_cap    = eligible_caps[0] if eligible_caps else 1.0
 
-        # ── Route grouping with same-corridor merging ──────────────────────────
-        # Pass 1: group by exact route (Rule 1 — same route, same lorry).
-        # Pass 2: merge non-heaviest groups that share the same cluster AND the
-        #   same exact corridor direction (e.g. both "NORTH"), provided the
-        #   merged group's distinct-route count stays ≤ MAX_STOPS_PER_LORRY and
-        #   combined weight still fits the largest available lorry.
-        # The single heaviest route is never merged — it gets its own lorry.
+        # ── Route grouping with geographic corridor merging ────────────────────
+        # Step 1: one item-list per exact route code.
+        # Step 2: build "corridor super-groups" — all routes that travel in the
+        #   same cluster+corridor direction AND pass through a shared geographic
+        #   waypoint (or have no parseable waypoints, in which case corridor
+        #   match alone is sufficient).
+        # Step 3: if a super-group is too heavy for the largest lorry, bin-pack
+        #   it into sub-groups (heaviest routes first).
+        # No "heaviest stays alone" rule — every route that goes the same way
+        # should share a lorry; capacity is the only hard limit.
         from collections import defaultdict
-        from lorry_engine import _extract_route_intelligence, MAX_STOPS_PER_LORRY as _MAX_STOPS
-
-        route_groups: dict[str, list] = defaultdict(list)
-        for it in items:
-            key = it["ROUTE"].strip().upper()
-            route_groups[key].append(it)
-
-        # Sort all route groups heaviest first
-        raw_groups = sorted(
-            route_groups.values(),
-            key=lambda grp: sum(it["WEIGHT"] for it in grp),
-            reverse=True,
+        from lorry_engine import (
+            _extract_route_intelligence,
+            _routes_on_same_way,
+            MAX_STOPS_PER_LORRY as _MAX_STOPS,
         )
 
-        if len(raw_groups) <= 1:
-            sorted_groups = raw_groups
-        else:
-            max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
-                if not engine.eligible_lorries.empty else 99.0
+        # Step 1 — exact-route buckets
+        route_buckets: dict[str, list] = defaultdict(list)
+        for it in items:
+            route_buckets[it["ROUTE"].strip().upper()].append(it)
 
-            # Heaviest route stands alone — no merging
-            heaviest_group = raw_groups[0]
-            rest = raw_groups[1:]
+        # Step 2 — cluster same-way buckets into corridor super-groups
+        # Each super-group is a list of route-bucket lists.
+        max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
+            if not engine.eligible_lorries.empty else 99.0
 
-            # Greedy forward merge among the lighter groups
-            merged_groups: list[list] = []
-            used = [False] * len(rest)
+        bucket_list = list(route_buckets.values())   # list of [item, …]
+        in_group    = [False] * len(bucket_list)
+        super_groups: list[list] = []                # each entry = flat item list
 
-            for i in range(len(rest)):
-                if used[i]:
+        for i, base_bucket in enumerate(bucket_list):
+            if in_group[i]:
+                continue
+            base_route = base_bucket[0]["ROUTE"]
+            merged_items = list(base_bucket)
+            in_group[i]  = True
+
+            for j in range(i + 1, len(bucket_list)):
+                if in_group[j]:
                     continue
-                base = list(rest[i])
-                base_intel = _extract_route_intelligence(base[0]["ROUTE"])
+                cand_bucket = bucket_list[j]
+                cand_route  = cand_bucket[0]["ROUTE"]
 
-                for j in range(i + 1, len(rest)):
-                    if used[j]:
-                        continue
-                    cand = rest[j]
-                    cand_intel = _extract_route_intelligence(cand[0]["ROUTE"])
+                # All routes already absorbed into merged_items
+                combined_w = sum(it["WEIGHT"] for it in merged_items) + \
+                             sum(it["WEIGHT"] for it in cand_bucket)
+                n_distinct = len({it["ROUTE"] for it in merged_items}) + 1
 
-                    combined_routes = (
-                        len({it["ROUTE"] for it in base})
-                        + len({it["ROUTE"] for it in cand})
-                    )
-                    combined_weight = (
-                        sum(it["WEIGHT"] for it in base)
-                        + sum(it["WEIGHT"] for it in cand)
-                    )
+                if (
+                    combined_w <= max_lorry_cap
+                    and n_distinct <= _MAX_STOPS
+                    and _routes_on_same_way(base_route, cand_route)
+                ):
+                    merged_items += list(cand_bucket)
+                    in_group[j]   = True
 
-                    if (
-                        base_intel["cluster"]  == cand_intel["cluster"]
-                        and base_intel["corridor"] == cand_intel["corridor"]
-                        and base_intel["corridor"] != "GENERAL"
-                        and combined_routes <= _MAX_STOPS
-                        and combined_weight <= max_lorry_cap
-                    ):
-                        base = base + list(cand)
-                        used[j] = True
+            super_groups.append(merged_items)
 
-                merged_groups.append(base)
+        # Step 3 — if a super-group is heavier than max lorry cap, bin-pack it
+        # into capacity-sized sub-groups (heaviest route bucket first).
+        sorted_groups: list[list] = []
+        for sg in super_groups:
+            total_w = sum(it["WEIGHT"] for it in sg)
+            if total_w <= max_lorry_cap:
+                sorted_groups.append(sg)
+                continue
 
-            # Re-sort merged groups heaviest first so they claim lorries first
-            merged_groups.sort(
-                key=lambda g: sum(it["WEIGHT"] for it in g), reverse=True
+            # Over-capacity super-group — split into sub-groups
+            sub_buckets = defaultdict(list)
+            for it in sg:
+                sub_buckets[it["ROUTE"]].append(it)
+            sub_list = sorted(
+                sub_buckets.values(),
+                key=lambda b: sum(i["WEIGHT"] for i in b),
+                reverse=True,
             )
-            sorted_groups = [heaviest_group] + merged_groups
+
+            current_sub: list = []
+            current_w = 0.0
+            for sub_b in sub_list:
+                w = sum(it["WEIGHT"] for it in sub_b)
+                if current_sub and current_w + w > max_lorry_cap:
+                    sorted_groups.append(current_sub)
+                    current_sub = list(sub_b)
+                    current_w   = w
+                else:
+                    current_sub += list(sub_b)
+                    current_w   += w
+            if current_sub:
+                sorted_groups.append(current_sub)
+
+        # Heaviest groups first so they claim the best-fit lorries first
+        sorted_groups.sort(
+            key=lambda g: sum(it["WEIGHT"] for it in g), reverse=True
+        )
 
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
@@ -1527,19 +1549,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         it["LORRY"]         = "SPLIT"
                         it["SPLIT_LORRIES"] = bins
                 else:
-                    # Bin-pack failed — every lorry is taken or too small.
-                    # Assign the largest still-available lorry as a last resort
-                    # (overloaded is better than unassigned per business rule).
+                    # Bin-pack failed — all lorries taken or too small.
+                    # Last resort: find the tightest-fitting available lorry
+                    # that is NOT overloaded (combined weight ≤ capacity).
+                    # If even the largest lorry can't handle the weight → NO_LORRY.
                     excl_final = sess["unavailable"] | get_assigned_today()
                     last_resort = engine.suggest_largest_available(
-                        route, excl_final, _today())
+                        route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
                         lorry = last_resort[0]["LORRY"]
                         sess["unavailable"].add(lorry)
                         for it in group_items:
                             it["LORRY"] = lorry
                     else:
-                        # Truly no lorries left at all
+                        # No lorry can carry this weight without overloading
                         for it in group_items:
                             it["LORRY"] = "NO_LORRY"
 

@@ -31,9 +31,12 @@ _CLUSTER_MAP = {
 }
 
 _CORRIDOR_MAP = {
-    "N": "NORTH", "S": "SOUTH", "E": "EAST", "W": "WEST",
-    "SE": "SOUTHEAST", "NE": "NORTHEAST", "SW": "SOUTHWEST",
-    "NW": "NORTHWEST", "C": "CENTRAL", "WN": "WEST_NORTH", "P": "PORT",
+    "N": "NORTH",    "S": "SOUTH",     "E": "EAST",      "W": "WEST",
+    "SE": "SOUTHEAST", "ES": "SOUTHEAST",
+    "NE": "NORTHEAST", "EN": "NORTHEAST",
+    "SW": "SOUTHWEST", "WS": "SOUTHWEST",
+    "NW": "NORTHWEST", "WN": "WEST_NORTH",
+    "C": "CENTRAL",  "P": "PORT",
 }
 
 # Rule 2: which corridors can share a lorry
@@ -66,13 +69,83 @@ def _extract_route_intelligence(route: str) -> dict:
     m = re.match(r'^([A-Z]{2}\d+[A-Z]?)', route_s, re.IGNORECASE)
     route_code = m.group(1).upper() if m else prefix
 
+    # Normalise separators so both "KV04A - N 4" and "JH09-->Kulai" work
+    normalised = re.sub(r'-->|->|→', ' - ', route_s)
     corridor = "GENERAL"
-    if " - " in route_s:
-        parts      = [p.strip() for p in route_s.split(" - ")]
+    if " - " in normalised:
+        parts      = [p.strip() for p in normalised.split(" - ")]
         suffix_raw = parts[-1].split()[0].upper() if parts else ""
         corridor   = _CORRIDOR_MAP.get(suffix_raw, "GENERAL")
 
     return {"cluster": cluster, "corridor": corridor, "route_code": route_code}
+
+
+def _extract_waypoints(route: str) -> frozenset:
+    """
+    Extract intermediate place-name tokens from a route description string.
+    Handles both "KV04A - PLACE1 - PLACE2 - N 4" and "JH09-->Kulai-Senai" formats.
+    Returns a frozenset of uppercased tokens (empty if route is just a code).
+    """
+    normalised = re.sub(r'-->|->|→', ' - ', route.strip())
+    parts = re.split(r'\s*-\s*', normalised)
+
+    _dir_re  = re.compile(r'^(N|S|E|W|NE|NW|SE|SW|WN|ES|EN|WS|C|P)\s*\d*$', re.IGNORECASE)
+    _code_re = re.compile(r'^[A-Z]{2}\d', re.IGNORECASE)
+
+    waypoints = []
+    for i, raw in enumerate(parts):
+        tok = raw.strip().upper()
+        if not tok:
+            continue
+        if i == 0 and _code_re.match(tok):
+            continue             # skip leading route code (KV04A, JH09, …)
+        if _dir_re.match(tok):
+            continue             # skip direction suffix (N 4, WN 1, SE 3, …)
+        tok = re.sub(r'\s+\d+\s*$', '', tok).strip()   # strip trailing numbers
+        if tok and not tok.isdigit() and len(tok) > 1:
+            waypoints.append(tok)
+    return frozenset(waypoints)
+
+
+def _routes_on_same_way(route1: str, route2: str) -> bool:
+    """
+    Return True when route1 and route2 can share a lorry because they travel
+    in the same geographic direction.
+
+    Two-path logic:
+      Path A — named corridor (N / SE / C / …):
+        Same cluster + same exact corridor string → same way.
+        (The corridor code is already a geographic direction; no further
+        waypoint check is required.  KV04A-NORTH and KV05A-NORTH both head
+        north from the warehouse even if their specific stops differ.)
+
+      Path B — GENERAL corridor (route uses --> format or has no direction code):
+        Same cluster + at least one shared waypoint (or one set is a
+        subset of the other) → same way.
+        (All three Pahang routes go through Bentong; all Johor branches
+        converge on JB — shared waypoints are the geographic signal.)
+
+    Cross-cluster merges are never allowed (JH ≠ KV etc.).
+    Routes whose cluster is UNKNOWN (bare codes like ZNA) are never merged.
+    """
+    ia = _extract_route_intelligence(route1)
+    ib = _extract_route_intelligence(route2)
+
+    if ia["cluster"] != ib["cluster"]:
+        return False
+    if ia["cluster"] == "UNKNOWN":
+        return False
+
+    # Path A: both have a named directional corridor
+    if ia["corridor"] != "GENERAL" and ib["corridor"] != "GENERAL":
+        return ia["corridor"] == ib["corridor"]
+
+    # Path B: at least one is GENERAL → need shared waypoints
+    wp1 = _extract_waypoints(route1)
+    wp2 = _extract_waypoints(route2)
+    if not wp1 or not wp2:
+        return False
+    return bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1
 
 
 def _corridors_adjacent(c1: str, c2: str) -> bool:
@@ -463,15 +536,14 @@ class LorryEngine:
         return _extract_route_intelligence(route)
 
     def suggest_largest_available(self, route: str, unavailable=None,
-                                   today_date_str: str = "") -> list:
+                                   today_date_str: str = "",
+                                   total_ton: float = 0.0) -> list:
         """
-        Last-resort assignment: return the single largest lorry that is still
-        available, ignoring weight constraints.
+        Last-resort assignment: return the single largest lorry still available
+        whose capacity is ≥ total_ton (so the lorry is NOT overloaded).
 
-        Called only when the DO weight exceeds every lorry's capacity AND
-        bin-packing across multiple lorries also failed — i.e. every normal
-        path returned nothing.  Assigning an overloaded lorry is better than
-        leaving the DO completely unassigned.
+        If every remaining lorry would be overloaded (total_ton > all caps),
+        returns [] — caller then assigns NO_LORRY.
 
         Returns a one-element list in the same format as suggest(), or [].
         """
@@ -484,7 +556,7 @@ class LorryEngine:
         if eligible.empty:
             return []
 
-        # Rule 6: honour the stop-count limit even for last-resort
+        # Rule 6: honour the stop-count limit
         if today_date_str:
             over = {
                 r["LORRY"] for _, r in eligible.iterrows()
@@ -494,6 +566,12 @@ class LorryEngine:
         if eligible.empty:
             return []
 
+        # Only assign lorries that can carry the load without exceeding capacity
+        if total_ton > 0:
+            eligible = eligible[eligible["TON"] >= total_ton].copy()
+        if eligible.empty:
+            return []   # every lorry would be overloaded → NO_LORRY
+
         intel      = _extract_route_intelligence(route)
         freq_route = self.get_route_frequencies(route)
         merged     = eligible.merge(
@@ -502,21 +580,29 @@ class LorryEngine:
         merged["ROUTE_FREQ"] = merged["ROUTE_FREQ"].fillna(0).astype(int)
         merged["IS_OWNER"]   = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
-        # Largest capacity first; use history + owner as tiebreakers
-        merged = merged.sort_values(
-            ["TON", "IS_OWNER", "ROUTE_FREQ"],
-            ascending=[False, False, False])
+        # Prefer tightest fit first (smallest surplus), then owner/history
+        if total_ton > 0:
+            merged["SURPLUS"] = merged["TON"] - total_ton
+            merged = merged.sort_values(
+                ["SURPLUS", "IS_OWNER", "ROUTE_FREQ"],
+                ascending=[True, False, False])
+        else:
+            merged = merged.sort_values(
+                ["TON", "IS_OWNER", "ROUTE_FREQ"],
+                ascending=[False, False, False])
 
-        row = merged.iloc[0]
-        cap = round(float(row["TON"]), 2)
+        row     = merged.iloc[0]
+        cap     = round(float(row["TON"]), 2)
+        surplus = round(cap - total_ton, 2) if total_ton > 0 else 0.0
+        util_pct = round(total_ton / cap * 100, 1) if cap > 0 and total_ton > 0 else 0.0
         return [{
             "LORRY":        row["LORRY"],
             "TON_CAPACITY": cap,
-            "SURPLUS":      0.0,
-            "UTIL_PCT":     999.0,   # sentinel: caller knows this is overloaded
+            "SURPLUS":      surplus,
+            "UTIL_PCT":     util_pct,
             "USER":         str(row["USER"]),
             "FREQ":         int(row["ROUTE_FREQ"]),
             "CLUSTER":      intel["cluster"],
             "CORRIDOR":     intel["corridor"],
-            "REASON":       f"Largest available lorry ({cap}T) — all others taken or insufficient",
+            "REASON":       f"Best available lorry ({cap}T) — {util_pct}% utilised, {surplus}T spare",
         }]
