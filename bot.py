@@ -1529,6 +1529,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if depot_to_cand < 50.0:   # local route — skip bearing check
                     continue
                 bearing_ok = True
+                bearing_checked = False  # must have ≥1 regional route in group to merge
                 for ex_route in {it["ROUTE"] for it in merged}:
                     ec = _route_centroid(ex_route)
                     if ec is None:
@@ -1536,11 +1537,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     d_ex = _haversine_km(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
                     if d_ex < 50.0:        # local route — skip bearing check
                         continue
+                    bearing_checked = True
                     b_ex = _bearing_deg(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
                     if _bearing_diff(b_ex, b_cand) > 80.0:
                         bearing_ok = False
                         break
-                if not bearing_ok:
+                # Reject if merged group has no regional routes — can't validate direction
+                if not bearing_checked or not bearing_ok:
                     continue
 
                 merged += list(cand_sg)
