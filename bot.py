@@ -1324,6 +1324,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "CODE":          str(row["CODE"]).strip(),
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
+                "DATE":          str(row.get("DATE", "")).strip(),
                 # assignment fields filled below
                 "LORRY":         None,   # plate string, or "SPLIT", "NO_LORRY"
                 "SPLIT_LORRIES": None,   # list of bins if split
@@ -1566,10 +1567,37 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         sorted_groups = _new_groups
 
-        # Heaviest groups first so they claim the best-fit lorries first
-        sorted_groups.sort(
-            key=lambda g: sum(it["WEIGHT"] for it in g), reverse=True
-        )
+        def _parse_date_sortkey(date_str: str) -> str:
+            """Convert any date string to ISO 'YYYY-MM-DD' for correct ordering.
+            Returns '9999-12-31' on failure so undated groups sort last.
+            Handles formats: 'd/m/yy', 'dd/mm/yy', 'YYYY-MM-DD', Excel serials.
+            """
+            s = (date_str or "").strip()
+            if not s or s.lower() in ("nan", "none", ""):
+                return "9999-12-31"
+            for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d", "%-d/%-m/%y"):
+                try:
+                    return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+            try:
+                ts = pd.to_datetime(s, dayfirst=True, errors="coerce")
+                if pd.notna(ts):
+                    return ts.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            return "9999-12-31"
+
+        def _group_sort_key(g):
+            """Primary: earliest delivery date in group (ascending).
+            Secondary: total weight (descending) so heavy groups within the same
+            date claim the best-fit lorries before lighter ones."""
+            dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
+            earliest = min(dates) if dates else "9999-12-31"
+            return (earliest, -sum(it["WEIGHT"] for it in g))
+
+        # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
+        sorted_groups.sort(key=_group_sort_key)
 
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
@@ -1766,6 +1794,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     "ROUTE":         item["ROUTE"],
                     "CODE":          item["CODE"],
                     "CUSTOMER NAME": item["CUSTOMER NAME"],
+                    "DATE":          item.get("DATE", ""),
                     "ITEMS":         [],          # list of item dicts
                 })
             pending_dos[seen_do[do_num]]["ITEMS"].append(item)
@@ -2286,6 +2315,9 @@ def _build_summary(sess) -> str:
             lines.append(f"*{entry_num}. {customer}*{itmref_str}")
             lines.append(f"📍 {route_short}")
             lines.append(f"🔖 {do_num}")
+            _do_date = do.get("DATE", "")
+            if _do_date and _do_date not in ("nan", "none", ""):
+                lines.append(f"📅 {_do_date}")
             lines.append(f"⚖️  {weight}T")
 
             # ── Lorry assignment ──────────────────────────────────────────
