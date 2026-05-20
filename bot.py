@@ -1499,6 +1499,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if base_clusters == {cand_cluster}:
                     continue
 
+                # KL_VALLEY / KL_CITY routes are local — never bundle with
+                # outstation clusters (prevents KV03A coastal + PK Perak merges
+                # that look like same direction but use different road corridors)
+                _LOCAL_CLUSTERS = {"KL_VALLEY", "KL_CITY"}
+                if (base_clusters & _LOCAL_CLUSTERS) or cand_cluster in _LOCAL_CLUSTERS:
+                    continue
+
                 combined_w = sum(it["WEIGHT"] for it in merged) + \
                              sum(it["WEIGHT"] for it in cand_sg)
                 n_routes   = len({it["ROUTE"] for it in merged}) + \

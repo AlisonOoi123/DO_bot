@@ -407,15 +407,15 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
     Two-path logic:
       Path A — named corridor (N / SE / C / …):
         Same cluster + same exact corridor string → same way.
-        (The corridor code is already a geographic direction; no further
-        waypoint check is required.  KV04A-NORTH and KV05A-NORTH both head
-        north from the warehouse even if their specific stops differ.)
 
       Path B — GENERAL corridor (route uses --> format or has no direction code):
         Same cluster + at least one shared waypoint (or one set is a
         subset of the other) → same way.
-        (All three Pahang routes go through Bentong; all Johor branches
-        converge on JB — shared waypoints are the geographic signal.)
+
+    Either path then applies a bearing sanity check: route centroids must
+    point in a similar direction from the depot (≤80°).  This prevents
+    "CENTRAL"-labelled routes that go in opposite directions (e.g. KV14A
+    Puchong 64° ENE vs KV21A Puncak Alam 335° NNW) from being merged.
 
     Cross-cluster merges are never allowed (JH ≠ KV etc.).
     Routes whose cluster is UNKNOWN (bare codes like ZNA) are never merged.
@@ -430,14 +430,31 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
 
     # Path A: both have a named directional corridor
     if ia["corridor"] != "GENERAL" and ib["corridor"] != "GENERAL":
-        return ia["corridor"] == ib["corridor"]
+        if ia["corridor"] != ib["corridor"]:
+            return False
+    else:
+        # Path B: at least one is GENERAL → need shared waypoints
+        wp1 = _extract_waypoints(route1)
+        wp2 = _extract_waypoints(route2)
+        if not wp1 or not wp2:
+            return False
+        if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
+            return False
 
-    # Path B: at least one is GENERAL → need shared waypoints
-    wp1 = _extract_waypoints(route1)
-    wp2 = _extract_waypoints(route2)
-    if not wp1 or not wp2:
-        return False
-    return bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1
+    # Bearing check: even same-corridor routes can go in opposite directions
+    # (the "CENTRAL" code is reused for both E and W sub-routes in KV cluster).
+    c1 = _route_centroid(route1)
+    c2 = _route_centroid(route2)
+    if c1 is not None and c2 is not None:
+        d1 = _haversine_km(_DEPOT[0], _DEPOT[1], c1[0], c1[1])
+        d2 = _haversine_km(_DEPOT[0], _DEPOT[1], c2[0], c2[1])
+        if d1 >= 3.0 and d2 >= 3.0:  # skip if centroid is essentially at depot
+            b1 = _bearing_deg(_DEPOT[0], _DEPOT[1], c1[0], c1[1])
+            b2 = _bearing_deg(_DEPOT[0], _DEPOT[1], c2[0], c2[1])
+            if _bearing_diff(b1, b2) > 80.0:
+                return False
+
+    return True
 
 
 def _corridors_adjacent(c1: str, c2: str) -> bool:
