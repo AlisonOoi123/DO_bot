@@ -1647,22 +1647,28 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             it["LORRY"] = lorry
             else:
                 # No single lorry fits — bin-pack across multiple lorries.
-                # Each item is assigned to exactly ONE lorry.
+                # Build bins using tightest-fit first: ask suggest() for the
+                # smallest lorry that can carry the remaining weight.  Fall
+                # back to the largest available only when no single lorry
+                # can carry the full remainder (partial-load pass).
                 remain = total_w
                 bins   = []
                 for _ in range(10):
                     if remain <= 0:
                         break
                     excl = sess["unavailable"] | get_assigned_today()
-                    sug  = engine.suggest(route=route, total_ton=min(remain, 0.01),
-                                          unavailable=excl, top_n=20,
-                                          customer_name=customer)
+                    # Tightest-fit pass: find smallest lorry that handles remain
+                    sug = engine.suggest(route=route, total_ton=remain,
+                                         unavailable=excl, top_n=20,
+                                         customer_name=customer)
                     if not sug:
+                        # No lorry can carry full remain — grab largest available
+                        # for a partial load, then continue with what's left
                         sug = engine.suggest(route=route, total_ton=0.001,
                                              unavailable=excl, top_n=20)
-                    if not sug:
-                        break
-                    sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
+                        if not sug:
+                            break
+                        sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
                     lorry   = sug[0]["LORRY"]
                     cap     = sug[0]["TON_CAPACITY"]
                     portion = min(cap, remain)
@@ -1671,8 +1677,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     remain = round(remain - cap, 6)
 
                 if remain <= 0 and bins:
-                    # Distribute items into bins (each item → one bin)
+                    # Distribute items into bins (each item → one bin, heaviest first)
                     item_bin2: dict[str, str] = {}
+                    max_bin_cap = max(b["remain"] + sum(
+                        x["W"] for x in b["rows"]) for b in bins) if bins else 0
                     for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
                         placed = False
                         for bin_ in bins:
@@ -1683,10 +1691,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 placed = True
                                 break
                         if not placed:
-                            bins[0]["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
-                            item_bin2[it["DO NUMBER"]] = bins[0]["lorry"]
+                            # Item heavier than every bin — exceeds all lorry caps
+                            item_bin2[it["DO NUMBER"]] = "NO_LORRY"
                     for it in group_items:
-                        it["LORRY"] = item_bin2.get(it["DO NUMBER"], bins[0]["lorry"])
+                        it["LORRY"] = item_bin2.get(it["DO NUMBER"], "NO_LORRY")
                         it.pop("SPLIT_LORRIES", None)
                 else:
                     # Bin-pack failed — all lorries taken or too small.

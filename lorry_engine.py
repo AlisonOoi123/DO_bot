@@ -753,38 +753,20 @@ class LorryEngine:
             lambda u: 1.0 if u >= CAPACITY_TARGET else u / CAPACITY_TARGET)
         merged["IS_OWNER"] = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
-        # Three-tier utilisation sort (Rules 3 + 4):
-        #
-        # Tier 2 (UTIL_GOOD=1): load uses ≥60% of capacity → "good fit".
-        #   Within tier: history (CUST/CLUSTER/ROUTE_FREQ) breaks the tie,
-        #   then SURPLUS (tightest fit), then owner preference.
-        #
-        # Tier 1 (UTIL_OK=1, UTIL_GOOD=0): 40–60% util → "acceptable".
-        #   Within tier: SURPLUS first (prefer smaller lorry = less waste),
-        #   then history as tiebreaker.  This prevents a 20T lorry with high
-        #   history beating a 5T lorry just because it's driven that route before.
-        #
-        # Tier 0 (UTIL_OK=0): <40% util → "poor fit".
-        #   Within tier: SURPLUS first, then history.
-        #
-        # Cross-tier: Tier 2 always beats Tier 1 always beats Tier 0.
+        # Per-tier sort — SURPLUS (tightest fit) is the primary key in every tier.
+        # History (CUST_FREQ / CLUSTER_FREQ) breaks ties within the same capacity class
+        # so a familiar driver is preferred when two lorries are equally efficient.
+        # This ensures minimum capacity waste regardless of route history.
+        _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
+        _sort_asc  = [True,      False,       False,          False,        False,       False]
         UTIL_GOOD_THRESHOLD = 0.60
         UTIL_OK_THRESHOLD   = 0.40
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
         merged["UTIL_OK"]   = (merged["UTIL"] >= UTIL_OK_THRESHOLD).astype(int)
 
-        # Per-tier sort — each tier has its own key priority:
-        # Tier 2 (≥60%): good fit already, prefer familiar driver → history first
-        # Tier 1 (40-60%) and Tier 0 (<40%): prefer SMALLEST sufficient lorry
-        #   (tightest fit / smallest SURPLUS) to avoid assigning a 10T truck for 1T load
-        _t2_cols = ["CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
-        _t1_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
-        tier2 = merged[merged["UTIL_GOOD"] == 1].sort_values(
-            _t2_cols, ascending=[False, False, False, True, False, False])
-        tier1 = merged[(merged["UTIL_GOOD"] == 0) & (merged["UTIL_OK"] == 1)].sort_values(
-            _t1_cols, ascending=[True, False, False, False, False, False])
-        tier0 = merged[merged["UTIL_OK"] == 0].sort_values(
-            _t1_cols, ascending=[True, False, False, False, False, False])
+        tier2 = merged[merged["UTIL_GOOD"] == 1].sort_values(_sort_cols, ascending=_sort_asc)
+        tier1 = merged[(merged["UTIL_GOOD"] == 0) & (merged["UTIL_OK"] == 1)].sort_values(_sort_cols, ascending=_sort_asc)
+        tier0 = merged[merged["UTIL_OK"] == 0].sort_values(_sort_cols, ascending=_sort_asc)
         import pandas as _pd
         merged = _pd.concat([tier2, tier1, tier0]).reset_index(drop=True)
 
