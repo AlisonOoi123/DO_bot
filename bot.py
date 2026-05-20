@@ -1375,6 +1375,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _DEPOT,
             can_share_cross_cluster,
             MAX_STOPS_PER_LORRY as _MAX_STOPS,
+            MIN_UTIL_TO_ASSIGN  as _MIN_UTIL,
         )
 
         # Step 1 — exact-route buckets
@@ -1585,48 +1586,55 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if suggestions:
                 single_cap  = suggestions[0]["TON_CAPACITY"]
                 single_util = total_w / single_cap if single_cap > 0 else 0
-                split_option = None
-                if single_util < 0.60:
-                    split_option = engine.suggest_split(
-                        route=route,
-                        total_ton=total_w,
-                        unavailable=excluded,
-                        single_util_threshold=0.60,
-                    )
-                if split_option is not None:
-                    # Each lorry in the split carries a portion of the items.
-                    # Build bins with their allotted weight (PORTION).
-                    bins = [
-                        {"lorry": s["LORRY"],
-                         "rows":  [],
-                         "remain": s["PORTION"]}   # how much this bin can take
-                        for s in split_option
-                    ]
-                    for s in split_option:
-                        sess["unavailable"].add(s["LORRY"])
-                    # Assign each item to exactly ONE bin (greedy, heaviest first)
-                    item_bin: dict[str, str] = {}
-                    for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
-                        placed = False
-                        for bin_ in bins:
-                            if bin_["remain"] >= it["WEIGHT"] - 0.001:
-                                bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
-                                bin_["remain"] -= it["WEIGHT"]
-                                item_bin[it["DO NUMBER"]] = bin_["lorry"]
-                                placed = True
-                                break
-                        if not placed:
-                            bins[0]["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
-                            item_bin[it["DO NUMBER"]] = bins[0]["lorry"]
-                    # Each item gets ONE lorry plate — no more "VEA2818, W3618U" for all
+
+                # Rule 8: tightest-fit lorry would still be <10% loaded → leave blank.
+                # Don't waste a large lorry on a tiny DO; let it be manually reviewed.
+                if single_util < _MIN_UTIL:
                     for it in group_items:
-                        it["LORRY"] = item_bin.get(it["DO NUMBER"], bins[0]["lorry"])
-                        it.pop("SPLIT_LORRIES", None)
+                        it["LORRY"] = "NO_LORRY"
                 else:
-                    lorry = suggestions[0]["LORRY"]
-                    sess["unavailable"].add(lorry)
-                    for it in group_items:
-                        it["LORRY"] = lorry
+                    split_option = None
+                    if single_util < 0.60:
+                        split_option = engine.suggest_split(
+                            route=route,
+                            total_ton=total_w,
+                            unavailable=excluded,
+                            single_util_threshold=0.60,
+                        )
+                    if split_option is not None:
+                        # Each lorry in the split carries a portion of the items.
+                        # Build bins with their allotted weight (PORTION).
+                        bins = [
+                            {"lorry": s["LORRY"],
+                             "rows":  [],
+                             "remain": s["PORTION"]}   # how much this bin can take
+                            for s in split_option
+                        ]
+                        for s in split_option:
+                            sess["unavailable"].add(s["LORRY"])
+                        # Assign each item to exactly ONE bin (greedy, heaviest first)
+                        item_bin: dict[str, str] = {}
+                        for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
+                            placed = False
+                            for bin_ in bins:
+                                if bin_["remain"] >= it["WEIGHT"] - 0.001:
+                                    bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                    bin_["remain"] -= it["WEIGHT"]
+                                    item_bin[it["DO NUMBER"]] = bin_["lorry"]
+                                    placed = True
+                                    break
+                            if not placed:
+                                bins[0]["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                item_bin[it["DO NUMBER"]] = bins[0]["lorry"]
+                        # Each item gets ONE lorry plate — no more "VEA2818, W3618U" for all
+                        for it in group_items:
+                            it["LORRY"] = item_bin.get(it["DO NUMBER"], bins[0]["lorry"])
+                            it.pop("SPLIT_LORRIES", None)
+                    else:
+                        lorry = suggestions[0]["LORRY"]
+                        sess["unavailable"].add(lorry)
+                        for it in group_items:
+                            it["LORRY"] = lorry
             else:
                 # No single lorry fits — bin-pack across multiple lorries.
                 # Each item is assigned to exactly ONE lorry.
@@ -1679,10 +1687,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
-                        lorry = last_resort[0]["LORRY"]
-                        sess["unavailable"].add(lorry)
-                        for it in group_items:
-                            it["LORRY"] = lorry
+                        lr_cap  = last_resort[0]["TON_CAPACITY"]
+                        lr_util = total_w / lr_cap if lr_cap > 0 else 0
+                        if lr_util < _MIN_UTIL:
+                            # Even the smallest available lorry would be <10% loaded
+                            for it in group_items:
+                                it["LORRY"] = "NO_LORRY"
+                        else:
+                            lorry = last_resort[0]["LORRY"]
+                            sess["unavailable"].add(lorry)
+                            for it in group_items:
+                                it["LORRY"] = lorry
                     else:
                         # No lorry can carry this weight without overloading
                         for it in group_items:
