@@ -1368,10 +1368,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
         from lorry_engine import (
             _extract_route_intelligence,
             _routes_on_same_way,
+            _route_centroid,
+            _haversine_km,
+            _bearing_deg,
+            _bearing_diff,
+            _DEPOT,
             can_share_cross_cluster,
             MAX_STOPS_PER_LORRY as _MAX_STOPS,
         )
-        _GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 
         # Step 1 — exact-route buckets
         route_buckets: dict[str, list] = defaultdict(list)
@@ -1448,56 +1452,105 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if current_sub:
                 sorted_groups.append(current_sub)
 
-        # ── Step 4: geographic cross-cluster merge ─────────────────────────────
+        # ── Step 4: geographic cross-cluster merge (Nominatim/OSM, free) ─────────
         # Same-cluster corridor merging (Step 2) only joins routes within the
-        # same region.  For groups whose combined weight still leaves a lorry
-        # very under-utilised, try to join them with groups from OTHER clusters
-        # if Google Geocoding confirms their destinations are within 300 km.
+        # same region.  Here we try to join groups from DIFFERENT clusters when
+        # Nominatim confirms their destinations are within 300 km straight-line.
         #
         # Example: PH01-03 (Pahang/Bentong, 0.275T) + TR02 (Terengganu, 6T)
-        # both travel the KL→East highway and share waypoints ≈160 km apart.
-        # Without a Google API key this step is skipped entirely.
-        if _GMAPS_KEY:
-            _cross_merged = [False] * len(sorted_groups)
-            _new_groups: list[list] = []
-
-            for i, base_sg in enumerate(sorted_groups):
-                if _cross_merged[i]:
+        # both use the KL→East highway and their centroids are ≈160 km apart.
+        # East Malaysia (Sabah/Sarawak) is ≈1 000 km from KL → always rejected.
+        def _group_centroid(items):
+            """Average lat/lng centroid of all routes in a group."""
+            seen, lats, lons = set(), [], []
+            for it in items:
+                r = it["ROUTE"]
+                if r in seen:
                     continue
-                merged = list(base_sg)
-                base_route = base_sg[0]["ROUTE"]
+                seen.add(r)
+                c = _route_centroid(r)
+                if c:
+                    lats.append(c[0]); lons.append(c[1])
+            if not lats:
+                return None
+            return (sum(lats) / len(lats), sum(lons) / len(lons))
 
-                for j in range(i + 1, len(sorted_groups)):
-                    if _cross_merged[j]:
+        _cross_merged = [False] * len(sorted_groups)
+        _new_groups: list[list] = []
+
+        for i, base_sg in enumerate(sorted_groups):
+            if _cross_merged[i]:
+                continue
+            merged      = list(base_sg)
+            merged_cent = _group_centroid(merged)   # updated as we absorb groups
+
+            for j in range(i + 1, len(sorted_groups)):
+                if _cross_merged[j]:
+                    continue
+                cand_sg    = sorted_groups[j]
+                cand_route = cand_sg[0]["ROUTE"]
+
+                # Skip if all routes in cand share the same cluster as base
+                # (same-cluster merging already handled by corridor merge)
+                base_clusters = {_extract_route_intelligence(it["ROUTE"])["cluster"]
+                                 for it in merged}
+                cand_cluster  = _extract_route_intelligence(cand_route)["cluster"]
+                if base_clusters == {cand_cluster}:
+                    continue
+
+                combined_w = sum(it["WEIGHT"] for it in merged) + \
+                             sum(it["WEIGHT"] for it in cand_sg)
+                n_routes   = len({it["ROUTE"] for it in merged}) + \
+                             len({it["ROUTE"] for it in cand_sg})
+
+                if combined_w > max_lorry_cap:
+                    continue
+                if n_routes > _MAX_STOPS:
+                    continue
+
+                # Geographic check: candidate centroid vs merged group centroid
+                cand_cent = _route_centroid(cand_route)
+                if merged_cent is None or cand_cent is None:
+                    continue
+                dist_km = _haversine_km(merged_cent[0], merged_cent[1],
+                                        cand_cent[0],   cand_cent[1])
+                if dist_km > 300.0:
+                    continue
+
+                # Bearing check — ALL PAIRS: candidate must be directionally
+                # compatible with every existing regional route in the group.
+                # Using the rolling centroid alone can drift as groups merge,
+                # allowing e.g. K.Selangor (304°) + Terengganu (34°) = 90°
+                # to slip through after KV03A+PK02 centroid shifts to 316°.
+                b_cand = _bearing_deg(_DEPOT[0], _DEPOT[1],
+                                      cand_cent[0], cand_cent[1])
+                depot_to_cand = _haversine_km(_DEPOT[0], _DEPOT[1],
+                                              cand_cent[0], cand_cent[1])
+                if depot_to_cand < 50.0:   # local route — skip bearing check
+                    continue
+                bearing_ok = True
+                for ex_route in {it["ROUTE"] for it in merged}:
+                    ec = _route_centroid(ex_route)
+                    if ec is None:
                         continue
-                    cand_sg    = sorted_groups[j]
-                    cand_route = cand_sg[0]["ROUTE"]
-
-                    # Skip if same cluster — already handled by corridor merge
-                    intel_base = _extract_route_intelligence(base_route)
-                    intel_cand = _extract_route_intelligence(cand_route)
-                    if intel_base["cluster"] == intel_cand["cluster"]:
+                    d_ex = _haversine_km(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
+                    if d_ex < 50.0:        # local route — skip bearing check
                         continue
+                    b_ex = _bearing_deg(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
+                    if _bearing_diff(b_ex, b_cand) > 80.0:
+                        bearing_ok = False
+                        break
+                if not bearing_ok:
+                    continue
 
-                    combined_w  = sum(it["WEIGHT"] for it in merged) + \
-                                  sum(it["WEIGHT"] for it in cand_sg)
-                    n_routes    = len({it["ROUTE"] for it in merged}) + \
-                                  len({it["ROUTE"] for it in cand_sg})
+                merged += list(cand_sg)
+                _cross_merged[j] = True
+                # Recompute centroid to keep it accurate for subsequent candidates
+                merged_cent = _group_centroid(merged)
 
-                    if combined_w > max_lorry_cap:
-                        continue
-                    if n_routes > _MAX_STOPS:
-                        continue
-                    if not can_share_cross_cluster(base_route, cand_route,
-                                                   _GMAPS_KEY, max_km=300.0):
-                        continue
+            _new_groups.append(merged)
 
-                    merged += list(cand_sg)
-                    _cross_merged[j] = True
-
-                _new_groups.append(merged)
-
-            sorted_groups = _new_groups
+        sorted_groups = _new_groups
 
         # Heaviest groups first so they claim the best-fit lorries first
         sorted_groups.sort(

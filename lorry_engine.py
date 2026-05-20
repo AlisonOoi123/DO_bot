@@ -18,7 +18,7 @@ import os
 import json
 import requests
 import pandas as pd
-from math import radians, cos, sin, asin, sqrt
+from math import radians, degrees, atan2, cos, sin, asin, sqrt
 from typing import Optional
 
 
@@ -63,12 +63,22 @@ MAX_STOPS_PER_LORRY   = 8     # Rule 6
 MERGE_DIST_THRESHOLD  = 0.25  # Rule 7: reject if extra dist > 25%
 CAPACITY_TARGET       = 0.80  # Rule 3: target >= 80% utilisation
 
-# ── Geographic cross-cluster merging (Google Geocoding + Haversine) ───────────
+# ── Geographic cross-cluster merging (Nominatim/OSM + Haversine) ─────────────
+# Nominatim is the geocoding service behind OpenStreetMap — completely free,
+# no API key required.  Usage policy: max 1 request/second; must send a
+# descriptive User-Agent.  All results are cached locally in
+# data/geocode_cache.json so each unique place name is only queried once.
+
+import time as _time
 
 _GEOCACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "data", "geocode_cache.json")
 _geocode_cache: dict = {}
 _geocache_dirty = False
+_last_nominatim_call = 0.0          # epoch seconds of last network request
+
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_NOMINATIM_UA  = "DO_bot-logistics/1.0 (whatsapp-lorry-assignment)"
 
 def _load_geocache():
     global _geocode_cache
@@ -90,34 +100,142 @@ def _save_geocache():
 
 _load_geocache()
 
-def _geocode(place: str, api_key: str) -> tuple | None:
-    """Geocode a place name to (lat, lng) using Google Geocoding API.
-    Results are cached to data/geocode_cache.json to avoid repeated API calls.
+# Built-in coordinates for common Malaysian cities/towns (lat, lng).
+# Covers the vast majority of route waypoints without any network call.
+# Nominatim is used as a fallback only for places not listed here.
+_MY_COORDS: dict[str, tuple] = {
+    # Klang Valley / KL
+    "KUALA LUMPUR": (3.1390, 101.6869), "KL": (3.1390, 101.6869),
+    "PETALING JAYA": (3.1073, 101.6067), "PJ": (3.1073, 101.6067),
+    "SHAH ALAM": (3.0733, 101.5185), "SUBANG": (3.1467, 101.5833),
+    "SUBANG JAYA": (3.0596, 101.5858), "KLANG": (3.0449, 101.4455),
+    "PORT KLANG": (2.9993, 101.3931), "PELABUHAN KLANG": (2.9993, 101.3931),
+    "CHERAS": (3.0877, 101.7482), "AMPANG": (3.1543, 101.7571),
+    "KEPONG": (3.2178, 101.6394), "SETAPAK": (3.2029, 101.7061),
+    "GOMBAK": (3.2517, 101.7164), "BATU CAVES": (3.2378, 101.6836),
+    "SELAYANG": (3.2521, 101.6514), "RAWANG": (3.3232, 101.5745),
+    "SUNGAI BULOH": (3.2003, 101.5760), "KOTA DAMANSARA": (3.1652, 101.5870),
+    "MONT KIARA": (3.1727, 101.6574), "CHOW KIT": (3.1681, 101.6980),
+    "RAJA LAUT": (3.1681, 101.6920), "PUDU": (3.1319, 101.7074),
+    "PANDAN": (3.1120, 101.7540), "BALAKONG": (3.0400, 101.7700),
+    "SERDANG": (2.9953, 101.7151), "SUNGAI BESI": (3.0700, 101.7200),
+    "BATU 9 CHERAS": (3.0033, 101.7930), "KAJANG": (2.9934, 101.7867),
+    "SEMENYIH": (2.9320, 101.8426), "BANGI": (2.9592, 101.7817),
+    "BERANANG": (2.8751, 101.8519), "MANTIN": (2.8037, 101.9262),
+    "PUCHONG": (3.0353, 101.6175), "USJ": (3.0522, 101.5794),
+    "SUNWAY": (3.0692, 101.6014), "GLENMARIE": (3.1033, 101.5697),
+    "PJ OLD TOWN": (3.1075, 101.6072), "PUTRA PERDANA": (2.9811, 101.6683),
+    "BANTING": (2.8128, 101.5027), "JENJAROM": (2.7978, 101.5456),
+    "TELOK PANGLIMA GARANG": (2.8667, 101.4833),
+    "TELUK PANGLIMA GARANG": (2.8667, 101.4833),
+    "PANDAMARAN": (2.9869, 101.3975), "TELUK GONG": (2.9681, 101.3838),
+    "BUKIT TINGGI": (3.3478, 101.8143), "KOTA KEMUNING": (3.0317, 101.5419),
+    "SALAK TINGGI": (2.7400, 101.7217), "SEPANG": (2.7275, 101.7033),
+    "SUNGAI MUDA": (3.0500, 101.4833), "KAPAR": (3.1336, 101.4586),
+    "PUNCAK ALAM": (3.2628, 101.5126), "SETIA ALAM": (3.1158, 101.5044),
+    "HULU LANGAT": (3.1167, 101.8500), "S.KEMBANGAN": (3.0570, 101.7282),
+    "SERDANG PERDANA": (2.9855, 101.7260), "BANDAR JALIL": (3.0333, 101.7617),
+    "PUTRA JAYA": (2.9264, 101.6964), "PUTRAJAYA": (2.9264, 101.6964),
+    "SEKINCHAN": (3.6846, 101.0339), "TANJUNG KARANG": (3.4167, 101.0583),
+    "SUNGAI BESAR": (3.6593, 100.9993), "K.SELANGOR": (3.3356, 101.2525),
+    "KUALA SELANGOR": (3.3356, 101.2525),
+    # Pahang
+    "BENTONG": (3.5151, 101.9175), "KARAK": (3.5323, 101.9922),
+    "RAUB": (3.7893, 101.8582), "BENTA": (3.9167, 101.9333),
+    "JERANTUT": (3.9333, 102.3667), "LANCHANG": (3.6167, 102.0833),
+    "TEMERLOH": (3.4500, 102.4167), "KUANTAN": (3.8319, 103.3322),
+    "MENTAKAB": (3.5000, 102.3500), "MARAN": (3.9833, 102.7667),
+    # Johor
+    "JOHOR BAHRU": (1.4927, 103.7414), "JB": (1.4927, 103.7414),
+    "JOHOR BHARU": (1.4927, 103.7414),
+    "KULAI": (1.6600, 103.5935), "SENAI": (1.6372, 103.6697),
+    "SKUDAI": (1.5264, 103.6700), "KLUANG": (2.0272, 103.3219),
+    "BATU PAHAT": (1.8559, 102.9325), "MUAR": (2.0437, 102.5691),
+    "PONTIAN": (1.4866, 103.3881), "MERSING": (2.4386, 103.8309),
+    "SEGAMAT": (2.5128, 102.8158), "AYER HITAM": (1.9233, 103.1797),
+    # Perak
+    "IPOH": (4.5975, 101.0901), "TELUK INTAN": (4.0228, 101.0202),
+    "LANGKAP": (4.1000, 101.0667), "SLIM RIVER": (3.8167, 101.4000),
+    "TAIPING": (4.8500, 100.7333), "KAMPAR": (4.3000, 101.1500),
+    "SITIAWAN": (4.2167, 100.7000), "LUMUT": (4.2278, 100.6250),
+    # Terengganu
+    "TERENGGANU": (5.3117, 103.1324), "KUALA TERENGGANU": (5.3117, 103.1324),
+    "KEMAMAN": (4.2333, 103.4167), "DUNGUN": (4.7667, 103.4167),
+    "KERTEH": (4.5167, 103.4500), "MARANG": (5.2000, 103.2167),
+    # Kelantan
+    "KOTA BHARU": (6.1254, 102.2380), "KB": (6.1254, 102.2380),
+    "GUAL PERIOK": (6.0333, 102.2500), "PASIR MAS": (6.0450, 102.1375),
+    "TANAH MERAH": (5.8076, 102.1464),
+    # Negeri Sembilan
+    "SEREMBAN": (2.7297, 101.9381), "PORT DICKSON": (2.5210, 101.7981),
+    "NILAI": (2.8193, 101.7924), "SENAWANG": (2.7333, 101.9667),
+    # Melaka
+    "MELAKA": (2.1896, 102.2501), "MALACCA": (2.1896, 102.2501),
+    "ALOR GAJAH": (2.3833, 102.2000), "JASIN": (2.3094, 102.4369),
+    # Kedah
+    "ALOR SETAR": (6.1248, 100.3673), "SUNGAI PETANI": (5.6472, 100.4888),
+    "KULIM": (5.3647, 100.5619), "BALING": (5.6725, 100.9231),
+    # Penang
+    "GEORGE TOWN": (5.4141, 100.3288), "PENANG": (5.4141, 100.3288),
+    "BUTTERWORTH": (5.3993, 100.3639), "BUKIT MERTAJAM": (5.3636, 100.4611),
+    # Sabah
+    "KOTA KINABALU": (5.9804, 116.0735), "KK": (5.9804, 116.0735),
+    "SANDAKAN": (5.8402, 118.1179), "TAWAU": (4.2333, 117.8833),
+    # Sarawak
+    "KUCHING": (1.5533, 110.3592), "MIRI": (4.3995, 113.9914),
+    "SIBU": (2.3010, 111.8254), "BINTULU": (3.1727, 113.0447),
+    "LIMBANG": (4.7500, 115.0167),
+}
+
+def _geocode(place: str) -> tuple | None:
+    """Return (lat, lng) for a Malaysian place name.
+    Lookup order:
+      1. Built-in _MY_COORDS dictionary (instant, no network)
+      2. Local cache from previous Nominatim calls
+      3. Nominatim (OpenStreetMap, free) — enforces 1 req/sec per OSM policy
     """
+    global _geocache_dirty, _last_nominatim_call
     key = place.strip().upper()
+
+    # 1. Built-in dictionary — covers the vast majority of route waypoints
+    if key in _MY_COORDS:
+        return _MY_COORDS[key]
+
+    # 2. Previously cached Nominatim result
     if key in _geocode_cache:
         cached = _geocode_cache[key]
         return tuple(cached) if cached else None
-    if not api_key:
-        return None
-    global _geocache_dirty
+
+    # 3. Nominatim fallback for unknown places
+    elapsed = _time.time() - _last_nominatim_call
+    if elapsed < 1.0:
+        _time.sleep(1.0 - elapsed)
+
     try:
         resp = requests.get(
-            "https://maps.googleapis.com/maps/api/geocode/json",
-            params={"address": f"{place}, Malaysia", "key": api_key},
-            timeout=5,
+            _NOMINATIM_URL,
+            params={
+                "q":               f"{place}, Malaysia",
+                "format":          "json",
+                "limit":           1,
+                "accept-language": "en",
+                "countrycodes":    "my",
+            },
+            headers={"User-Agent": _NOMINATIM_UA},
+            timeout=8,
         )
+        _last_nominatim_call = _time.time()
         data = resp.json()
-        if data.get("status") == "OK":
-            loc = data["results"][0]["geometry"]["location"]
-            coords = [loc["lat"], loc["lng"]]
+        if data:
+            coords = [float(data[0]["lat"]), float(data[0]["lon"])]
             _geocode_cache[key] = coords
             _geocache_dirty = True
             _save_geocache()
             return tuple(coords)
     except Exception:
-        pass
-    # Cache the miss so we don't retry every time
+        _last_nominatim_call = _time.time()
+
+    # Cache the miss so we don't hammer the server for unknown places
     _geocode_cache[key] = None
     _geocache_dirty = True
     _save_geocache()
@@ -126,7 +244,7 @@ def _geocode(place: str, api_key: str) -> tuple | None:
 # Fallback city for each cluster when no waypoints can be extracted
 _CLUSTER_CITY = {
     "KL_VALLEY":       "Petaling Jaya",
-    "KL_CITY":         "Kuala Lumpur City Centre",
+    "KL_CITY":         "Kuala Lumpur",
     "JOHOR":           "Johor Bahru",
     "PAHANG":          "Kuantan",
     "PERAK":           "Ipoh",
@@ -147,54 +265,89 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     return 2 * R * asin(sqrt(a))
 
-def _route_centroid(route: str, api_key: str) -> tuple | None:
-    """Return the geographic centroid (lat, lng) of a route's destinations.
-    Uses waypoints from the route description; falls back to cluster capital city.
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compass bearing (0–360°, clockwise from North) from point 1 to point 2."""
+    dlon = radians(lon2 - lon1)
+    lat1r, lat2r = radians(lat1), radians(lat2)
+    x = sin(dlon) * cos(lat2r)
+    y = cos(lat1r) * sin(lat2r) - sin(lat1r) * cos(lat2r) * cos(dlon)
+    return (degrees(atan2(x, y)) + 360) % 360
+
+def _bearing_diff(b1: float, b2: float) -> float:
+    """Smallest angular difference between two compass bearings (0–180°)."""
+    diff = abs(b1 - b2) % 360
+    return diff if diff <= 180 else 360 - diff
+
+# Depot assumed to be in Petaling Jaya / KL area (lorries start here)
+_DEPOT = (3.14, 101.69)
+
+def _route_centroid(route: str) -> tuple | None:
+    """Geographic centroid (lat, lng) of a route's destinations.
+    Uses extracted waypoints; falls back to the cluster's capital city.
     """
     waypoints = list(_extract_waypoints(route))
     if not waypoints:
         intel = _extract_route_intelligence(route)
         city  = _CLUSTER_CITY.get(intel.get("cluster", "UNKNOWN"))
-        return _geocode(city, api_key) if city else None
+        return _geocode(city) if city else None
 
     coords = []
-    for wp in waypoints[:6]:  # cap at 6 to limit API calls
-        c = _geocode(wp, api_key)
+    for wp in waypoints[:6]:       # cap at 6 waypoints to limit network calls
+        c = _geocode(wp)
         if c:
             coords.append(c)
     if not coords:
-        # Fallback to cluster city if no waypoints resolved
         intel = _extract_route_intelligence(route)
         city  = _CLUSTER_CITY.get(intel.get("cluster", "UNKNOWN"))
-        return _geocode(city, api_key) if city else None
+        return _geocode(city) if city else None
     return (
         sum(c[0] for c in coords) / len(coords),
         sum(c[1] for c in coords) / len(coords),
     )
 
-def routes_distance_km(route1: str, route2: str, api_key: str) -> float | None:
-    """Straight-line km between the geographic centroids of two routes.
-    Returns None if either route cannot be geocoded.
-    """
-    c1 = _route_centroid(route1, api_key)
-    c2 = _route_centroid(route2, api_key)
+def routes_distance_km(route1: str, route2: str) -> float | None:
+    """Straight-line km between the geographic centroids of two routes."""
+    c1 = _route_centroid(route1)
+    c2 = _route_centroid(route2)
     if c1 is None or c2 is None:
         return None
     return _haversine_km(c1[0], c1[1], c2[0], c2[1])
 
-def can_share_cross_cluster(route1: str, route2: str, api_key: str,
-                             max_km: float = 300.0) -> bool:
-    """Two routes from different clusters can share a lorry if their geographic
-    centroids are within max_km straight-line distance of each other.
-    300 km covers all intra-Peninsular combinations; East Malaysia (Sabah/Sarawak)
-    is ~1 500 km from KL and will always be rejected.
+def can_share_cross_cluster(route1: str, route2: str,
+                             max_km: float = 300.0,
+                             max_bearing_diff: float = 80.0,
+                             min_depot_dist_km: float = 50.0) -> bool:
+    """Two routes from different clusters can share a lorry when ALL of:
+      1. Both route centroids are ≥ min_depot_dist_km from the KL depot —
+         local suburban routes (Cheras, Serdang, Subang, <50 km) are never
+         combined cross-cluster; only regional/long-haul routes qualify.
+      2. Their geographic centroids are within max_km of each other.
+      3. Their bearings from the KL depot differ by ≤ max_bearing_diff degrees —
+         prevents directionally opposite routes being combined even if close
+         (e.g. K.Selangor NW 304° vs Terengganu NE 34° = 90° diff).
+
+    East Malaysia (Sabah/Sarawak ≈ 1 000–1 500 km from KL) is always rejected
+    by the distance check alone.
     """
-    if not api_key:
+    c1 = _route_centroid(route1)
+    c2 = _route_centroid(route2)
+    if c1 is None or c2 is None:
         return False
-    dist = routes_distance_km(route1, route2, api_key)
-    if dist is None:
+
+    # Check 1: both routes must be regional (not local suburban)
+    d1 = _haversine_km(_DEPOT[0], _DEPOT[1], c1[0], c1[1])
+    d2 = _haversine_km(_DEPOT[0], _DEPOT[1], c2[0], c2[1])
+    if d1 < min_depot_dist_km or d2 < min_depot_dist_km:
         return False
-    return dist <= max_km
+
+    # Check 2: routes must be geographically close to each other
+    if _haversine_km(c1[0], c1[1], c2[0], c2[1]) > max_km:
+        return False
+
+    # Check 3: routes must head in roughly the same direction from the depot
+    b1 = _bearing_deg(_DEPOT[0], _DEPOT[1], c1[0], c1[1])
+    b2 = _bearing_deg(_DEPOT[0], _DEPOT[1], c2[0], c2[1])
+    return _bearing_diff(b1, b2) <= max_bearing_diff
 
 
 def _extract_route_intelligence(route: str) -> dict:
