@@ -415,13 +415,20 @@ class LorryEngine:
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
         merged["UTIL_OK"]   = (merged["UTIL"] >= UTIL_OK_THRESHOLD).astype(int)
 
-        merged = merged.sort_values(
-            # Primary: utilisation tier (2 > 1 > 0)
-            ["UTIL_GOOD", "UTIL_OK",
-             # Within Tier 2 (good fit): history-first, then tightest-fit
-             "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"],
-            ascending=[False, False,
-                       False, False, False, True, False, False])
+        # Per-tier sort — each tier has its own key priority:
+        # Tier 2 (≥60%): good fit already, prefer familiar driver → history first
+        # Tier 1 (40-60%) and Tier 0 (<40%): prefer SMALLEST sufficient lorry
+        #   (tightest fit / smallest SURPLUS) to avoid assigning a 10T truck for 1T load
+        _t2_cols = ["CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
+        _t1_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
+        tier2 = merged[merged["UTIL_GOOD"] == 1].sort_values(
+            _t2_cols, ascending=[False, False, False, True, False, False])
+        tier1 = merged[(merged["UTIL_GOOD"] == 0) & (merged["UTIL_OK"] == 1)].sort_values(
+            _t1_cols, ascending=[True, False, False, False, False, False])
+        tier0 = merged[merged["UTIL_OK"] == 0].sort_values(
+            _t1_cols, ascending=[True, False, False, False, False, False])
+        import pandas as _pd
+        merged = _pd.concat([tier2, tier1, tier0]).reset_index(drop=True)
 
         results = []
         for _, row in merged.head(top_n).iterrows():
