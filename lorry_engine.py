@@ -107,7 +107,8 @@ _MY_COORDS: dict[str, tuple] = {
     # Klang Valley / KL
     "KUALA LUMPUR": (3.1390, 101.6869), "KL": (3.1390, 101.6869),
     "PETALING JAYA": (3.1073, 101.6067), "PJ": (3.1073, 101.6067),
-    "SHAH ALAM": (3.0733, 101.5185), "SUBANG": (3.1467, 101.5833),
+    "SHAH ALAM": (3.0733, 101.5185), "HICOM": (3.0340, 101.5563),
+    "SUBANG": (3.1467, 101.5833),
     "SUBANG JAYA": (3.0596, 101.5858), "KLANG": (3.0449, 101.4455),
     "PORT KLANG": (2.9993, 101.3931), "PELABUHAN KLANG": (2.9993, 101.3931),
     "CHERAS": (3.0877, 101.7482), "AMPANG": (3.1543, 101.7571),
@@ -278,8 +279,8 @@ def _bearing_diff(b1: float, b2: float) -> float:
     diff = abs(b1 - b2) % 360
     return diff if diff <= 180 else 360 - diff
 
-# Depot assumed to be in Petaling Jaya / KL area (lorries start here)
-_DEPOT = (3.14, 101.69)
+# Depot: Eng Sheng HQ — No 11 Persiaran Sabak Bernam, Section 26 (HICOM), 40400 Shah Alam
+_DEPOT = (3.0340, 101.5563)
 
 def _route_centroid(route: str) -> tuple | None:
     """Geographic centroid (lat, lng) of a route's destinations.
