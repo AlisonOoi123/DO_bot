@@ -1163,7 +1163,7 @@ def _handle_user_id(phone, sess, text):
         "buttons": [
             {"id": "clear daily log",     "title": "🗑️ Clear Today Log"},
             {"id": "show assigned today", "title": "📋 Show Assigned"},
-            {"id": "manage lorry",        "title": "🔧 Manage Lorry"},
+            {"id": "show blocked",        "title": "🚫 Show Blocked"},
         ],
     }
 
