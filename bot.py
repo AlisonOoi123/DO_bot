@@ -3098,23 +3098,61 @@ def _export_result_inner(sess) -> list[str]:
 def _generate_trip_manifest(sess) -> bytes:
     """
     Build a driver-friendly trip manifest Excel workbook.
-    One sheet per lorry — sorted by route so stops are geographically grouped.
-    Columns: # | DO# | Customer | Route/Area | WT(T) | Distance | Remarks/Notes
+    One sheet per lorry — stops sorted by DO date first, then route,
+    so multi-date assignments are clearly separated.
+    Columns: # | DATE | DO# | Customer | Route/Area | WT(T) | Dist | Remarks
+    Title shows generated date; each row shows the actual DO delivery date.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
-    from datetime import date as _date
+    from datetime import date as _date, datetime as _dt
     from collections import defaultdict as _dd
 
     wb = Workbook()
-    wb.remove(wb.active)   # drop default empty sheet
+    wb.remove(wb.active)
 
-    today_str = _date.today().strftime("%d-%m-%Y")
-    raw_df    = sess.get("raw_df")   # original uploaded DataFrame for DISTANCE/REMARKS
+    generated_str = _date.today().strftime("%d-%m-%Y")
+    raw_df = sess.get("raw_df")
+
+    # ── Normalise a date string to DD-MM-YYYY for display ────────────────────
+    def _fmt_date(s) -> str:
+        s = str(s).strip()
+        if not s or s.lower() in ("nan", "none", "nat", ""):
+            return ""
+        # Pandas Timestamp str e.g. "2026-05-18 00:00:00"
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+            try:
+                return _dt.strptime(s, fmt).strftime("%d-%m-%Y")
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return ts.strftime("%d-%m-%Y")
+        except Exception:
+            pass
+        return s
+
+    # ── Sort key: date then route ─────────────────────────────────────────────
+    def _sort_key(pair):
+        do, _ = pair
+        s = str(do.get("DATE", "") or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y"):
+            try:
+                return (_dt.strptime(s, fmt).strftime("%Y-%m-%d"), do["ROUTE"], do["CUSTOMER NAME"])
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return (ts.strftime("%Y-%m-%d"), do["ROUTE"], do["CUSTOMER NAME"])
+        except Exception:
+            pass
+        return ("9999-12-31", do["ROUTE"], do["CUSTOMER NAME"])
 
     # ── Gather items per lorry ────────────────────────────────────────────────
-    lorry_pairs: dict[str, list] = _dd(list)   # plate → [(do_dict, item_dict), …]
+    lorry_pairs: dict[str, list] = _dd(list)
     no_lorry_pairs: list         = []
 
     for do in sess.get("pending_dos", []):
@@ -3138,19 +3176,21 @@ def _generate_trip_manifest(sess) -> bytes:
     )
 
     # ── Shared styles ─────────────────────────────────────────────────────────
-    _thin      = Side(style="thin", color="BBBBBB")
-    _brd       = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
-    _TITLE_FILL = PatternFill("solid", fgColor="1F4E79")  # dark navy
+    _thin       = Side(style="thin", color="BBBBBB")
+    _brd        = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    _TITLE_FILL = PatternFill("solid", fgColor="1F4E79")
     _TITLE_FONT = Font(color="FFFFFF", bold=True, size=11)
-    _HDR_FILL   = PatternFill("solid", fgColor="2E75B6")  # mid-blue
+    _HDR_FILL   = PatternFill("solid", fgColor="2E75B6")
     _HDR_FONT   = Font(color="FFFFFF", bold=True, size=9)
-    _ALT_FILL   = PatternFill("solid", fgColor="DEEBF7")  # pale blue
-    _FOOT_FILL  = PatternFill("solid", fgColor="FCE4D6")  # pale orange
+    _ALT_FILL   = PatternFill("solid", fgColor="DEEBF7")
+    _DATE_FILL  = PatternFill("solid", fgColor="E2EFDA")   # green tint for date change rows
+    _FOOT_FILL  = PatternFill("solid", fgColor="FCE4D6")
     _FOOT_FONT  = Font(bold=True, size=9)
-    _NL_FILL    = PatternFill("solid", fgColor="C00000")  # red for NO LORRY sheet
+    _NL_FILL    = PatternFill("solid", fgColor="C00000")
 
-    HEADERS   = ["#", "DO #", "CUSTOMER", "ROUTE / AREA", "WT (T)", "DIST", "REMARKS / NOTES"]
-    COL_WIDTHS = [4,    9,      22,          32,             8,        8,      42]
+    # DATE column added as column 2 (after #)
+    HEADERS    = ["#", "DATE", "DO #", "CUSTOMER", "ROUTE / AREA", "WT (T)", "DIST", "REMARKS / NOTES"]
+    COL_WIDTHS = [4,   11,     9,      22,          32,             8,        8,      42]
 
     def _apply_headers(ws, row):
         for ci, (hdr, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
@@ -3166,12 +3206,17 @@ def _generate_trip_manifest(sess) -> bytes:
             return f"{parts[0]}: {' - '.join(parts[1:3])}"[:32]
         return route_str[:32]
 
-    def _raw_val(raw_df, row_idx, col: str) -> str:
+    def _raw_val(row_idx, col: str) -> str:
         if raw_df is None or row_idx is None:
             return ""
         try:
             v = str(raw_df.loc[row_idx, col]).strip()
-            return "" if v in ("nan", "None", "NaN", "") else v
+            if v in ("nan", "None", "NaN", ""):
+                return ""
+            # Ignore GPS-coordinate strings accidentally placed in DISTANCE column
+            if col == "DISTANCE" and re.match(r"^-?\d+\.\d+\s+-?\d+\.\d+", v):
+                return ""
+            return v
         except Exception:
             return ""
 
@@ -3186,11 +3231,12 @@ def _generate_trip_manifest(sess) -> bytes:
         ws = wb.create_sheet(title=plate[:31].replace("/", "-"))
         ws.freeze_panes = "A3"
 
-        # Title
+        # Title — generated date (not DO date)
         ws.merge_cells(f"A1:{last_col}1")
         util_icon = "✅" if util_pct >= 75 else ("🟡" if util_pct >= 50 else "⚠️")
         title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
-                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   |   {today_str}")
+                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   "
+                     f"|   Generated: {generated_str}")
         t = ws.cell(1, 1, title_txt)
         t.font = _TITLE_FONT; t.fill = _TITLE_FILL
         t.alignment = Alignment(horizontal="center", vertical="center")
@@ -3198,19 +3244,27 @@ def _generate_trip_manifest(sess) -> bytes:
 
         _apply_headers(ws, 2)
 
-        # Sort stops: by route then customer for a logical delivery sequence
-        sorted_pairs = sorted(pairs, key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
+        # Sort: date first so same-day deliveries are grouped, then route, then customer
+        sorted_pairs = sorted(pairs, key=_sort_key)
 
+        prev_date = None
         for seq, (do, it) in enumerate(sorted_pairs, 1):
-            dr = seq + 2
-            row_idx     = it.get("ROW_IDX")
-            dist_val    = _raw_val(raw_df, row_idx, "DISTANCE")
-            remarks_val = _raw_val(raw_df, row_idx, "REMARKS")
+            dr      = seq + 2
+            row_idx = it.get("ROW_IDX")
+            dist_val    = _raw_val(row_idx, "DISTANCE")
+            remarks_val = _raw_val(row_idx, "REMARKS")
 
-            dn_short = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            dn_short  = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            date_disp = _fmt_date(do.get("DATE", ""))
+
+            # Shade first row of each new date group in green tint so dates are visually separated
+            date_changed = (date_disp != prev_date)
+            prev_date    = date_disp
+            fill = _DATE_FILL if date_changed else (_ALT_FILL if seq % 2 == 0 else None)
 
             row_data = [
                 seq,
+                date_disp,
                 dn_short,
                 do["CUSTOMER NAME"][:22],
                 _route_display(do["ROUTE"]),
@@ -3218,30 +3272,28 @@ def _generate_trip_manifest(sess) -> bytes:
                 dist_val,
                 remarks_val,
             ]
-
-            fill = _ALT_FILL if seq % 2 == 0 else None
             for ci, val in enumerate(row_data, 1):
                 c = ws.cell(dr, ci, val)
                 c.border    = _brd
                 c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
                 if fill:
                     c.fill = fill
-            # Auto-height for wrapped remarks
             if remarks_val:
                 ws.row_dimensions[dr].height = min(60, max(15, len(remarks_val) // 5 * 8))
 
         # Footer
         fr = len(sorted_pairs) + 3
-        ws.merge_cells(f"A{fr}:D{fr}")
+        ws.merge_cells(f"A{fr}:E{fr}")
         c = ws.cell(fr, 1, f"TOTAL — {len(sorted_pairs)} stop(s)")
         c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
         c.alignment = Alignment(horizontal="right")
 
-        c = ws.cell(fr, 5, total_w)
-        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd; c.alignment = Alignment(horizontal="center")
+        c = ws.cell(fr, 6, total_w)
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
 
-        ws.merge_cells(f"F{fr}:{last_col}{fr}")
-        c = ws.cell(fr, 6, f"{util_icon} {util_pct}% utilisation  ({total_w}T / {cap}T)")
+        ws.merge_cells(f"G{fr}:{last_col}{fr}")
+        c = ws.cell(fr, 7, f"{util_icon} {util_pct}% utilisation  ({total_w}T / {cap}T)")
         c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
         c.alignment = Alignment(horizontal="center")
 
@@ -3249,26 +3301,31 @@ def _generate_trip_manifest(sess) -> bytes:
     if no_lorry_pairs:
         ws = wb.create_sheet(title="NO LORRY")
         ws.merge_cells(f"A1:{last_col}1")
-        t = ws.cell(1, 1, f"UNASSIGNED — {len(no_lorry_pairs)} item(s)  |  {today_str}  — Needs manual assignment")
+        t = ws.cell(1, 1,
+            f"UNASSIGNED — {len(no_lorry_pairs)} item(s)  |  Generated: {generated_str}  — Needs manual assignment")
         t.font = Font(color="FFFFFF", bold=True, size=11)
         t.fill = _NL_FILL
         t.alignment = Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[1].height = 22
 
         _apply_headers(ws, 2)
-        for seq, (do, it) in enumerate(no_lorry_pairs, 1):
-            dr  = seq + 2
+        for seq, (do, it) in enumerate(sorted(no_lorry_pairs, key=_sort_key), 1):
+            dr = seq + 2
             row_idx     = it.get("ROW_IDX")
-            remarks_val = _raw_val(raw_df, row_idx, "REMARKS")
-            dn_short = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            remarks_val = _raw_val(row_idx, "REMARKS")
+            dn_short    = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            date_disp   = _fmt_date(do.get("DATE", ""))
             for ci, val in enumerate(
-                [seq, dn_short, do["CUSTOMER NAME"][:22], _route_display(do["ROUTE"]),
-                 round(it["WEIGHT"], 3), "", remarks_val or "⚠️ No lorry assigned"],
+                [seq, date_disp, dn_short, do["CUSTOMER NAME"][:22],
+                 _route_display(do["ROUTE"]), round(it["WEIGHT"], 3), "",
+                 remarks_val or "⚠️ No lorry assigned"],
                 1,
             ):
                 c = ws.cell(dr, ci, val)
                 c.border = _brd
                 c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
+        for ci, w in enumerate(COL_WIDTHS, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
 
     buf = io.BytesIO()
     wb.save(buf)
