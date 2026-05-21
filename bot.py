@@ -1051,9 +1051,20 @@ def handle_message(phone: str, text: str = None,
         if file_bytes:
             return _handle_excel_upload(phone, sess, file_bytes)
         return ["Please upload the DO Excel file (.xlsx) to continue."]
-    elif state == "REVIEWING":
-        return _handle_reviewing(phone, sess, text)
-    elif state == "CONFIRMING":
+    elif state in ("REVIEWING", "CONFIRMING"):
+        # Allow lorry-status file upload at any point during an active session
+        if file_bytes:
+            try:
+                _df_up = pd.read_excel(io.BytesIO(file_bytes))
+                _df_up.columns = [c.strip().upper() for c in _df_up.columns]
+                _status_result = _handle_lorry_status_upload(phone, sess, _df_up)
+                if _status_result is not None:
+                    # After updating statuses, re-show summary so user sees changes
+                    return _status_result + [_build_summary(sess)]
+            except Exception:
+                pass   # not an Excel — fall through to text handler
+        if state == "REVIEWING":
+            return _handle_reviewing(phone, sess, text)
         return _handle_confirming(phone, sess, text)
     elif state == "DONE":
         # After export, user may still block/change a lorry — revert to CONFIRMING,
@@ -1142,7 +1153,8 @@ def _handle_user_id(phone, sess, text):
     lorry_text = (
         f"✅ Logged in as *{user}*\n\n"
         f"Your lorries:\n" + "\n".join(lines) + "\n\n"
-        "📎 Now please upload your DO Excel file (.xlsx)."
+        "📎 Now please upload your DO Excel file (.xlsx).\n\n"
+        "_Tip: you can also upload the master lorry file (with a_ *Status* _column) to block/release lorries in bulk._"
     )
     # Quick-action buttons (max 3 for WhatsApp)
     buttons_msg = {
@@ -1234,10 +1246,88 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
         }
     ]
 
+def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
+    """Handle a lorry-status update file.
+
+    Accepted column names (case-insensitive):
+      LORRY / PLATE / LICENSE  — plate number
+      STATUS                   — "Available" or "Blocked" (or "block"/"avail")
+
+    Reads each row and blocks or releases the lorry in today's log.
+    Returns a reply message list.
+    """
+    # Normalise column names
+    col_map = {c.upper(): c for c in df.columns}
+
+    # Find LORRY column
+    lorry_col = next((col_map[k] for k in ("LORRY", "PLATE", "LICENSE") if k in col_map), None)
+    status_col = col_map.get("STATUS")
+
+    if not lorry_col or not status_col:
+        return None   # not a lorry-status file — caller should fall through
+
+    engine = sess.get("engine")
+    all_plates = set(engine.all_lorries["LORRY"].str.upper()) if engine else set()
+
+    blocked_now  = []
+    released_now = []
+    unknown      = []
+
+    for _, row in df.iterrows():
+        plate  = str(row[lorry_col]).strip().upper()
+        status = str(row[status_col]).strip().lower()
+        if not plate or plate in ("NAN", "NONE", ""):
+            continue
+        if all_plates and plate not in all_plates:
+            unknown.append(plate)
+            continue
+
+        if status.startswith("block"):
+            record_assignments_today([plate])
+            sess.setdefault("unavailable", set()).add(plate)
+            blocked_now.append(plate)
+        elif status.startswith("avail") or status in ("ok", "free", "available"):
+            release_specific_plates([plate])
+            sess.setdefault("unavailable", set()).discard(plate)
+            released_now.append(plate)
+
+    if not blocked_now and not released_now and not unknown:
+        return None   # nothing actionable — fall through to DO-file handler
+
+    lines = ["📋 *Lorry Status Updated from File*\n"]
+    if blocked_now:
+        lines.append(f"⛔ *Blocked ({len(blocked_now)}):* {', '.join(blocked_now)}")
+    if released_now:
+        lines.append(f"✅ *Released ({len(released_now)}):* {', '.join(released_now)}")
+    if unknown:
+        lines.append(f"⚠️ *Not found in master:* {', '.join(unknown)}")
+    lines.append("\nLorry availability updated for today.")
+
+    return [
+        "\n".join(lines),
+        {
+            "_type": "buttons",
+            "body": "What would you like to do next?",
+            "buttons": [
+                {"id": "hi",                  "title": "👋 Upload DOs"},
+                {"id": "show assigned today",  "title": "📋 Show Blocked"},
+                {"id": "manage lorry",         "title": "🔧 Manage Lorry"},
+            ],
+        }
+    ]
+
+
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
         df.columns = [c.strip().upper() for c in df.columns]
+
+        # ── Detect lorry-status file (LORRY + STATUS columns) ───────────────
+        # Must be checked BEFORE DO-file detection so a master-lorry upload
+        # with Status column doesn't accidentally trigger DO assignment flow.
+        _lorry_status_result = _handle_lorry_status_upload(phone, sess, df)
+        if _lorry_status_result is not None:
+            return _lorry_status_result
 
         # ── Detect format: new (ZSDOROUTEWRH) vs old ────────────────────────
         # New format: GROSS WEIGHT (kg), no WEIGHT(T) or ITMREF_0
@@ -2280,93 +2370,117 @@ def _build_summary(sess) -> str:
     lines.append("")
 
     engine = sess.get("engine")
-    entry_num = 0
 
+    # ── Build lorry-grouped view ──────────────────────────────────────────
+    # Collect all items and build per-lorry buckets
+    all_items = [it for do in pending for it in do.get("ITEMS", [])]
+
+    # Map DO NUMBER → (customer_short, route_code, date)
+    do_meta: dict[str, tuple] = {}
     for do in pending:
-        do_num   = do["DO NUMBER"]
-        customer = do["CUSTOMER NAME"]
-        items    = do.get("ITEMS", [])
+        dn  = do["DO NUMBER"]
+        cust = do["CUSTOMER NAME"][:22]
+        route_code = do["ROUTE"].split(" - ")[0].strip()[:8] if " - " in do["ROUTE"] else do["ROUTE"][:8]
+        dt  = do.get("DATE", "")
+        if dt and dt.lower() in ("nan", "none", ""):
+            dt = ""
+        do_meta[dn] = (cust, route_code, dt)
 
-        # Shorten route: "KV04A - SUNGAI BULOH - U5 - KOTA DAMANSARA - N 4"
-        # → "KV04A  SUNGAI BULOH → KOTA DAMANSARA"
-        route = do["ROUTE"]
-        if "-->" in route:
-            route_short = route.split("-->")[-1].strip()
+    # Group items by lorry plate
+    from collections import defaultdict as _dd
+    lorry_items: dict[str, list] = _dd(list)  # plate → [item, ...]
+    no_lorry_items: list = []
+    for it in all_items:
+        if it["LORRY"] in ("NO_LORRY", None):
+            no_lorry_items.append(it)
         else:
-            parts = [p.strip() for p in route.split(" - ")]
-            code  = parts[0] if parts else ""
-            areas = [p for p in parts[1:]
-                     if len(p) > 3 and (not p.replace(" ", "").isalnum() or len(p) > 5)]
-            if len(areas) >= 2:
-                route_short = f"{code}  {areas[0]} → {areas[1]}"
-            elif areas:
-                route_short = f"{code}  {areas[0]}"
+            lorry_items[it["LORRY"]].append(it)
+
+    # Lorry capacities
+    cap_map: dict[str, float] = {}
+    if engine is not None:
+        for _, r in engine.eligible_lorries.iterrows():
+            cap_map[r["LORRY"]] = float(r["TON"])
+
+    # Sort lorries: by earliest date among their items, then by total weight desc
+    def _lorry_sort(plate):
+        its = lorry_items[plate]
+        dates = [_parse_date_sortkey(it.get("DATE", "")) for it in its]
+        return (min(dates) if dates else "9999-12-31", -sum(i["WEIGHT"] for i in its))
+
+    # _parse_date_sortkey may not be in scope here (defined inside _handle_excel_upload).
+    # Use a local re-implementation for sorting.
+    def _dsort(s):
+        s = (s or "").strip()
+        if not s or s.lower() in ("nan", "none", ""):
+            return "9999-12-31"
+        for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return ts.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return "9999-12-31"
+
+    sorted_lorries = sorted(lorry_items.keys(),
+        key=lambda p: (
+            min((_dsort(it.get("DATE","")) for it in lorry_items[p]), default="9999-12-31"),
+            -sum(i["WEIGHT"] for i in lorry_items[p])
+        ))
+
+    for plate in sorted_lorries:
+        its   = lorry_items[plate]
+        total_w = round(sum(i["WEIGHT"] for i in its), 3)
+        cap     = cap_map.get(plate)
+
+        if cap and cap > 0:
+            util_pct = round(total_w / cap * 100, 1)
+            if util_pct > 100:
+                util_tag = f"🔴 {util_pct}% OVER"
+            elif util_pct >= 75:
+                util_tag = f"✅ {util_pct}%"
+            elif util_pct >= 50:
+                util_tag = f"🟡 {util_pct}%"
             else:
-                route_short = route[:45]
+                util_tag = f"⚠️ {util_pct}%"
+            cap_str = f"{cap}T"
+        else:
+            util_tag = ""
+            cap_str  = "?"
 
-        for item in items:
-            entry_num += 1
-            weight = round(item["WEIGHT"], 3)
-            lorry  = item["LORRY"]
-            itmref = item.get("ITMREF", "")
-            itmref_str = f" ({itmref})" if itmref and itmref != "nan" else ""
+        lines.append(f"🚛 *{plate}* ({cap_str})  {util_tag}  _{total_w}T_")
 
-            # ── Entry header ──────────────────────────────────────────────
-            lines.append(f"*{entry_num}. {customer}*{itmref_str}")
-            lines.append(f"📍 {route_short}")
-            lines.append(f"🔖 {do_num}")
-            _do_date = do.get("DATE", "")
-            if _do_date and _do_date not in ("nan", "none", ""):
-                lines.append(f"📅 {_do_date}")
-            lines.append(f"⚖️  {weight}T")
+        # One line per DO under this lorry
+        for it in sorted(its, key=lambda x: _dsort(x.get("DATE", ""))):
+            dn   = it["DO NUMBER"]
+            w    = round(it["WEIGHT"], 3)
+            cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
+            dt_tag = f" [{dt}]" if dt else ""
+            lines.append(f"  {rcode}  {cust}  {w}T{dt_tag}")
 
-            # ── Lorry assignment ──────────────────────────────────────────
-            if lorry == "SPLIT" and item.get("SPLIT_LORRIES"):
-                lines.append("🚛 SPLIT LOAD:")
-                for bin_ in (item.get("SPLIT_LORRIES") or []):
-                    bin_w = round(sum(r["W"] for r in bin_["rows"]), 3)
-                    lines.append(f"    • *{bin_['lorry']}* — {bin_w}T")
-                no_lorry  # keep list intact
+        lines.append("")   # blank line between lorries
 
-            elif lorry == "NO_LORRY":
-                lines.append("🚛 ❌ No lorry available")
-                no_lorry.append(do_num)
-
-            else:
-                # Single lorry — compute utilization
-                cap = None
-                if engine is not None:
-                    row = engine.eligible_lorries[
-                        engine.eligible_lorries["LORRY"] == lorry]
-                    if not row.empty:
-                        cap = float(row.iloc[0]["TON"])
-                if cap and cap > 0:
-                    util_pct = round((weight / cap) * 100, 1)
-                    if util_pct > 100:
-                        util_icon = "🔴"
-                        util_str  = f"{util_pct}% ⚠ OVER CAP"
-                    elif util_pct < 50:
-                        util_icon = "⚠️"
-                        util_str  = f"{util_pct}%"
-                    elif util_pct < 75:
-                        util_icon = "🟡"
-                        util_str  = f"{util_pct}%"
-                    else:
-                        util_icon = "✅"
-                        util_str  = f"{util_pct}%"
-                    lines.append(f"🚛 *{lorry}*  {util_icon} {util_str}")
-                else:
-                    lines.append(f"🚛 *{lorry}*")
-
-            # ── Divider between entries ───────────────────────────────────
-            lines.append("─────────────────────")
+    # ── No-lorry items ────────────────────────────────────────────────────
+    if no_lorry_items:
+        lines.append(f"❌ *NO LORRY ({len(no_lorry_items)} item(s)):*")
+        for it in no_lorry_items:
+            dn   = it["DO NUMBER"]
+            w    = round(it["WEIGHT"], 3)
+            cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
+            dt_tag = f" [{dt}]" if dt else ""
+            lines.append(f"  {rcode}  {cust}  {w}T{dt_tag}")
+        lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────
-    all_items   = [it for do in pending for it in do.get("ITEMS", [])]
-    assigned_ok = sum(1 for it in all_items if it["LORRY"] not in ("NO_LORRY", None))
-    unassigned  = sum(1 for it in all_items if it["LORRY"] == "NO_LORRY")
+    assigned_ok = len(all_items) - len(no_lorry_items)
+    unassigned  = len(no_lorry_items)
 
-    lines.append(f"✅ {assigned_ok} assigned   ❌ {unassigned} unassigned")
+    lines.append(f"✅ {assigned_ok} assigned  ❌ {unassigned} unassigned  🚛 {len(sorted_lorries)} lorry(s)")
     summary_text = "\n".join(lines)
 
     result = [summary_text]
