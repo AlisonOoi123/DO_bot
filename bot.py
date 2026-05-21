@@ -2458,10 +2458,11 @@ def _build_summary(sess) -> str:
         # One line per DO under this lorry: DO# first, then route→dest, customer, weight, date
         for it in sorted(its, key=lambda x: _dsort(x.get("DATE", ""))):
             dn   = it["DO NUMBER"]
+            dn_short = dn[-5:] if len(dn) >= 5 else dn
             w    = round(it["WEIGHT"], 3)
             cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
             dt_tag = f" [{dt}]" if dt else ""
-            lines.append(f"  {dn}  {rcode}  {cust}  {w}T{dt_tag}")
+            lines.append(f"  {dn_short}  {rcode}  {cust}  {w}T{dt_tag}")
 
         lines.append("")   # blank line between lorries
 
@@ -2470,10 +2471,11 @@ def _build_summary(sess) -> str:
         lines.append(f"❌ *NO LORRY ({len(no_lorry_items)} item(s)):*")
         for it in no_lorry_items:
             dn   = it["DO NUMBER"]
+            dn_short = dn[-5:] if len(dn) >= 5 else dn
             w    = round(it["WEIGHT"], 3)
             cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
             dt_tag = f" [{dt}]" if dt else ""
-            lines.append(f"  {dn}  {rcode}  {cust}  {w}T{dt_tag}")
+            lines.append(f"  {dn_short}  {rcode}  {cust}  {w}T{dt_tag}")
         lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────
