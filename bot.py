@@ -1832,8 +1832,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 placed = True
                                 break
                         if not placed:
-                            # Item heavier than every bin — exceeds all lorry caps
-                            item_bin2[it["DO NUMBER"]] = "NO_LORRY"
+                            # Bins are full — try to grab one more lorry rather
+                            # than giving up (greedy fill can leave tiny tail items
+                            # stranded even when arithmetic says they should fit).
+                            excl_retry = sess["unavailable"] | get_assigned_today()
+                            extra_sug  = engine.suggest(
+                                route=route, total_ton=it["WEIGHT"],
+                                unavailable=excl_retry, top_n=1,
+                                customer_name=customer,
+                                today_date_str=_today(),
+                            )
+                            if extra_sug:
+                                extra_lorry = extra_sug[0]["LORRY"]
+                                extra_cap   = extra_sug[0]["TON_CAPACITY"]
+                                new_bin = {"lorry": extra_lorry, "rows": [], "remain": extra_cap}
+                                bins.append(new_bin)
+                                sess["unavailable"].add(extra_lorry)
+                                new_bin["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                new_bin["remain"] -= it["WEIGHT"]
+                                item_bin2[it["DO NUMBER"]] = extra_lorry
+                            else:
+                                item_bin2[it["DO NUMBER"]] = "NO_LORRY"
                     for it in group_items:
                         it["LORRY"] = item_bin2.get(it["DO NUMBER"], "NO_LORRY")
                         it.pop("SPLIT_LORRIES", None)
