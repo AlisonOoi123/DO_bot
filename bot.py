@@ -1616,7 +1616,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 dist_km = _haversine_km(merged_cent[0], merged_cent[1],
                                         cand_cent[0],   cand_cent[1])
-                if dist_km > 300.0:
+                if dist_km > 180.0:
                     continue
 
                 # Bearing check — ALL PAIRS: candidate must be directionally

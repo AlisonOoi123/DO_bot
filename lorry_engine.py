@@ -328,7 +328,7 @@ def routes_distance_km(route1: str, route2: str) -> float | None:
     return _haversine_km(c1[0], c1[1], c2[0], c2[1])
 
 def can_share_cross_cluster(route1: str, route2: str,
-                             max_km: float = 300.0,
+                             max_km: float = 180.0,
                              max_bearing_diff: float = 80.0,
                              min_depot_dist_km: float = 50.0) -> bool:
     """Two routes from different clusters can share a lorry when ALL of:
