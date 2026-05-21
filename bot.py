@@ -1138,9 +1138,9 @@ def _handle_user_id(phone, sess, text):
     broken_today = get_broken_lorries()   # {plate: replacement}
     lines = []
     for _, r in lorries.iterrows():
-        plate = r["LORRY"]
-        ton   = r["TON"]
-        user  = r["USER"]
+        plate    = r["LORRY"]
+        ton      = r["TON"]
+        lorry_user = r["USER"]
         if plate in broken_today:
             rep = broken_today[plate]
             tag = f" 🔴 Broken→{rep}" if rep != "NONE" else " 🔴 Broken"
@@ -1148,7 +1148,7 @@ def _handle_user_id(phone, sess, text):
             tag = " ⛔ Assigned today"
         else:
             tag = " ✅ Available"
-        lines.append(f"  • {plate} — {ton}T ({user}){tag}")
+        lines.append(f"  • {plate} — {ton}T ({lorry_user}){tag}")
 
     lorry_text = (
         f"✅ Logged in as *{user}*\n\n"
@@ -2455,13 +2455,13 @@ def _build_summary(sess) -> str:
 
         lines.append(f"🚛 *{plate}* ({cap_str})  {util_tag}  _{total_w}T_")
 
-        # One line per DO under this lorry
+        # One line per DO under this lorry: DO# first, then route→dest, customer, weight, date
         for it in sorted(its, key=lambda x: _dsort(x.get("DATE", ""))):
             dn   = it["DO NUMBER"]
             w    = round(it["WEIGHT"], 3)
             cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
             dt_tag = f" [{dt}]" if dt else ""
-            lines.append(f"  {rcode}  {cust}  {w}T{dt_tag}")
+            lines.append(f"  {dn}  {rcode}  {cust}  {w}T{dt_tag}")
 
         lines.append("")   # blank line between lorries
 
@@ -2473,7 +2473,7 @@ def _build_summary(sess) -> str:
             w    = round(it["WEIGHT"], 3)
             cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
             dt_tag = f" [{dt}]" if dt else ""
-            lines.append(f"  {rcode}  {cust}  {w}T{dt_tag}")
+            lines.append(f"  {dn}  {rcode}  {cust}  {w}T{dt_tag}")
         lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────
