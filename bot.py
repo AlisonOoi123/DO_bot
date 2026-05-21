@@ -1809,7 +1809,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     lorry   = sug[0]["LORRY"]
                     cap     = sug[0]["TON_CAPACITY"]
                     portion = min(cap, remain)
-                    bins.append({"lorry": lorry, "rows": [], "remain": portion})
+                    # Use full lorry capacity for the bin, not just the arithmetic
+                    # portion. Items overflow BQU3875's last few scraps and must
+                    # fit in the next bin — which needs its full capacity available,
+                    # not just the remaining-weight arithmetic.
+                    bins.append({"lorry": lorry, "rows": [], "remain": cap})
                     sess["unavailable"].add(lorry)
                     remain = round(remain - cap, 6)
 
