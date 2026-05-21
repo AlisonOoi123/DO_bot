@@ -2379,7 +2379,7 @@ def _build_summary(sess) -> str:
     do_meta: dict[str, tuple] = {}
     for do in pending:
         dn  = do["DO NUMBER"]
-        cust = do["CUSTOMER NAME"][:22]
+        cust = do["CUSTOMER NAME"][:10]
         route_code = do["ROUTE"].split(" - ")[0].strip()[:8] if " - " in do["ROUTE"] else do["ROUTE"][:8]
         dt  = do.get("DATE", "")
         if dt and dt.lower() in ("nan", "none", ""):
