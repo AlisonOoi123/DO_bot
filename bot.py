@@ -3067,6 +3067,13 @@ def _export_result_inner(sess) -> list[str]:
     buf.seek(0)
     sess["export_bytes"] = buf.read()
 
+    # Generate trip manifest for drivers (second file sent alongside the export)
+    try:
+        sess["trip_manifest_bytes"] = _generate_trip_manifest(sess)
+    except Exception as _tm_err:
+        print(f"⚠️ Trip manifest generation failed: {_tm_err}")
+        sess["trip_manifest_bytes"] = None
+
     # Persist confirmed plates to daily log
     record_assignments_today(list(set(confirmed_plates)))
 
@@ -3087,6 +3094,198 @@ def _export_result_inner(sess) -> list[str]:
             "buttons": [{"id": "hi", "title": "👋 Hi"}],
         }
     ]
+
+def _generate_trip_manifest(sess) -> bytes:
+    """
+    Build a driver-friendly trip manifest Excel workbook.
+    One sheet per lorry — sorted by route so stops are geographically grouped.
+    Columns: # | DO# | Customer | Route/Area | WT(T) | Distance | Remarks/Notes
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    from datetime import date as _date
+    from collections import defaultdict as _dd
+
+    wb = Workbook()
+    wb.remove(wb.active)   # drop default empty sheet
+
+    today_str = _date.today().strftime("%d-%m-%Y")
+    raw_df    = sess.get("raw_df")   # original uploaded DataFrame for DISTANCE/REMARKS
+
+    # ── Gather items per lorry ────────────────────────────────────────────────
+    lorry_pairs: dict[str, list] = _dd(list)   # plate → [(do_dict, item_dict), …]
+    no_lorry_pairs: list         = []
+
+    for do in sess.get("pending_dos", []):
+        for it in do.get("ITEMS", []):
+            lorry = it.get("LORRY") or "NO_LORRY"
+            if lorry in ("NO_LORRY", None, ""):
+                no_lorry_pairs.append((do, it))
+            elif lorry != "SPLIT":
+                lorry_pairs[lorry].append((do, it))
+
+    engine  = sess.get("engine")
+    cap_map: dict[str, float] = {}
+    if engine is not None:
+        for _, r in engine.eligible_lorries.iterrows():
+            cap_map[r["LORRY"]] = float(r["TON"])
+
+    sorted_lorries = sorted(
+        lorry_pairs.keys(),
+        key=lambda p: sum(it["WEIGHT"] for _, it in lorry_pairs[p]),
+        reverse=True,
+    )
+
+    # ── Shared styles ─────────────────────────────────────────────────────────
+    _thin      = Side(style="thin", color="BBBBBB")
+    _brd       = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    _TITLE_FILL = PatternFill("solid", fgColor="1F4E79")  # dark navy
+    _TITLE_FONT = Font(color="FFFFFF", bold=True, size=11)
+    _HDR_FILL   = PatternFill("solid", fgColor="2E75B6")  # mid-blue
+    _HDR_FONT   = Font(color="FFFFFF", bold=True, size=9)
+    _ALT_FILL   = PatternFill("solid", fgColor="DEEBF7")  # pale blue
+    _FOOT_FILL  = PatternFill("solid", fgColor="FCE4D6")  # pale orange
+    _FOOT_FONT  = Font(bold=True, size=9)
+    _NL_FILL    = PatternFill("solid", fgColor="C00000")  # red for NO LORRY sheet
+
+    HEADERS   = ["#", "DO #", "CUSTOMER", "ROUTE / AREA", "WT (T)", "DIST", "REMARKS / NOTES"]
+    COL_WIDTHS = [4,    9,      22,          32,             8,        8,      42]
+
+    def _apply_headers(ws, row):
+        for ci, (hdr, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
+            c = ws.cell(row, ci, hdr)
+            c.font = _HDR_FONT; c.fill = _HDR_FILL; c.border = _brd
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.row_dimensions[row].height = 16
+
+    def _route_display(route_str: str) -> str:
+        if " - " in route_str:
+            parts = route_str.split(" - ")
+            return f"{parts[0]}: {' - '.join(parts[1:3])}"[:32]
+        return route_str[:32]
+
+    def _raw_val(raw_df, row_idx, col: str) -> str:
+        if raw_df is None or row_idx is None:
+            return ""
+        try:
+            v = str(raw_df.loc[row_idx, col]).strip()
+            return "" if v in ("nan", "None", "NaN", "") else v
+        except Exception:
+            return ""
+
+    # ── One sheet per lorry ───────────────────────────────────────────────────
+    last_col = get_column_letter(len(HEADERS))
+    for plate in sorted_lorries:
+        pairs    = lorry_pairs[plate]
+        cap      = cap_map.get(plate, 0)
+        total_w  = round(sum(it["WEIGHT"] for _, it in pairs), 3)
+        util_pct = round(total_w / cap * 100, 1) if cap > 0 else 0
+
+        ws = wb.create_sheet(title=plate[:31].replace("/", "-"))
+        ws.freeze_panes = "A3"
+
+        # Title
+        ws.merge_cells(f"A1:{last_col}1")
+        util_icon = "✅" if util_pct >= 75 else ("🟡" if util_pct >= 50 else "⚠️")
+        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
+                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   |   {today_str}")
+        t = ws.cell(1, 1, title_txt)
+        t.font = _TITLE_FONT; t.fill = _TITLE_FILL
+        t.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+        _apply_headers(ws, 2)
+
+        # Sort stops: by route then customer for a logical delivery sequence
+        sorted_pairs = sorted(pairs, key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
+
+        for seq, (do, it) in enumerate(sorted_pairs, 1):
+            dr = seq + 2
+            row_idx     = it.get("ROW_IDX")
+            dist_val    = _raw_val(raw_df, row_idx, "DISTANCE")
+            remarks_val = _raw_val(raw_df, row_idx, "REMARKS")
+
+            dn_short = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+
+            row_data = [
+                seq,
+                dn_short,
+                do["CUSTOMER NAME"][:22],
+                _route_display(do["ROUTE"]),
+                round(it["WEIGHT"], 3),
+                dist_val,
+                remarks_val,
+            ]
+
+            fill = _ALT_FILL if seq % 2 == 0 else None
+            for ci, val in enumerate(row_data, 1):
+                c = ws.cell(dr, ci, val)
+                c.border    = _brd
+                c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
+                if fill:
+                    c.fill = fill
+            # Auto-height for wrapped remarks
+            if remarks_val:
+                ws.row_dimensions[dr].height = min(60, max(15, len(remarks_val) // 5 * 8))
+
+        # Footer
+        fr = len(sorted_pairs) + 3
+        ws.merge_cells(f"A{fr}:D{fr}")
+        c = ws.cell(fr, 1, f"TOTAL — {len(sorted_pairs)} stop(s)")
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="right")
+
+        c = ws.cell(fr, 5, total_w)
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd; c.alignment = Alignment(horizontal="center")
+
+        ws.merge_cells(f"F{fr}:{last_col}{fr}")
+        c = ws.cell(fr, 6, f"{util_icon} {util_pct}% utilisation  ({total_w}T / {cap}T)")
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
+
+    # ── NO LORRY sheet ────────────────────────────────────────────────────────
+    if no_lorry_pairs:
+        ws = wb.create_sheet(title="NO LORRY")
+        ws.merge_cells(f"A1:{last_col}1")
+        t = ws.cell(1, 1, f"UNASSIGNED — {len(no_lorry_pairs)} item(s)  |  {today_str}  — Needs manual assignment")
+        t.font = Font(color="FFFFFF", bold=True, size=11)
+        t.fill = _NL_FILL
+        t.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+        _apply_headers(ws, 2)
+        for seq, (do, it) in enumerate(no_lorry_pairs, 1):
+            dr  = seq + 2
+            row_idx     = it.get("ROW_IDX")
+            remarks_val = _raw_val(raw_df, row_idx, "REMARKS")
+            dn_short = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            for ci, val in enumerate(
+                [seq, dn_short, do["CUSTOMER NAME"][:22], _route_display(do["ROUTE"]),
+                 round(it["WEIGHT"], 3), "", remarks_val or "⚠️ No lorry assigned"],
+                1,
+            ):
+                c = ws.cell(dr, ci, val)
+                c.border = _brd
+                c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def get_trip_manifest_bytes(phone: str) -> bytes | None:
+    """Return trip manifest bytes if available (generated at Yes confirm), then clear."""
+    sess = sessions.get(phone, {})
+    if sess.get("state") in ("DONE", "CONFIRMING"):
+        data = sess.get("trip_manifest_bytes")
+        if data:
+            sess["trip_manifest_bytes"] = None
+        return data
+    return None
+
 
 def get_export_bytes(phone: str) -> bytes | None:
     """Return export bytes if available (DONE or re-exported after post-yes block), then clear."""

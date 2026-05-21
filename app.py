@@ -133,6 +133,15 @@ def webhook():
         except Exception as e:
             print(f"⚠️ Failed to send export file: {e}")
 
+        try:
+            manifest_bytes = bot.get_trip_manifest_bytes(phone)
+            if manifest_bytes:
+                from datetime import date as _d
+                mname = f"Trip_Manifest_{_d.today().strftime('%d%m%Y')}.xlsx"
+                _send_file(phone, manifest_bytes, filename=mname)
+        except Exception as e:
+            print(f"⚠️ Failed to send trip manifest: {e}")
+
     except (KeyError, IndexError) as e:
         print(f"Webhook parse error: {e} — data: {json.dumps(data)[:300]}")
 
