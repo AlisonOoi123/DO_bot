@@ -1316,9 +1316,33 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
         })
     sess["items"] = rebuilt_items
 
-    # Store the uploaded file (already has updated plates) as the export to resend
-    if file_bytes:
-        sess["export_bytes"] = file_bytes
+    # Regenerate a clean xlsx from the DataFrame (don't reuse uploaded bytes —
+    # WhatsApp can corrupt them in transit, producing an invalid file).
+    try:
+        _exp_cols = [c for c in raw.columns if not c.startswith("_")]
+        _exp_df   = raw[_exp_cols].copy()
+        # Ensure DATE stays as text so Excel doesn't re-parse it as a date serial
+        if "DATE" in _exp_df.columns:
+            _exp_df["DATE"] = _exp_df["DATE"].astype(str).replace({"nan": "", "NaT": "", "None": ""})
+        _exp_buf = io.BytesIO()
+        _exp_df.to_excel(_exp_buf, index=False, engine="openpyxl")
+        # Force DATE column to Text format so Excel never re-interprets it
+        if "DATE" in _exp_df.columns:
+            from openpyxl import load_workbook as _load_wb2
+            _exp_buf.seek(0)
+            _wb2 = _load_wb2(_exp_buf)
+            _ws2 = _wb2.active
+            _dc  = _exp_df.columns.get_loc("DATE") + 1
+            for _r in _ws2.iter_rows(min_row=2, min_col=_dc, max_col=_dc):
+                for _c in _r:
+                    _c.number_format = "@"
+            _exp_buf = io.BytesIO()
+            _wb2.save(_exp_buf)
+        _exp_buf.seek(0)
+        sess["export_bytes"] = _exp_buf.read()
+    except Exception as _exp_err:
+        print(f"⚠️ Export regeneration failed after override: {_exp_err}")
+        sess["export_bytes"] = None
     # Regenerate trip manifest with the updated assignments
     try:
         sess["trip_manifest_bytes"] = _generate_trip_manifest(sess)
