@@ -133,6 +133,15 @@ def webhook():
         except Exception as e:
             print(f"⚠️ Failed to send export file: {e}")
 
+        try:
+            manifest_bytes = bot.get_trip_manifest_bytes(phone)
+            if manifest_bytes:
+                from datetime import date as _d
+                mname = f"Trip_Manifest_{_d.today().strftime('%d%m%Y')}.xlsx"
+                _send_file(phone, manifest_bytes, filename=mname)
+        except Exception as e:
+            print(f"⚠️ Failed to send trip manifest: {e}")
+
     except (KeyError, IndexError) as e:
         print(f"Webhook parse error: {e} — data: {json.dumps(data)[:300]}")
 
@@ -142,21 +151,46 @@ def webhook():
 # ── Meta API helpers ──────────────────────────────────────────────────────────
 
 def _send_text(to: str, body: str):
-    """Send a plain text WhatsApp message via Meta Cloud API."""
+    """Send a plain text WhatsApp message via Meta Cloud API.
+    Splits messages longer than 4096 chars at newline boundaries so the
+    Meta API never rejects an oversized payload.
+    """
+    WA_MAX = 4096
+    # Split at newline boundaries to avoid breaking mid-line
+    if len(body) > WA_MAX:
+        chunks = []
+        current = []
+        current_len = 0
+        for line in body.split("\n"):
+            # +1 for the newline character
+            segment_len = len(line) + 1
+            if current_len + segment_len > WA_MAX and current:
+                chunks.append("\n".join(current))
+                current = [line]
+                current_len = segment_len
+            else:
+                current.append(line)
+                current_len += segment_len
+        if current:
+            chunks.append("\n".join(current))
+    else:
+        chunks = [body]
+
     url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": body},
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=10)
-    if not r.ok:
-        print(f"❌ Send text failed: {r.status_code} {r.text}")
+    for chunk in chunks:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": chunk},
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if not r.ok:
+            print(f"❌ Send text failed: {r.status_code} {r.text}")
 
 
 def _send_buttons(to: str, body: str, buttons: list[dict]):
@@ -341,12 +375,20 @@ def _send_do_list(to: str, header: str, body: str, button: str, items: list[dict
 
 if __name__ == "__main__":
     import platform, sys, io
-    # Windows services use cp1252 by default; reconfigure to UTF-8 so emoji
-    # in log output doesn't crash the process before waitress even starts.
+    # Force UTF-8 output early — must happen before any print().
+    # PYTHONUTF8=1 is the cleanest fix but may not be set on the service yet.
+    # The TextIOWrapper fallback handles interactive terminals.
+    # errors="replace" ensures unknown chars never crash the process.
+    os.environ.setdefault("PYTHONUTF8", "1")
     if sys.platform == "win32":
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    print("Starting Meta WhatsApp Bot server...")
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+        except AttributeError:
+            # NSSM redirects stdout to a raw file; .buffer is unavailable.
+            # PYTHONUTF8=1 above handles encoding for that case.
+            pass
+    print("Starting DO Bot server...")
     print(f"   Webhook URL: {PUBLIC_BASE_URL}/webhook")
     print(f"   Verify token: {META_VERIFY_TOKEN}")
     port = int(os.environ.get("PORT", 5000))
