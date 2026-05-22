@@ -1171,12 +1171,14 @@ def _handle_user_id(phone, sess, text):
 
 
 
-def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.DataFrame") -> list[str]:
+def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.DataFrame",
+                            file_bytes: bytes = None) -> list[str]:
     """
     Called when the uploaded Excel already has LICENSE plates filled in.
     Supports both initial import and re-import after manual edits:
       - Computes diff against today's daily log for this user's engine.
       - Releases plates removed from the file; records plates added to the file.
+      - Re-sends the updated export Excel + trip manifest automatically.
     Handles comma-separated split plates (e.g. "BMN3682, WUD4927").
     """
     SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "", "nan", "none", "n/a", "-", None}
@@ -1233,6 +1235,55 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
     record_assignments_today(list(new_plates))
     sess.setdefault("unavailable", set()).update(new_plates)
 
+    # ── Rebuild session so trip manifest can be regenerated ───────────────────
+    sess["raw_df"] = raw
+    rebuilt_items = []
+    for idx, row in raw.iterrows():
+        lic_raw = str(row.get("LICENSE", "")).strip()
+        plates_in_cell = [p.strip().upper() for p in lic_raw.split(",")
+                          if p.strip().upper() not in SENTINELS_UP]
+        if len(plates_in_cell) > 1:
+            lorry_val = "SPLIT"
+            split_val = plates_in_cell
+        elif len(plates_in_cell) == 1:
+            lorry_val = plates_in_cell[0]
+            split_val = None
+        else:
+            lorry_val = "NO_LORRY"
+            split_val = None
+        wt = row.get("WEIGHT(T)", 0)
+        if not wt:
+            gw = row.get("GROSS WEIGHT", 0)
+            try:
+                wt = float(gw) / 1000 if gw else 0
+            except Exception:
+                wt = 0
+        rebuilt_items.append({
+            "ROW_IDX":       idx,
+            "DO NUMBER":     str(row.get("DO NUMBER", "")).strip(),
+            "CUSTOMER NAME": str(row.get("CUSTOMER NAME", "")).strip(),
+            "ROUTE":         str(row.get("ROUTE", "")).strip(),
+            "CODE":          str(row.get("CODE", "")).strip(),
+            "WEIGHT":        float(wt),
+            "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
+            "DATE":          str(row.get("DATE", "")).strip(),
+            "LORRY":         lorry_val,
+            "SPLIT_LORRIES": split_val,
+        })
+    sess["items"] = rebuilt_items
+
+    # Store the uploaded file (already has updated plates) as the export to resend
+    if file_bytes:
+        sess["export_bytes"] = file_bytes
+    # Regenerate trip manifest with the updated assignments
+    try:
+        sess["trip_manifest_bytes"] = _generate_trip_manifest(sess)
+    except Exception as _tm_err:
+        print(f"⚠️ Trip manifest regeneration failed after override: {_tm_err}")
+        sess["trip_manifest_bytes"] = None
+    # Keep state as DONE so app.py's get_export_bytes / get_trip_manifest_bytes pick them up
+    sess["state"] = "DONE"
+
     # ── Build reply ───────────────────────────────────────────────────────────
     is_update = bool(released or (old_plates and added))
     lines: list[str] = []
@@ -1269,11 +1320,9 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
     lines.append("─────────────────────")
 
     if is_update:
-        lines.append("✅ Lorry availability updated for today.")
+        lines.append("✅ Lorry availability updated. Updated files incoming...")
     else:
         lines.append("✅ These lorries are now marked *unavailable* for today's auto-assignment.")
-
-    reset_session(phone)
 
     return [
         "\n".join(lines),
@@ -1437,7 +1486,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         ].copy()
 
         if not prefilled_rows.empty:
-            result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows)
+            result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows, file_bytes)
             if result is not None:
                 return result
             # result is None → all plates were sentinels, fall through to auto-assign
