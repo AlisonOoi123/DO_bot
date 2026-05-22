@@ -1604,6 +1604,24 @@ def _handle_excel_upload(phone, sess, file_bytes):
             assign_raw  = raw
             other_count = 0
 
+        # ── Sort by date ascending so early-date DOs are assigned first ──────
+        # When lorries are limited, later-date DOs get NO_LORRY rather than
+        # earlier ones. Stable sort preserves original row order within same date.
+        if "DATE" in assign_raw.columns:
+            from datetime import datetime as _dts
+            def _date_sortkey_upload(v):
+                v = str(v).strip()
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y",
+                            "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+                    try:
+                        return _dts.strptime(v, fmt).strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+                return "9999-12-31"
+            _tmp = assign_raw.copy()
+            _tmp["_ds"] = _tmp["DATE"].apply(_date_sortkey_upload)
+            assign_raw = _tmp.sort_values("_ds", kind="stable").drop(columns=["_ds"])
+
         # ── Build item list: one item per Excel row ─────────────────────────
         # Each row is an independent item that needs its own lorry.
         # Items with the same DO NUMBER belong to the same customer/route
