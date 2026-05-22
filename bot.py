@@ -1193,6 +1193,9 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
     new_plates: set[str] = set()
     rows_summary: list[str] = []
 
+    # Collect rows: store (plates_set, summary_line) so we can filter later
+    all_row_entries: list[tuple[set, str]] = []
+
     for _, row in prefilled.iterrows():
         lic_raw  = str(row.get("LICENSE", "")).strip()
         customer = str(row.get("CUSTOMER NAME", "")).strip()
@@ -1213,9 +1216,8 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
         new_plates.update(plates_in_cell)
         plate_display = ", ".join(f"*{p}*" for p in plates_in_cell)
         itmref_str = f" ({itmref})" if itmref and itmref.lower() not in ("nan", "") else ""
-        rows_summary.append(
-            f"  🚛 {plate_display}  ←  {customer}{itmref_str}  {do_num}  {weight}T"
-        )
+        line = f"  🚛 {plate_display}  ←  {customer}{itmref_str}  {do_num}  {weight}T"
+        all_row_entries.append((set(plates_in_cell), line))
 
     if not new_plates:
         # All LICENSE cells empty — fall through to auto-assign
@@ -1234,6 +1236,16 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
     # Record all new plates (safe: released plates are not in new_plates)
     record_assignments_today(list(new_plates))
     sess.setdefault("unavailable", set()).update(new_plates)
+
+    is_update = bool(released or (old_plates and added))
+
+    # For override: only show rows whose plate actually changed (in added set)
+    # For initial import: show all rows
+    if is_update:
+        rows_summary = [line for plates, line in all_row_entries if plates & added]
+    else:
+        rows_summary = [line for _, line in all_row_entries]
+
 
     # ── Rebuild session so trip manifest can be regenerated ───────────────────
     sess["raw_df"] = raw
@@ -1285,7 +1297,6 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
     sess["state"] = "DONE"
 
     # ── Build reply ───────────────────────────────────────────────────────────
-    is_update = bool(released or (old_plates and added))
     lines: list[str] = []
 
     if is_update:
