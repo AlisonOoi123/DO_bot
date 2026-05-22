@@ -1,0 +1,4 @@
+cd "C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot"
+Stop-Service ngrok_do_bot; Restart-Service do_bot; Start-Service ngrok_do_bot
+
+# git pull origin claude/debug-ngrok-path-CKBcE

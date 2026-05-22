@@ -91,11 +91,77 @@ if ($SITE_PACKAGES) {
 & $NSSM set do_bot AppEnvironmentExtra $envExtra
 
 # -- ngrok service --
-$ngrokCmd  = Get-Command ngrok -ErrorAction SilentlyContinue
-$ngrokPath = if ($ngrokCmd) { $ngrokCmd.Source } else { "$APP_DIR\ngrok.exe" }
-if (-not (Test-Path $ngrokPath)) {
-    Write-Host "   WARNING: ngrok not found at $ngrokPath" -ForegroundColor Yellow
-    Write-Host "   Download from https://ngrok.com/download and extract ngrok.exe to $APP_DIR" -ForegroundColor Yellow
+# Search for ngrok in PATH, then common install locations (Scoop, Chocolatey, WinGet, etc.)
+# WindowsApps aliases are excluded - they are Store stubs that SYSTEM cannot execute.
+function Find-NgrokPath {
+    $cmd = Get-Command ngrok -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -notlike "*WindowsApps*") { return $cmd.Source }
+
+    $fixed = @(
+        "$APP_DIR\ngrok.exe",
+        "$env:USERPROFILE\scoop\shims\ngrok.exe",
+        "$env:USERPROFILE\AppData\Local\ngrok\ngrok.exe",
+        "$env:USERPROFILE\ngrok.exe",
+        "C:\ProgramData\chocolatey\bin\ngrok.exe",
+        "C:\Program Files\ngrok\ngrok.exe",
+        "C:\ngrok\ngrok.exe"
+    )
+    foreach ($c in $fixed) {
+        if (Test-Path $c) { return $c }
+    }
+
+    # WinGet installs into a versioned subdirectory - use wildcard
+    $wingetMatch = Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ngrok.Ngrok*\ngrok.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($wingetMatch -and $wingetMatch -notlike "*WindowsApps*") { return $wingetMatch }
+
+    return $null
+}
+
+function Install-NgrokStandalone {
+    Write-Host "   Attempting to download standalone ngrok.exe directly to $APP_DIR ..." -ForegroundColor Cyan
+    # Add a Defender exclusion for APP_DIR so the download isn't quarantined
+    try {
+        Add-MpPreference -ExclusionPath $APP_DIR -ErrorAction Stop
+        Write-Host "   Windows Defender exclusion added for $APP_DIR" -ForegroundColor Gray
+    } catch {
+        Write-Host "   Could not add Defender exclusion (non-fatal): $_" -ForegroundColor Gray
+    }
+
+    # Download directly into APP_DIR (which has the Defender exclusion).
+    # Do NOT use $env:TEMP -- Defender scans it and quarantines the file there
+    # before it can be moved to the excluded folder.
+    $zipPath = "$APP_DIR\ngrok-standalone.zip"
+    try {
+        Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+            -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+        Expand-Archive -Path $zipPath -DestinationPath $APP_DIR -Force
+        Remove-Item $zipPath -ErrorAction SilentlyContinue
+        if (Test-Path "$APP_DIR\ngrok.exe") {
+            Write-Host "   ngrok.exe extracted to $APP_DIR" -ForegroundColor Green
+            return "$APP_DIR\ngrok.exe"
+        }
+    } catch {
+        Write-Host "   Download failed: $_" -ForegroundColor Red
+    }
+    return $null
+}
+
+$ngrokPath = Find-NgrokPath
+if (-not $ngrokPath) {
+    Write-Host "   ngrok standalone not found -- downloading now..." -ForegroundColor Yellow
+    $ngrokPath = Install-NgrokStandalone
+    if (-not $ngrokPath) {
+        $ngrokPath = "$APP_DIR\ngrok.exe"
+        Write-Host ""
+        Write-Host "   MANUAL STEP REQUIRED:" -ForegroundColor Red
+        Write-Host "   1. Open Windows Security > Virus & threat protection > Exclusions" -ForegroundColor Red
+        Write-Host "      and add an exclusion for: $APP_DIR" -ForegroundColor Red
+        Write-Host "   2. Extract ngrok.exe from the zip at https://ngrok.com/download" -ForegroundColor Red
+        Write-Host "      into $APP_DIR, then re-run this script." -ForegroundColor Red
+    }
+} else {
+    Write-Host "   ngrok found: $ngrokPath" -ForegroundColor Gray
 }
 
 try { & $NSSM stop   ngrok_do_bot         2>$null } catch {}; $LASTEXITCODE = 0
