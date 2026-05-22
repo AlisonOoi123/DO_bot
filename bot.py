@@ -1174,74 +1174,116 @@ def _handle_user_id(phone, sess, text):
 def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.DataFrame") -> list[str]:
     """
     Called when the uploaded Excel already has LICENSE plates filled in.
-    Reads every plate (including comma-separated split plates), registers them
-    as assigned today in the daily log, and returns a clear summary message.
+    Supports both initial import and re-import after manual edits:
+      - Computes diff against today's daily log for this user's engine.
+      - Releases plates removed from the file; records plates added to the file.
+    Handles comma-separated split plates (e.g. "BMN3682, WUD4927").
     """
     SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "", "nan", "none", "n/a", "-", None}
+    SENTINELS_UP = {s.upper() for s in SENTINELS if s}
 
-    # Collect all plates from LICENSE column (handles "BMN3682, WUD4927" too)
-    plates_found = []
-    rows_summary = []
+    # Plates currently assigned today for this user's engine (to diff against)
+    engine = sess.get("engine")
+    user_plates = set(engine.eligible_lorries["LORRY"].str.upper()) if engine else set()
+    old_plates = get_assigned_today() & user_plates if user_plates else set()
+
+    # Collect all plates from the uploaded file's LICENSE column
+    new_plates: set[str] = set()
+    rows_summary: list[str] = []
 
     for _, row in prefilled.iterrows():
-        lic_raw   = str(row.get("LICENSE", "")).strip()
-        customer  = str(row.get("CUSTOMER NAME", "")).strip()
-        do_num    = str(row.get("DO NUMBER", "")).strip()
-        # Support both formats: WEIGHT(T) (old) or GROSS WEIGHT converted (new)
-        weight    = row.get("WEIGHT(T)", row.get("GROSS WEIGHT", ""))
+        lic_raw  = str(row.get("LICENSE", "")).strip()
+        customer = str(row.get("CUSTOMER NAME", "")).strip()
+        do_num   = str(row.get("DO NUMBER", "")).strip()
+        weight   = row.get("WEIGHT(T)", row.get("GROSS WEIGHT", ""))
         if sess.get("is_new_format") and weight != "":
             try:
                 weight = round(float(weight) / 1000, 3)
             except Exception:
                 pass
-        itmref    = str(row.get("ITMREF_0", "")).strip()
+        itmref = str(row.get("ITMREF_0", "")).strip()
 
-        # Split on comma to handle multi-lorry cells
         plates_in_cell = [p.strip().upper() for p in lic_raw.split(",")
-                          if p.strip().upper() not in {s.upper() for s in SENTINELS if s}]
+                          if p.strip().upper() not in SENTINELS_UP]
         if not plates_in_cell:
             continue
 
-        plates_found.extend(plates_in_cell)
+        new_plates.update(plates_in_cell)
         plate_display = ", ".join(f"*{p}*" for p in plates_in_cell)
-        itmref_str    = f" ({itmref})" if itmref and itmref.lower() not in ("nan","") else ""
+        itmref_str = f" ({itmref})" if itmref and itmref.lower() not in ("nan", "") else ""
         rows_summary.append(
             f"  🚛 {plate_display}  ←  {customer}{itmref_str}  {do_num}  {weight}T"
         )
 
-    if not plates_found:
-        # All LICENSE cells were empty despite column existing — fall through to auto-assign
-        return None  # caller must handle None → proceed with normal auto-assign
+    if not new_plates:
+        # All LICENSE cells empty — fall through to auto-assign
+        return None
 
-    # Register in daily log
-    record_assignments_today(plates_found)
+    # ── Diff: what changed vs today's log ────────────────────────────────────
+    released  = old_plates - new_plates   # was assigned, no longer in file
+    added     = new_plates - old_plates   # newly assigned / plate was swapped in
+    unchanged = new_plates & old_plates
 
-    unique_plates = sorted(set(plates_found))
-    lines = []
-    lines.append(f"📋 *Pre-filled assignment detected!*")
-    lines.append(f"Found *{len(unique_plates)} lorry plate(s)* in the uploaded file.")
-    lines.append("Registered as assigned today:")
-    for p in unique_plates:
-        lines.append(f"  ⛔ *{p}*")
-    lines.append("")
+    if released:
+        release_specific_plates(list(released))
+        for p in released:
+            sess.setdefault("unavailable", set()).discard(p)
+
+    # Record all new plates (safe: released plates are not in new_plates)
+    record_assignments_today(list(new_plates))
+    sess.setdefault("unavailable", set()).update(new_plates)
+
+    # ── Build reply ───────────────────────────────────────────────────────────
+    is_update = bool(released or (old_plates and added))
+    lines: list[str] = []
+
+    if is_update:
+        lines.append("🔄 *Assignment Override Detected*\n")
+        lines.append("Daily log updated to reflect your manual changes:\n")
+    else:
+        lines.append("📋 *Pre-filled assignment imported!*\n")
+
+    if released:
+        lines.append(f"✅ *Released — now available ({len(released)}):*")
+        for p in sorted(released):
+            lines.append(f"  ✅ {p}")
+        lines.append("")
+
+    if added:
+        lines.append(f"⛔ *Newly assigned — now unavailable ({len(added)}):*")
+        for p in sorted(added):
+            lines.append(f"  ⛔ {p}")
+        lines.append("")
+
+    if unchanged:
+        lines.append(f"  Unchanged ({len(unchanged)}): {', '.join(sorted(unchanged))}")
+        lines.append("")
+
+    if not released and not added:
+        lines.append(f"  No changes — {len(new_plates)} plate(s) already registered.")
+        lines.append("")
+
     lines.append("─────────────────────")
-    lines.append("*Row details:*")
+    lines.append("*DO details:*")
     lines.extend(rows_summary)
     lines.append("─────────────────────")
-    lines.append(f"✅ These lorries are now marked *unavailable* for today's auto-assignment.")
 
-    # Reset session — user may want to do a fresh assignment next
+    if is_update:
+        lines.append("✅ Lorry availability updated for today.")
+    else:
+        lines.append("✅ These lorries are now marked *unavailable* for today's auto-assignment.")
+
     reset_session(phone)
 
     return [
         "\n".join(lines),
         {
             "_type": "buttons",
-            "body": "Start a new session or check what's assigned today.",
+            "body": "What would you like to do next?",
             "buttons": [
-                {"id": "hi",                  "title": "👋 Hi"},
+                {"id": "hi",                  "title": "👋 Upload DOs"},
                 {"id": "show assigned today",  "title": "📋 Show Assigned"},
-            {"id": "show blocked",         "title": "🚫 Show Blocked"},
+                {"id": "show blocked",         "title": "🚫 Show Blocked"},
             ],
         }
     ]
