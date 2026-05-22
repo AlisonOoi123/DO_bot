@@ -37,7 +37,39 @@ def _resolve_history_path() -> str:
         if os.path.exists(p):
             return p
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
-DAILY_LOG_PATH = os.path.join(_DATA_DIR, "daily_assignments.json")
+DAILY_LOG_PATH        = os.path.join(_DATA_DIR, "daily_assignments.json")
+ROUTE_ASSIGN_PATH     = os.path.join(_DATA_DIR, "route_assignments.json")
+
+# ── Route assignment helpers ──────────────────────────────────────────────────
+import re as _re
+
+def _extract_route_code(route_str: str) -> str:
+    """Extract the short route code from a full ROUTE string.
+    'NS01-->Nilai-Mantin'  → 'NS01'
+    'KV11A - PUDU - ...'   → 'KV11A'
+    'PH01-->Karak'          → 'PH01'
+    """
+    m = _re.match(r'^([A-Z]{2,5}\d+[A-Z]*)', str(route_str).strip().upper())
+    return m.group(1) if m else ""
+
+def _load_route_assignments() -> dict:
+    """Return {username_upper: [route_code, ...]} from route_assignments.json."""
+    if os.path.exists(ROUTE_ASSIGN_PATH):
+        try:
+            with open(ROUTE_ASSIGN_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_route_assignments(mapping: dict):
+    with open(ROUTE_ASSIGN_PATH, "w") as f:
+        json.dump(mapping, f, indent=2)
+
+def get_user_route_codes(user_id: str) -> list[str]:
+    """Return list of route codes assigned to this user (empty = no filter)."""
+    mapping = _load_route_assignments()
+    return mapping.get(user_id.upper(), [])
 
 # ── Shared UI constants ───────────────────────────────────────────────────────
 _HI_BTN = {"_type": "buttons", "body": "Tap below to start a new session.",
@@ -1419,10 +1451,65 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
     ]
 
 
+def _handle_route_assignment_upload(phone, sess, df: "pd.DataFrame") -> list | None:
+    """Detect and process a route-assignment reference file.
+
+    Expected columns (case-insensitive): NAME, ROUTE
+    Extracts the route code prefix (e.g. 'NS01' from 'NS01-->Nilai-Mantin')
+    and saves the user→route_codes mapping to route_assignments.json.
+    Returns None if the file is not a route-assignment file.
+    """
+    col_map = {c.strip().upper(): c for c in df.columns}
+    name_col  = col_map.get("NAME")
+    route_col = col_map.get("ROUTE")
+
+    if not name_col or not route_col:
+        return None
+    # Must NOT look like a DO file (DO NUMBER present → not a route file)
+    if "DO NUMBER" in col_map or "GROSS WEIGHT" in col_map or "WEIGHT(T)" in col_map:
+        return None
+
+    mapping = _load_route_assignments()
+    updated: dict[str, list] = {}
+
+    for _, row in df.iterrows():
+        name  = str(row[name_col]).strip().upper()
+        route = str(row[route_col]).strip()
+        if not name or name in ("NAN", "NONE", ""):
+            continue
+        code = _extract_route_code(route)
+        if not code:
+            continue
+        mapping.setdefault(name, [])
+        if code not in mapping[name]:
+            mapping[name].append(code)
+        updated.setdefault(name, [])
+        if code not in updated[name]:
+            updated[name].append(code)
+
+    if not updated:
+        return None
+
+    _save_route_assignments(mapping)
+
+    lines = ["📋 *Route Assignment Updated*\n"]
+    for uname, codes in sorted(updated.items()):
+        lines.append(f"  *{uname}*: {', '.join(sorted(codes))}")
+    lines.append("")
+    lines.append("✅ Route codes saved. When a user uploads a full DO file, "
+                 "only their assigned routes will be auto-assigned.")
+    return ["\n".join(lines)]
+
+
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
         df.columns = [c.strip().upper() for c in df.columns]
+
+        # ── Detect route-assignment file (NAME + ROUTE columns) ─────────────
+        _route_assign_result = _handle_route_assignment_upload(phone, sess, df)
+        if _route_assign_result is not None:
+            return _route_assign_result
 
         # ── Detect lorry-status file (LORRY + STATUS columns) ───────────────
         # Must be checked BEFORE DO-file detection so a master-lorry upload
@@ -1502,12 +1589,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 return result
             # result is None → all plates were sentinels, fall through to auto-assign
 
+        # ── Route-code filtering ─────────────────────────────────────────────
+        # If the logged-in user has route codes configured, only auto-assign
+        # their DOs. Other rows are kept in raw_df (for the full-file export)
+        # but skipped during assignment — their LICENSE stays blank.
+        user_route_codes = get_user_route_codes(sess.get("user_id", ""))
+        if user_route_codes:
+            my_indices = raw.index[
+                raw["ROUTE"].apply(lambda r: _extract_route_code(str(r)) in user_route_codes)
+            ]
+            other_count = len(raw) - len(my_indices)
+            assign_raw = raw.loc[my_indices]
+        else:
+            assign_raw  = raw
+            other_count = 0
+
         # ── Build item list: one item per Excel row ─────────────────────────
         # Each row is an independent item that needs its own lorry.
         # Items with the same DO NUMBER belong to the same customer/route
         # but may end up on different lorries (e.g. 17.5T row vs 3.5T row).
         items = []
-        for idx, row in raw.iterrows():
+        for idx, row in assign_raw.iterrows():
             items.append({
                 "ROW_IDX":       idx,                         # original df index
                 "DO NUMBER":     str(row["DO NUMBER"]).strip(),
@@ -2018,12 +2120,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for do in pending_dos:
             do["TOTAL_TON"] = round(sum(it["WEIGHT"] for it in do["ITEMS"]), 3)
 
-        sess["pending_dos"]   = pending_dos
+        sess["pending_dos"]    = pending_dos
         sess["change_do_page"] = 0   # reset Change DO pagination on new upload
 
         # ── Build and return summary ──────────────────────────────────────────
         total_items = len(items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
+        if other_count:
+            header += (f"\n📌 _{other_count} row(s) from other users' routes left blank "
+                       f"— only your route codes were assigned._")
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
             return [header + "\n\n" + _summ[0]] + _summ[1:]
