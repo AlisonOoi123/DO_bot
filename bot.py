@@ -3305,6 +3305,16 @@ def _generate_trip_manifest(sess) -> bytes:
             elif lorry != "SPLIT":
                 lorry_pairs[lorry].append((do, it))
 
+    # Fallback: flat items list used after assignment override re-upload
+    # (pending_dos not populated in that path; flat items has all needed fields)
+    if not lorry_pairs and not no_lorry_pairs:
+        for it in sess.get("items", []):
+            lorry = it.get("LORRY") or "NO_LORRY"
+            if lorry in ("NO_LORRY", None, ""):
+                no_lorry_pairs.append((it, it))
+            elif lorry != "SPLIT":
+                lorry_pairs[lorry].append((it, it))
+
     engine  = sess.get("engine")
     cap_map: dict[str, float] = {}
     if engine is not None:
