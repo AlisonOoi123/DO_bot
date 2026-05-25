@@ -1736,6 +1736,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
         sorted_groups.sort(key=_group_sort_key)
 
+        # Session-level capacity tracker so groups can share a lorry when combined
+        # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
+        _session_loads: dict[str, float] = {}   # plate → tons assigned this session
+        _session_routes: dict[str, str]  = {}   # plate → representative route
+        _lorry_cap_map = {row["LORRY"]: float(row["TON"])
+                          for _, row in engine.eligible_lorries.iterrows()}
+
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
             All items in the group share the same route (one route = one lorry).
@@ -1785,6 +1792,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
             excluded = sess["unavailable"] | get_assigned_today()
+
+            # ── Within-session lorry sharing ──────────────────────────────────
+            # Before consuming a new lorry, check if a lorry already used this
+            # session has enough remaining capacity.  Prefer same-corridor lorries
+            # (same direction); fall back only if no compatible match exists.
+            _share_pool = [
+                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                for p in _session_loads
+                if p in _lorry_cap_map
+                and float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= total_w
+                and p not in excluded
+            ]
+            if _share_pool:
+                _compat = sorted(
+                    [(r, p) for r, p in _share_pool
+                     if _routes_on_same_way(route, _session_routes.get(p, ""))]
+                )
+                if _compat:
+                    _shared = _compat[0][1]
+                    for it in group_items:
+                        it["LORRY"] = _shared
+                    _session_loads[_shared] = float(_session_loads.get(_shared, 0)) + total_w
+                    for it in _all_group:
+                        sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
+                    return
 
             # Try single lorry for the whole group
             suggestions = engine.suggest(
@@ -1950,8 +1982,45 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for it in _all_group:
                 sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
 
+            # Update session load tracker so subsequent groups can share this lorry
+            for _it in _all_group:
+                _pl = _it.get("LORRY")
+                if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", None}:
+                    _session_loads[_pl] = float(_session_loads.get(_pl, 0)) + _it["WEIGHT"]
+                    if _pl not in _session_routes:
+                        _session_routes[_pl] = route
+
         for group in sorted_groups:
             _assign_group(group)
+
+        # ── Consolidation pass ────────────────────────────────────────────────
+        # Any item still marked NO_LORRY gets a second chance: find a lorry from
+        # this session with enough remaining capacity, or any eligible lorry at all.
+        _excl_consol = sess["unavailable"] | get_assigned_today()
+        for it in items:
+            if it.get("LORRY") != "NO_LORRY":
+                continue
+            w = it["WEIGHT"]
+            # Build candidates: lorries with remaining session capacity ≥ w
+            _cands = [
+                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                for p in _lorry_cap_map
+                if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
+                and p not in _excl_consol
+            ]
+            if not _cands:
+                continue
+            # Prefer same-corridor lorries with tightest remaining fit
+            _compat = sorted(
+                [(r, p) for r, p in _cands
+                 if _routes_on_same_way(it["ROUTE"], _session_routes.get(p, ""))]
+            )
+            _pick = (_compat or sorted(_cands))[0][1]
+            it["LORRY"] = _pick
+            _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
+            if _pick not in _session_routes:
+                _session_routes[_pick] = it["ROUTE"]
+            sess["assigned"][it["DO NUMBER"]] = _pick
 
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]

@@ -62,7 +62,7 @@ _ADJACENT_CORRIDORS = {
 MAX_STOPS_PER_LORRY   = 8     # Rule 6
 MERGE_DIST_THRESHOLD  = 0.25  # Rule 7: reject if extra dist > 25%
 CAPACITY_TARGET       = 0.80  # Rule 3: target >= 80% utilisation
-MIN_UTIL_TO_ASSIGN    = 0.20  # Rule 8: don't assign a lorry if load < 20% of its capacity
+MIN_UTIL_TO_ASSIGN    = 0.10  # Rule 8: don't assign a lorry if load < 10% of its capacity
 
 # ── Geographic cross-cluster merging (Nominatim/OSM + Haversine) ─────────────
 # Nominatim is the geocoding service behind OpenStreetMap — completely free,
