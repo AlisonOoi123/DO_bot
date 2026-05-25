@@ -2045,6 +2045,55 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _session_routes[_pick] = it["ROUTE"]
             sess["assigned"][it["DO NUMBER"]] = _pick
 
+        # ── Lorry-swap optimisation ───────────────────────────────────────────
+        # Reduce waste on large lorries (≥10T) by swapping them with a smaller
+        # lorry that is currently carrying a heavier load.  Conditions for a
+        # valid swap: (A is large, B is small), A's load fits on B, B's load is
+        # heavier than A's (so A's utilisation improves after taking B's items).
+        # Pick the swap with the biggest waste reduction each round; repeat
+        # until no improving swap remains.
+        _LARGE_T = 10.0
+        _pit: dict[str, list] = {}
+        for _it in items:
+            _pl = _it.get("LORRY")
+            if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", None}:
+                _pit.setdefault(_pl, []).append(_it)
+
+        _swap_ok = True
+        while _swap_ok:
+            _swap_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _best_delta, _best_pa, _best_pb = 0.0, None, None
+            for _pa, _pa_its in list(_pit.items()):
+                _cap_a = _lorry_cap_map.get(_pa, 0)
+                if _cap_a < _LARGE_T:
+                    continue  # A must be a large lorry
+                _load_a = _ploads[_pa]
+                for _pb, _pb_its in list(_pit.items()):
+                    if _pb == _pa:
+                        continue
+                    _cap_b = _lorry_cap_map.get(_pb, 0)
+                    if _cap_b >= _LARGE_T:
+                        continue  # B must be smaller than A
+                    _load_b = _ploads[_pb]
+                    if _load_b <= _load_a:
+                        continue  # swap only improves if B is heavier
+                    if _load_a > _cap_b:
+                        continue  # A's items must physically fit on B
+                    _delta = _load_a - _load_b  # negative = waste reduction
+                    if _delta < _best_delta:
+                        _best_delta = _delta
+                        _best_pa, _best_pb = _pa, _pb
+            if _best_pa:
+                for _it in _pit[_best_pa]:
+                    _it["LORRY"] = _best_pb
+                    sess["assigned"][_it["DO NUMBER"]] = _best_pb
+                for _it in _pit[_best_pb]:
+                    _it["LORRY"] = _best_pa
+                    sess["assigned"][_it["DO NUMBER"]] = _best_pa
+                _pit[_best_pa], _pit[_best_pb] = _pit[_best_pb], _pit[_best_pa]
+                _swap_ok = True
+
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
