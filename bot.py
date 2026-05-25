@@ -1777,6 +1777,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _sorted = sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True)
                 half_a = _sorted[::2]   # indices 0, 2, 4, …
                 half_b = _sorted[1::2]  # indices 1, 3, 5, …
+                # Rebalance: if moving the smallest half_b item to half_a drops
+                # half_b into a smaller lorry tier without making half_a overflow,
+                # do the move so the lighter half fits a smaller (cheaper) lorry.
+                if len(half_b) > 1:
+                    _half_b_w = sum(it["WEIGHT"] for it in half_b)
+                    _half_a_w = sum(it["WEIGHT"] for it in half_a)
+                    _smallest_b = min(half_b, key=lambda x: x["WEIGHT"])
+                    _new_b_w = _half_b_w - _smallest_b["WEIGHT"]
+                    _new_a_w = _half_a_w + _smallest_b["WEIGHT"]
+                    _caps = sorted(engine.eligible_lorries["TON"].tolist())
+                    _best_b_before = next((c for c in _caps if c >= _half_b_w), float("inf"))
+                    _best_b_after  = next((c for c in _caps if c >= _new_b_w),  float("inf"))
+                    _best_a_after  = next((c for c in _caps if c >= _new_a_w),  float("inf"))
+                    if _best_b_after < _best_b_before and _best_a_after < float("inf"):
+                        half_b = [it for it in half_b if it is not _smallest_b]
+                        half_a = half_a + [_smallest_b]
                 _assign_group(half_a)
                 _assign_group(half_b)
                 # Propagate back to _all_group items that were pre-filtered NO_LORRY
@@ -1791,7 +1807,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
-            excluded = sess["unavailable"] | get_assigned_today()
+            # Also exclude lorries already full or incompatible with this route
+            _session_full = {p for p in _session_loads
+                             if _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) < total_w}
+            _session_incompatible = {
+                p for p in _session_loads
+                if _session_routes.get(p)
+                and not _routes_on_same_way(route, _session_routes.get(p, ""))
+                and _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) >= total_w
+            }
+            excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
 
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
@@ -1877,7 +1902,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             it.pop("SPLIT_LORRIES", None)
                     else:
                         lorry = suggestions[0]["LORRY"]
-                        sess["unavailable"].add(lorry)
                         for it in group_items:
                             it["LORRY"] = lorry
             else:
@@ -1971,7 +1995,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 it["LORRY"] = "NO_LORRY"
                         else:
                             lorry = last_resort[0]["LORRY"]
-                            sess["unavailable"].add(lorry)
                             for it in group_items:
                                 it["LORRY"] = lorry
                     else:

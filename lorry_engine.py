@@ -440,9 +440,10 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
     if ia["cluster"] == "UNKNOWN":
         return False
 
-    # Path A: both have a named directional corridor — they must match
+    # Path A: both have a named directional corridor — must be same or adjacent
     if ia["corridor"] != "GENERAL" and ib["corridor"] != "GENERAL":
-        if ia["corridor"] != ib["corridor"]:
+        if not (_corridors_adjacent(ia["corridor"], ib["corridor"]) or
+                _corridors_adjacent(ib["corridor"], ia["corridor"])):
             return False
     elif ia["corridor"] == "GENERAL" and ib["corridor"] == "GENERAL":
         # Path B: BOTH are GENERAL → need shared waypoints to confirm direction
