@@ -81,9 +81,77 @@ if (Test-Path "$APP_DIR\config.txt") {
     Write-Host "   MISSING -- config.txt not found" -ForegroundColor Red
 }
 
-# -- 6. Check ngrok config -----------------------------------------------------
+# -- 6. Check ngrok executable -------------------------------------------------
 Write-Host ""
-Write-Host "[6] ngrok_do_bot.yml" -ForegroundColor Yellow
+Write-Host "[6] ngrok executable" -ForegroundColor Yellow
+$ngrokFound = $null
+$ngrokCmd = Get-Command ngrok -ErrorAction SilentlyContinue
+# WindowsApps aliases are Store stubs - SYSTEM cannot run them, so don't count them as valid
+if ($ngrokCmd -and $ngrokCmd.Source -notlike "*WindowsApps*") { $ngrokFound = $ngrokCmd.Source }
+if (-not $ngrokFound) {
+    $candidates = @(
+        "$APP_DIR\ngrok.exe",
+        "$env:USERPROFILE\scoop\shims\ngrok.exe",
+        "$env:USERPROFILE\AppData\Local\ngrok\ngrok.exe",
+        "$env:USERPROFILE\ngrok.exe",
+        "C:\ProgramData\chocolatey\bin\ngrok.exe",
+        "C:\Program Files\ngrok\ngrok.exe",
+        "C:\ngrok\ngrok.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { $ngrokFound = $c; break } }
+}
+# Check WinGet versioned path (exclude WindowsApps stubs)
+if (-not $ngrokFound) {
+    $wg = Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ngrok.Ngrok*\ngrok.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($wg -and $wg -notlike "*WindowsApps*") { $ngrokFound = $wg }
+}
+# Detect WindowsApps alias separately for a targeted warning
+$windowsAppsNgrok = $null
+if ($ngrokCmd -and $ngrokCmd.Source -like "*WindowsApps*") {
+    $windowsAppsNgrok = $ngrokCmd.Source
+} elseif (Test-Path "$env:LOCALAPPDATA\Microsoft\WindowsApps\ngrok.exe") {
+    $windowsAppsNgrok = "$env:LOCALAPPDATA\Microsoft\WindowsApps\ngrok.exe"
+}
+if (-not $ngrokFound) {
+    $wingetMatch = Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ngrok.Ngrok*\ngrok.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($wingetMatch) { $ngrokFound = $wingetMatch }
+}
+if ($ngrokFound) {
+    Write-Host "   Found: $ngrokFound" -ForegroundColor Green
+    $ngrokVer = & $ngrokFound version 2>&1 | Select-Object -First 1
+    Write-Host "   Version: $ngrokVer" -ForegroundColor Gray
+    if ($ngrokFound -like "*WindowsApps*") {
+        Write-Host ""
+        Write-Host "   WARNING: WindowsApps alias detected. NSSM services run as SYSTEM" -ForegroundColor Yellow
+        Write-Host "            and cannot execute Windows Store app aliases -- the" -ForegroundColor Yellow
+        Write-Host "            ngrok_do_bot service will fail to start with this path." -ForegroundColor Yellow
+        Write-Host "            Fix: download the standalone zip from https://ngrok.com/download" -ForegroundColor Yellow
+        Write-Host "            and extract ngrok.exe to $APP_DIR, then re-run setup_windows.ps1." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "   TIP: If the ngrok_do_bot service was set up before ngrok was found," -ForegroundColor Yellow
+        Write-Host "        re-run setup_windows.ps1 so the service path is updated." -ForegroundColor Yellow
+    }
+} else {
+    if ($windowsAppsNgrok) {
+        Write-Host "   Store alias found: $windowsAppsNgrok" -ForegroundColor Yellow
+        Write-Host "   This is a Windows Store stub -- SYSTEM services cannot execute it." -ForegroundColor Yellow
+    } else {
+        Write-Host "   MISSING -- ngrok.exe not found in PATH or common locations" -ForegroundColor Red
+    }
+    Write-Host ""
+    Write-Host "   FIX: Run setup_windows.ps1 -- it will download ngrok.exe automatically." -ForegroundColor Cyan
+    Write-Host "   If the download is blocked by Defender:" -ForegroundColor Yellow
+    Write-Host "     1. Windows Security > Virus & threat protection > Manage settings" -ForegroundColor Yellow
+    Write-Host "        > Exclusions > Add exclusion > Folder > $APP_DIR" -ForegroundColor Yellow
+    Write-Host "     2. Re-run setup_windows.ps1" -ForegroundColor Yellow
+}
+
+# -- 7. Check ngrok config -----------------------------------------------------
+Write-Host ""
+Write-Host "[7] ngrok_do_bot.yml" -ForegroundColor Yellow
 if (Test-Path "$APP_DIR\ngrok_do_bot.yml") {
     Write-Host "   OK -- file exists" -ForegroundColor Green
     $hasToken = Select-String -Path "$APP_DIR\ngrok_do_bot.yml" -Pattern "authtoken:\s*\S+" -Quiet
@@ -96,9 +164,9 @@ if (Test-Path "$APP_DIR\ngrok_do_bot.yml") {
     Write-Host "   MISSING -- copy ngrok_do_bot.yml.example to ngrok_do_bot.yml and fill in your token" -ForegroundColor Red
 }
 
-# -- 7. NSSM service registration ----------------------------------------------
+# -- 8. NSSM service registration ----------------------------------------------
 Write-Host ""
-Write-Host "[7] NSSM service registration" -ForegroundColor Yellow
+Write-Host "[8] NSSM service registration" -ForegroundColor Yellow
 if (Test-Path $NSSM) {
     foreach ($svc in @("do_bot", "ngrok_do_bot")) {
         $status = & $NSSM status $svc 2>&1
@@ -108,9 +176,9 @@ if (Test-Path $NSSM) {
     Write-Host "   nssm.exe not found -- run setup_windows.ps1 first" -ForegroundColor Red
 }
 
-# -- 8. Show recent error logs -------------------------------------------------
+# -- 9. Show recent error logs -------------------------------------------------
 Write-Host ""
-Write-Host "[8] Recent error log output" -ForegroundColor Yellow
+Write-Host "[9] Recent error log output" -ForegroundColor Yellow
 foreach ($log in @("do_bot_error.log", "ngrok_error.log")) {
     $path = "$APP_DIR\logs\$log"
     if (Test-Path $path) {
