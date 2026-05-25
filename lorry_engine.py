@@ -498,6 +498,7 @@ class LorryEngine:
         df = pd.read_excel(path)
         df.columns = [c.strip().upper() for c in df.columns]
         df["USER"] = df["USER"].str.strip().str.upper()
+        df = df.drop_duplicates(subset=["LORRY"], keep="first")
         self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
         self.all_lorries = df.copy()
 

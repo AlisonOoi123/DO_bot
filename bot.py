@@ -1764,7 +1764,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # lorries so drivers aren't overloaded and idle ABI lorries get work.
             # MAX_STOPS_PER_LORRY (=8) was designed for route-count merging;
             # here we use a separate threshold for DO count.
-            _MAX_DOS_PER_LORRY = 10
+            _MAX_DOS_PER_LORRY = 15
             if len(group_items) > _MAX_DOS_PER_LORRY:
                 # Balance by weight: sort heaviest first, alternate between two halves
                 _sorted = sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True)
