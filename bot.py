@@ -22,7 +22,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
-MASTER_PATH    = os.path.join(_HERE, "master lorry.xlsx")      # read-only, stays in root
+MASTER_PATH    = os.path.join(_DATA_DIR, "master lorry.xlsx")
 # History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
 HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
