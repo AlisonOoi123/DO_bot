@@ -28,6 +28,36 @@ HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # n
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
+ROUTE_CODES_PATH = os.path.join(_DATA_DIR, "route_codes.xlsx")                  # user→route mapping
+
+def _load_user_route_prefixes(user: str) -> set | None:
+    """Return the set of route-code prefixes (e.g. 'KV19A', 'PH09') assigned to
+    *user* (case-insensitive).  Returns None if the mapping file doesn't exist,
+    meaning no filtering is applied and all routes are processed.
+    """
+    if not os.path.exists(ROUTE_CODES_PATH):
+        return None
+    try:
+        df = pd.read_excel(ROUTE_CODES_PATH)
+        df.columns = [c.strip().upper() for c in df.columns]
+        name_col  = next((c for c in df.columns if "NAME" in c), None)
+        route_col = next((c for c in df.columns if "ROUTE" in c), None)
+        if name_col is None or route_col is None:
+            return None
+        user_rows = df[df[name_col].str.strip().str.upper() == user.upper()]
+        prefixes = set()
+        for route in user_rows[route_col].dropna().astype(str):
+            m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
+            if m:
+                prefixes.add(m.group(1).upper())
+        return prefixes if prefixes else None
+    except Exception:
+        return None
+
+def _extract_route_prefix(route: str) -> str:
+    """Extract the leading route code token (e.g. 'KV19A', 'PH09', 'JH09')."""
+    m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
+    return m.group(1).upper() if m else ""
 
 def _resolve_history_path() -> str:
     """Return the best available history file.
@@ -1404,20 +1434,35 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Each row is an independent item that needs its own lorry.
         # Items with the same DO NUMBER belong to the same customer/route
         # but may end up on different lorries (e.g. 17.5T row vs 3.5T row).
+
+        # Route-code filtering: only assign rows whose route prefix belongs to
+        # the logged-in user.  Rows for other users are kept in items (so they
+        # appear in the export) but pre-marked as OTHER_USER so they get a
+        # blank LICENSE in the exported file.
+        _user_prefixes = _load_user_route_prefixes(sess.get("user_id", ""))
+
         items = []
+        _other_user_count = 0
         for idx, row in raw.iterrows():
+            route_str = str(row["ROUTE"]).strip()
+            _is_mine  = True
+            if _user_prefixes:
+                pfx = _extract_route_prefix(route_str)
+                if pfx and pfx not in _user_prefixes:
+                    _is_mine = False
+                    _other_user_count += 1
+
             items.append({
-                "ROW_IDX":       idx,                         # original df index
+                "ROW_IDX":       idx,
                 "DO NUMBER":     str(row["DO NUMBER"]).strip(),
                 "CUSTOMER NAME": str(row["CUSTOMER NAME"]).strip(),
-                "ROUTE":         str(row["ROUTE"]).strip(),
+                "ROUTE":         route_str,
                 "CODE":          str(row["CODE"]).strip(),
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
                 "DATE":          str(row.get("DATE", "")).strip(),
-                # assignment fields filled below
-                "LORRY":         None,   # plate string, or "SPLIT", "NO_LORRY"
-                "SPLIT_LORRIES": None,   # list of bins if split
+                "LORRY":         None if _is_mine else "OTHER_USER",
+                "SPLIT_LORRIES": None,
             })
 
         sess["items"]      = items          # row-level item list
@@ -1472,9 +1517,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             MIN_UTIL_TO_ASSIGN  as _MIN_UTIL,
         )
 
-        # Step 1 — exact-route buckets
+        # Step 1 — exact-route buckets (skip other-user rows — they stay blank)
         route_buckets: dict[str, list] = defaultdict(list)
         for it in items:
+            if it.get("LORRY") == "OTHER_USER":
+                continue
             route_buckets[it["ROUTE"].strip().upper()].append(it)
 
         # Step 2 — cluster same-way buckets into corridor super-groups
@@ -1917,6 +1964,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
         seen_do = {}
         pending_dos = []
         for item in items:
+            if item.get("LORRY") == "OTHER_USER":
+                continue          # keep in raw_df for export blank; hide from UI
             do_num = item["DO NUMBER"]
             if do_num not in seen_do:
                 seen_do[do_num] = len(pending_dos)
@@ -1939,8 +1988,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
         sess["change_do_page"] = 0   # reset Change DO pagination on new upload
 
         # ── Build and return summary ──────────────────────────────────────────
-        total_items = len(items)
+        my_items    = [it for it in items if it.get("LORRY") != "OTHER_USER"]
+        total_items = len(my_items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
+        if _other_user_count:
+            header += f"\n📌 _{_other_user_count} row(s) from other users' routes left blank — only your route codes were assigned._"
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
             return [header + "\n\n" + _summ[0]] + _summ[1:]
@@ -2414,8 +2466,9 @@ def _build_summary(sess) -> str:
     engine = sess.get("engine")
 
     # ── Build lorry-grouped view ──────────────────────────────────────────
-    # Collect all items and build per-lorry buckets
-    all_items = [it for do in pending for it in do.get("ITEMS", [])]
+    # Collect all items and build per-lorry buckets (exclude other-user rows)
+    all_items = [it for do in pending for it in do.get("ITEMS", [])
+                 if it.get("LORRY") != "OTHER_USER"]
 
     # Map DO NUMBER → (customer_short, route_code, date)
     do_meta: dict[str, tuple] = {}
@@ -2958,7 +3011,7 @@ def _export_result_inner(sess) -> list[str]:
     # Blank out any stale sentinel strings in LICENSE so we only write real plates
     new_df["LICENSE"] = new_df["LICENSE"].astype(str).replace({"nan": "", "None": ""})
 
-    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "", None}
+    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "OTHER_USER", "", None}
     confirmed_plates = []
     assigned_row_idxs = set()
 
