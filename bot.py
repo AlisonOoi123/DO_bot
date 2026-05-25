@@ -1712,6 +1712,25 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
                 return
 
+            # Rule 6b — per-lorry delivery-stop limit.
+            # When a group carries too many individual DOs, split it across two
+            # lorries so drivers aren't overloaded and idle ABI lorries get work.
+            # MAX_STOPS_PER_LORRY (=8) was designed for route-count merging;
+            # here we use a separate threshold for DO count.
+            _MAX_DOS_PER_LORRY = 10
+            if len(group_items) > _MAX_DOS_PER_LORRY:
+                # Balance by weight: sort heaviest first, alternate between two halves
+                _sorted = sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True)
+                half_a = _sorted[::2]   # indices 0, 2, 4, …
+                half_b = _sorted[1::2]  # indices 1, 3, 5, …
+                _assign_group(half_a)
+                _assign_group(half_b)
+                # Propagate back to _all_group items that were pre-filtered NO_LORRY
+                for it in _all_group:
+                    if it.get("LORRY") == "NO_LORRY":
+                        sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                return
+
             total_w  = sum(it["WEIGHT"] for it in group_items)
             route    = group_items[0]["ROUTE"]
             customer = group_items[0]["CUSTOMER NAME"]
