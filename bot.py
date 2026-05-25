@@ -1597,24 +1597,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Store format flag so export knows not to touch DATE
         sess["is_new_format"] = IS_NEW_FORMAT
 
-        # ── Pre-filled detection ─────────────────────────────────────────────
-        # If the uploaded Excel already has LICENSE plates in it, the user is
-        # importing a completed assignment sheet (not asking us to auto-assign).
-        # Read those plates, register them as assigned today, and show a summary.
-        SENTINELS_STR = {"", "nan", "none", "n/a", "-"}
-        prefilled_rows = raw[
-            raw["LICENSE"].astype(str).str.strip().str.lower()
-            .isin(SENTINELS_STR) == False
-        ].copy()
-
-        if not prefilled_rows.empty:
-            result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows, file_bytes)
-            if result is not None:
-                return result
-            # result is None → all plates were sentinels, fall through to auto-assign
-
         # ── Route-code filtering ─────────────────────────────────────────────
-        # If the logged-in user has route codes configured, only auto-assign
+        # Must happen BEFORE pre-filled detection: a full company DO file may
+        # have other users' plates in LICENSE while this user's rows are empty.
+        # Checking all rows would incorrectly trigger the pre-filled path.
+
         # their DOs. Other rows are kept in raw_df (for the full-file export)
         # but skipped during assignment — their LICENSE stays blank.
         user_route_codes = get_user_route_codes(sess.get("user_id", ""))
@@ -1627,6 +1614,21 @@ def _handle_excel_upload(phone, sess, file_bytes):
         else:
             assign_raw  = raw
             other_count = 0
+
+        # ── Pre-filled detection (on user's rows only) ───────────────────────
+        # Check assign_raw (not raw) so other users' plates in the full-file
+        # export don't falsely trigger the pre-filled / override path.
+        SENTINELS_STR = {"", "nan", "none", "n/a", "-"}
+        prefilled_rows = assign_raw[
+            assign_raw["LICENSE"].astype(str).str.strip().str.lower()
+            .isin(SENTINELS_STR) == False
+        ].copy()
+
+        if not prefilled_rows.empty:
+            result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows, file_bytes)
+            if result is not None:
+                return result
+            # result is None → all plates were sentinels, fall through to auto-assign
 
         # ── Sort by date ascending so early-date DOs are assigned first ──────
         # When lorries are limited, later-date DOs get NO_LORRY rather than
