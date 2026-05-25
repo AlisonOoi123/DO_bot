@@ -251,7 +251,9 @@ def _send_file(to: str, file_bytes: bytes, filename: str):
     Send a file back to the user.
     Meta requires uploading the file first, then sending by media ID.
     """
-    # Step 1: Upload media
+    file_kb = len(file_bytes) / 1024
+    # Step 1: Upload media — give larger files more time (min 60s, +1s per 50KB)
+    upload_timeout = max(60, int(file_kb / 50) + 30)
     upload_url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/media"
     headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
     files = {
@@ -259,12 +261,14 @@ def _send_file(to: str, file_bytes: bytes, filename: str):
                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "messaging_product": (None, "whatsapp"),
     }
-    r = requests.post(upload_url, headers=headers, files=files, timeout=30)
+    print(f"📤 Uploading {filename} ({file_kb:.0f} KB), timeout={upload_timeout}s")
+    r = requests.post(upload_url, headers=headers, files=files, timeout=upload_timeout)
     if not r.ok:
         print(f"❌ File upload failed: {r.status_code} {r.text}")
         _send_text(to, "⚠️ Could not send the Excel file. Please check the server.")
         return
     media_id = r.json().get("id")
+    print(f"✅ Upload OK — media_id={media_id}, sending {filename}")
 
     # Step 2: Send as document message
     msg_url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
