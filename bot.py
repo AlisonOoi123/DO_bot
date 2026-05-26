@@ -2128,7 +2128,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _best_util, _best_src, _best_dst = -1.0, None, None
             for _pa in list(_pit.keys()):
                 _load_a = _ploads[_pa]
-                _route_a = _session_routes.get(_pa, "")
+                # Use the first item's route as the representative route for
+                # this lorry — more reliable than _session_routes when the lorry
+                # received items from a new route with no history record.
+                _route_a = next((it["ROUTE"] for it in _pit[_pa] if it.get("ROUTE")), "") \
+                           or _session_routes.get(_pa, "")
                 for _pb in list(_pit.keys()):
                     if _pb == _pa:
                         continue
@@ -2136,13 +2140,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _cap_b  = float(_lorry_cap_map.get(_pb, 0))
                     if _load_a + _load_b > _cap_b:
                         continue
-                    _route_b = _session_routes.get(_pb, "")
-                    # If either lorry's route is unknown, refuse the merge —
-                    # we can't verify compatibility and mustn't mix clusters.
-                    if not _route_a or not _route_b:
-                        continue
-                    if not _routes_on_same_way(_route_a, _route_b):
-                        continue
+                    _route_b = next((it["ROUTE"] for it in _pit[_pb] if it.get("ROUTE")), "") \
+                               or _session_routes.get(_pb, "")
+                    # Route compatibility: use route/GPS/weight rules so that
+                    # lorries carrying new routes (no history) are still checked
+                    # correctly against cluster, bearing, and direction.
+                    if _route_a and _route_b:
+                        if not _routes_on_same_way(_route_a, _route_b):
+                            continue
                     _util = (_load_a + _load_b) / _cap_b if _cap_b else 0
                     if _util > _best_util:
                         _best_util = _util
