@@ -2114,6 +2114,43 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _pit[_best_pa], _pit[_best_pb] = _pit[_best_pb], _pit[_best_pa]
                 _swap_ok = True
 
+        # ── Same-route merge pass ─────────────────────────────────────────────
+        # If two lorries carry compatible routes and lorry A's entire load fits
+        # inside lorry B's remaining capacity, move all of A's DOs onto B and
+        # free lorry A.  Picks the merge that maximises B's utilisation after
+        # the move so we prefer consolidating onto the tightest-fitting lorry.
+        # Example: VEA2818 (1T, PH09, 0.6T) + WLD8738 (5T, PH09, 0.538T)
+        #   → 0.6T fits on WLD8738 (remaining 4.46T) → merge → WLD8738 at 22.8%
+        _merge_ok = True
+        while _merge_ok:
+            _merge_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _best_util, _best_src, _best_dst = -1.0, None, None
+            for _pa in list(_pit.keys()):
+                _load_a = _ploads[_pa]
+                _route_a = _session_routes.get(_pa, "")
+                for _pb in list(_pit.keys()):
+                    if _pb == _pa:
+                        continue
+                    _load_b = _ploads[_pb]
+                    _cap_b  = float(_lorry_cap_map.get(_pb, 0))
+                    if _load_a + _load_b > _cap_b:
+                        continue
+                    _route_b = _session_routes.get(_pb, "")
+                    if _route_a and _route_b:
+                        if not _routes_on_same_way(_route_a, _route_b):
+                            continue
+                    _util = (_load_a + _load_b) / _cap_b if _cap_b else 0
+                    if _util > _best_util:
+                        _best_util = _util
+                        _best_src, _best_dst = _pa, _pb
+            if _best_src:
+                for _it in _pit[_best_src]:
+                    _it["LORRY"] = _best_dst
+                    sess["assigned"][_it["DO NUMBER"]] = _best_dst
+                _pit[_best_dst].extend(_pit.pop(_best_src))
+                _merge_ok = True
+
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
