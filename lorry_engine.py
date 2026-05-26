@@ -761,12 +761,30 @@ class LorryEngine:
             lambda u: 1.0 if u >= CAPACITY_TARGET else u / CAPACITY_TARGET)
         merged["IS_OWNER"] = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
-        # Per-tier sort — SURPLUS (tightest fit) is the primary key in every tier.
-        # History (CUST_FREQ / CLUSTER_FREQ) breaks ties within the same capacity class
-        # so a familiar driver is preferred when two lorries are equally efficient.
-        # This ensures minimum capacity waste regardless of route history.
-        _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
-        _sort_asc  = [True,      False,       False,          False,        False,       False]
+        # ── Distance-aware scoring ────────────────────────────────────────────
+        # Long-haul routes (>100 km from depot): drop undersized lorries and sort
+        # by utilisation first.  Without this, SURPLUS-primary sort picks a 5T van
+        # over a 14T lorry for a 4T Pahang/Johor load just because it fits tighter —
+        # sending a mini-van on a 280 km highway run is operationally wrong.
+        # Local/medium routes keep SURPLUS-primary (tightest fit, minimise waste).
+        _centroid      = _route_centroid(route)
+        _route_dist_km = (
+            _haversine_km(_DEPOT[0], _DEPOT[1], _centroid[0], _centroid[1])
+            if _centroid else 0.0
+        )
+        LONG_HAUL_KM       = 100.0
+        _LONG_HAUL_MIN_TON = 8.0   # exclude vans/small trucks for long-haul
+
+        if _route_dist_km >= LONG_HAUL_KM:
+            _lh_big = merged[merged["TON"] >= _LONG_HAUL_MIN_TON]
+            if not _lh_big.empty:
+                merged = _lh_big
+            _sort_cols = ["UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
+            _sort_asc  = [False,        False,       False,           True,     False,       False]
+        else:
+            _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
+            _sort_asc  = [True,      False,       False,          False,        False,       False]
+
         UTIL_GOOD_THRESHOLD = 0.60
         UTIL_OK_THRESHOLD   = 0.40
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
