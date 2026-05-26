@@ -1773,33 +1773,43 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # here we use a separate threshold for DO count.
             _MAX_DOS_PER_LORRY = 15
             if len(group_items) > _MAX_DOS_PER_LORRY:
-                # Balance by weight: sort heaviest first, alternate between two halves
-                _sorted = sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True)
-                half_a = _sorted[::2]   # indices 0, 2, 4, …
-                half_b = _sorted[1::2]  # indices 1, 3, 5, …
-                # Rebalance: if moving the smallest half_b item to half_a drops
-                # half_b into a smaller lorry tier without making half_a overflow,
-                # do the move so the lighter half fits a smaller (cheaper) lorry.
-                if len(half_b) > 1:
-                    _half_b_w = sum(it["WEIGHT"] for it in half_b)
-                    _half_a_w = sum(it["WEIGHT"] for it in half_a)
-                    _smallest_b = min(half_b, key=lambda x: x["WEIGHT"])
-                    _new_b_w = _half_b_w - _smallest_b["WEIGHT"]
-                    _new_a_w = _half_a_w + _smallest_b["WEIGHT"]
-                    _caps = sorted(engine.eligible_lorries["TON"].tolist())
-                    _best_b_before = next((c for c in _caps if c >= _half_b_w), float("inf"))
-                    _best_b_after  = next((c for c in _caps if c >= _new_b_w),  float("inf"))
-                    _best_a_after  = next((c for c in _caps if c >= _new_a_w),  float("inf"))
-                    if _best_b_after < _best_b_before and _best_a_after < float("inf"):
-                        half_b = [it for it in half_b if it is not _smallest_b]
-                        half_a = half_a + [_smallest_b]
-                _assign_group(half_a)
-                _assign_group(half_b)
-                # Propagate back to _all_group items that were pre-filtered NO_LORRY
-                for it in _all_group:
-                    if it.get("LORRY") == "NO_LORRY":
-                        sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
-                return
+                # Only split when the combined weight truly exceeds every
+                # available lorry's capacity.  If the full group fits on a
+                # single lorry (even a large 14T), keep it together so that
+                # lorry reaches high utilisation instead of creating two
+                # under-filled lorries.
+                _pre_total_w = sum(it["WEIGHT"] for it in group_items)
+                _all_caps = sorted(engine.eligible_lorries["TON"].tolist())
+                if not any(c >= _pre_total_w for c in _all_caps):
+                    # Too heavy for any single lorry — must split by DO count
+                    # Balance by weight: sort heaviest first, alternate between two halves
+                    _sorted = sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True)
+                    half_a = _sorted[::2]   # indices 0, 2, 4, …
+                    half_b = _sorted[1::2]  # indices 1, 3, 5, …
+                    # Rebalance: if moving the smallest half_b item to half_a drops
+                    # half_b into a smaller lorry tier without making half_a overflow,
+                    # do the move so the lighter half fits a smaller (cheaper) lorry.
+                    if len(half_b) > 1:
+                        _half_b_w = sum(it["WEIGHT"] for it in half_b)
+                        _half_a_w = sum(it["WEIGHT"] for it in half_a)
+                        _smallest_b = min(half_b, key=lambda x: x["WEIGHT"])
+                        _new_b_w = _half_b_w - _smallest_b["WEIGHT"]
+                        _new_a_w = _half_a_w + _smallest_b["WEIGHT"]
+                        _caps = sorted(engine.eligible_lorries["TON"].tolist())
+                        _best_b_before = next((c for c in _caps if c >= _half_b_w), float("inf"))
+                        _best_b_after  = next((c for c in _caps if c >= _new_b_w),  float("inf"))
+                        _best_a_after  = next((c for c in _caps if c >= _new_a_w),  float("inf"))
+                        if _best_b_after < _best_b_before and _best_a_after < float("inf"):
+                            half_b = [it for it in half_b if it is not _smallest_b]
+                            half_a = half_a + [_smallest_b]
+                    _assign_group(half_a)
+                    _assign_group(half_b)
+                    # Propagate back to _all_group items that were pre-filtered NO_LORRY
+                    for it in _all_group:
+                        if it.get("LORRY") == "NO_LORRY":
+                            sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                    return
+                # else: weight fits one lorry — fall through to normal single-lorry path
 
             total_w  = sum(it["WEIGHT"] for it in group_items)
             route    = group_items[0]["ROUTE"]
