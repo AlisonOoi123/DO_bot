@@ -1779,8 +1779,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # lorry reaches high utilisation instead of creating two
                 # under-filled lorries.
                 _pre_total_w = sum(it["WEIGHT"] for it in group_items)
-                _all_caps = sorted(engine.eligible_lorries["TON"].tolist())
-                if not any(c >= _pre_total_w for c in _all_caps):
+                _excl_check = sess["unavailable"] | get_assigned_today()
+                _avail_caps = sorted(
+                    float(row["TON"]) for _, row in engine.eligible_lorries.iterrows()
+                    if row["LORRY"] not in _excl_check
+                )
+                if not any(c >= _pre_total_w for c in _avail_caps):
                     # Too heavy for any single lorry — must split by DO count
                     # Balance by weight: sort heaviest first, alternate between two halves
                     _sorted = sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True)
