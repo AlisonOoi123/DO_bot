@@ -1929,7 +1929,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 for _ in range(10):
                     if remain <= 0:
                         break
-                    excl = sess["unavailable"] | get_assigned_today()
+                    # Exclude lorries that already carry too much from this
+                    # session to accept 'remain' more tons — otherwise the
+                    # bin-pack re-picks a lorry loaded in an earlier group
+                    # (e.g. BQU3875 filled to 20T getting a second 18T run).
+                    _excl_session_full = {
+                        p for p in _session_loads
+                        if float(_lorry_cap_map.get(p, 0))
+                           - float(_session_loads.get(p, 0)) < remain
+                    }
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -1971,7 +1980,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             # Bins are full — try to grab one more lorry rather
                             # than giving up (greedy fill can leave tiny tail items
                             # stranded even when arithmetic says they should fit).
-                            excl_retry = sess["unavailable"] | get_assigned_today()
+                            _excl_retry_sf = {
+                                p for p in _session_loads
+                                if float(_lorry_cap_map.get(p, 0))
+                                   - float(_session_loads.get(p, 0)) < it["WEIGHT"]
+                            }
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -1997,7 +2011,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # Last resort: find the tightest-fitting available lorry
                     # that is NOT overloaded (combined weight ≤ capacity).
                     # If even the largest lorry can't handle the weight → NO_LORRY.
-                    excl_final = sess["unavailable"] | get_assigned_today()
+                    _excl_lr_sf = {
+                        p for p in _session_loads
+                        if float(_lorry_cap_map.get(p, 0))
+                           - float(_session_loads.get(p, 0)) < total_w
+                    }
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -2158,6 +2177,35 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     sess["assigned"][_it["DO NUMBER"]] = _best_dst
                 _pit[_best_dst].extend(_pit.pop(_best_src))
                 _merge_ok = True
+
+        # ── Hard capacity guard ───────────────────────────────────────────────
+        # After all passes, any lorry whose assigned weight still exceeds its
+        # physical capacity is trimmed: keep the nearest DOs (to Shah Alam HQ)
+        # up to the lorry's capacity and mark the overflow as NO_LORRY so the
+        # user can handle them manually or in a second trip.
+        for _pl, _pl_items in list(_pit.items()):
+            _cap = float(_lorry_cap_map.get(_pl, 0))
+            if _cap <= 0:
+                continue
+            _total = sum(x["WEIGHT"] for x in _pl_items)
+            if _total <= _cap:
+                continue
+            # Sort by distance from depot — nearest first
+            def _dist_hq_guard(it):
+                c = _route_centroid(it["ROUTE"])
+                if c is None:
+                    return float("inf")
+                return _haversine_km(_DEPOT[0], _DEPOT[1], c[0], c[1])
+            _sorted_items = sorted(_pl_items, key=_dist_hq_guard)
+            _kept, _fill = [], 0.0
+            for _it in _sorted_items:
+                if _fill + _it["WEIGHT"] <= _cap:
+                    _kept.append(_it)
+                    _fill += _it["WEIGHT"]
+                else:
+                    _it["LORRY"] = "NO_LORRY"
+                    sess["assigned"][_it["DO NUMBER"]] = "NO_LORRY"
+            _pit[_pl] = _kept
 
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
