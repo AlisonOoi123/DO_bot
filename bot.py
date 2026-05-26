@@ -1785,27 +1785,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if row["LORRY"] not in _excl_check
                 )
                 if not any(c >= _pre_total_w for c in _avail_caps):
-                    # Too heavy for any single lorry — must split by DO count
-                    # Balance by weight: sort heaviest first, alternate between two halves
-                    _sorted = sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True)
-                    half_a = _sorted[::2]   # indices 0, 2, 4, …
-                    half_b = _sorted[1::2]  # indices 1, 3, 5, …
-                    # Rebalance: if moving the smallest half_b item to half_a drops
-                    # half_b into a smaller lorry tier without making half_a overflow,
-                    # do the move so the lighter half fits a smaller (cheaper) lorry.
-                    if len(half_b) > 1:
-                        _half_b_w = sum(it["WEIGHT"] for it in half_b)
-                        _half_a_w = sum(it["WEIGHT"] for it in half_a)
-                        _smallest_b = min(half_b, key=lambda x: x["WEIGHT"])
-                        _new_b_w = _half_b_w - _smallest_b["WEIGHT"]
-                        _new_a_w = _half_a_w + _smallest_b["WEIGHT"]
-                        _caps = sorted(engine.eligible_lorries["TON"].tolist())
-                        _best_b_before = next((c for c in _caps if c >= _half_b_w), float("inf"))
-                        _best_b_after  = next((c for c in _caps if c >= _new_b_w),  float("inf"))
-                        _best_a_after  = next((c for c in _caps if c >= _new_a_w),  float("inf"))
-                        if _best_b_after < _best_b_before and _best_a_after < float("inf"):
-                            half_b = [it for it in half_b if it is not _smallest_b]
-                            half_a = half_a + [_smallest_b]
+                    # Too heavy for any single lorry — split by proximity to HQ.
+                    # Nearest DOs load onto the first lorry (first round); the
+                    # remaining DOs go on a second lorry (second round).  This
+                    # ensures the driver can complete the closer deliveries even
+                    # if the full group cannot be handled in one trip.
+                    def _item_dist_hq(it):
+                        c = _route_centroid(it["ROUTE"])
+                        if c is None:
+                            return float("inf")
+                        return _haversine_km(_DEPOT[0], _DEPOT[1], c[0], c[1])
+
+                    _sorted_by_dist = sorted(group_items, key=_item_dist_hq)
+                    _cap1 = max(_avail_caps) if _avail_caps else 0
+                    half_a, half_b = [], []
+                    _fill_w = 0.0
+                    for _it in _sorted_by_dist:
+                        if _fill_w + _it["WEIGHT"] <= _cap1:
+                            half_a.append(_it)
+                            _fill_w += _it["WEIGHT"]
+                        else:
+                            half_b.append(_it)
                     _assign_group(half_a)
                     _assign_group(half_b)
                     # Propagate back to _all_group items that were pre-filtered NO_LORRY
@@ -2137,9 +2137,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if _load_a + _load_b > _cap_b:
                         continue
                     _route_b = _session_routes.get(_pb, "")
-                    if _route_a and _route_b:
-                        if not _routes_on_same_way(_route_a, _route_b):
-                            continue
+                    # If either lorry's route is unknown, refuse the merge —
+                    # we can't verify compatibility and mustn't mix clusters.
+                    if not _route_a or not _route_b:
+                        continue
+                    if not _routes_on_same_way(_route_a, _route_b):
+                        continue
                     _util = (_load_a + _load_b) / _cap_b if _cap_b else 0
                     if _util > _best_util:
                         _best_util = _util
