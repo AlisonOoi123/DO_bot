@@ -2080,6 +2080,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         continue  # swap only improves if B is heavier
                     if _load_a > _cap_b:
                         continue  # A's items must physically fit on B
+                    # Only swap if A's load would fill B to ≥70%.
+                    # This prevents cascading swaps that move heavy, well-fitted
+                    # loads off their historically preferred smaller lorries
+                    # (e.g. KV19A at 92% on BMN3682 should stay there).
+                    if _load_a / _cap_b < 0.70:
+                        continue
                     _delta = _load_a - _load_b  # negative = waste reduction
                     if _delta < _best_delta:
                         _best_delta = _delta
