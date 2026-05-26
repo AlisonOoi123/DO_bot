@@ -762,20 +762,29 @@ class LorryEngine:
         merged["IS_OWNER"] = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
         # ── Distance-aware scoring ────────────────────────────────────────────
-        # Long-haul routes (>100 km from depot): drop undersized lorries and sort
-        # by utilisation first.  Without this, SURPLUS-primary sort picks a 5T van
-        # over a 14T lorry for a 4T Pahang/Johor load just because it fits tighter —
-        # sending a mini-van on a 280 km highway run is operationally wrong.
+        # Routes >100 km: drop undersized lorries, sort by utilisation first.
+        # Routes >200 km (cross-state, e.g. Kuantan ~280 km): raise minimum to
+        # 10T so an 8.5T lorry is never dispatched on a 280 km highway run when
+        # a 14T lorry is available.  Fixing this also frees the 8.5T lorry for
+        # medium routes (~150 km Temerloh) where it is a better-utilised fit.
         # Local/medium routes keep SURPLUS-primary (tightest fit, minimise waste).
         _centroid      = _route_centroid(route)
         _route_dist_km = (
             _haversine_km(_DEPOT[0], _DEPOT[1], _centroid[0], _centroid[1])
             if _centroid else 0.0
         )
-        LONG_HAUL_KM       = 100.0
-        _LONG_HAUL_MIN_TON = 8.0   # exclude vans/small trucks for long-haul
+        ULTRA_LONG_HAUL_KM       = 200.0
+        LONG_HAUL_KM             = 100.0
+        _ULTRA_LONG_HAUL_MIN_TON = 10.0  # 10T+ for cross-state runs (>200 km)
+        _LONG_HAUL_MIN_TON       = 8.0   # 8T+ for regional runs (100–200 km)
 
-        if _route_dist_km >= LONG_HAUL_KM:
+        if _route_dist_km >= ULTRA_LONG_HAUL_KM:
+            _lh_big = merged[merged["TON"] >= _ULTRA_LONG_HAUL_MIN_TON]
+            if not _lh_big.empty:
+                merged = _lh_big
+            _sort_cols = ["UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
+            _sort_asc  = [False,        False,       False,           True,     False,       False]
+        elif _route_dist_km >= LONG_HAUL_KM:
             _lh_big = merged[merged["TON"] >= _LONG_HAUL_MIN_TON]
             if not _lh_big.empty:
                 merged = _lh_big
