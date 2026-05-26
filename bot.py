@@ -2178,6 +2178,74 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _pit[_best_dst].extend(_pit.pop(_best_src))
                 _merge_ok = True
 
+        # ── Partial-transfer rebalance pass ──────────────────────────────────
+        # The merge pass moves entire lorry loads (all-or-nothing).  When two
+        # lorries carry compatible routes but their combined weight exceeds any
+        # single lorry's capacity, the merge fails and one lorry stays severely
+        # underloaded.  This pass moves individual items from well-loaded lorries
+        # onto underloaded ones (< 50 % util) when routes are compatible and
+        # the source stays above the threshold after the transfer — preventing
+        # oscillation.  Each item may only be moved once (tracked by object id).
+        # Example: BPE9788 (14T, 30% Temerloh) absorbs individual Kuantan DOs
+        # from BQX9983 (10.5T, 95%) since PH05/PH09 are both east-bound.
+        _REBAL_THRESHOLD = 0.50
+        _rebal_moved: set = set()
+        _rebal_ok = True
+        while _rebal_ok:
+            _rebal_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _underloaded = sorted(
+                [p for p in _pit
+                 if _pit[p]
+                 and float(_lorry_cap_map.get(p, 0)) > 0
+                 and _ploads[p] / float(_lorry_cap_map.get(p, 0)) < _REBAL_THRESHOLD],
+                key=lambda p: _ploads[p] / float(_lorry_cap_map.get(p, 1))
+            )
+            if not _underloaded:
+                break
+            _best_gain, _best_item, _best_src, _best_dst = 0.0, None, None, None
+            for _dst in _underloaded:
+                _cap_dst  = float(_lorry_cap_map.get(_dst, 0))
+                _load_dst = _ploads[_dst]
+                _route_dst = next((x["ROUTE"] for x in _pit[_dst] if x.get("ROUTE")), "") \
+                             or _session_routes.get(_dst, "")
+                for _src in list(_pit.keys()):
+                    if _src == _dst:
+                        continue
+                    _cap_src  = float(_lorry_cap_map.get(_src, 0))
+                    _load_src = _ploads[_src]
+                    _route_src = next((x["ROUTE"] for x in _pit[_src] if x.get("ROUTE")), "") \
+                                 or _session_routes.get(_src, "")
+                    for _it in _pit[_src]:
+                        if id(_it) in _rebal_moved:
+                            continue
+                        if _load_dst + _it["WEIGHT"] > _cap_dst:
+                            continue
+                        # Don't make the source lorry itself underloaded
+                        # (skip only when source has multiple items remaining)
+                        if len(_pit[_src]) > 1 and _cap_src > 0:
+                            if (_load_src - _it["WEIGHT"]) / _cap_src < _REBAL_THRESHOLD:
+                                continue
+                        _route_it = _it.get("ROUTE", "") or _route_src
+                        if _route_dst and _route_it:
+                            if not _routes_on_same_way(_route_dst, _route_it):
+                                continue
+                        _gain = _it["WEIGHT"] / _cap_dst
+                        if _gain > _best_gain:
+                            _best_gain = _gain
+                            _best_item = _it
+                            _best_src  = _src
+                            _best_dst  = _dst
+            if _best_item:
+                _best_item["LORRY"] = _best_dst
+                sess["assigned"][_best_item["DO NUMBER"]] = _best_dst
+                _pit[_best_src].remove(_best_item)
+                _pit[_best_dst].append(_best_item)
+                _rebal_moved.add(id(_best_item))
+                if not _pit[_best_src]:
+                    del _pit[_best_src]
+                _rebal_ok = True
+
         # ── Hard capacity guard ───────────────────────────────────────────────
         # After all passes, any lorry whose assigned weight still exceeds its
         # physical capacity is trimmed: keep the nearest DOs (to Shah Alam HQ)
