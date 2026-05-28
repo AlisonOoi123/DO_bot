@@ -489,15 +489,95 @@ def _distance_km(dist_str) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 
+# ── LORRY_DAILY_PLANNING.xlsx helpers ────────────────────────────────────────
+
+_PLANNING_SECTION_USER = {
+    "ABI":      "ABI",
+    "VIVIAN":   "VIVIAN",
+    "SPARE":    "SPARE",
+    "SELAYANG": "SPARE",
+    "BIG":      "SPARE",
+}
+
+def load_planning_lorries(planning_path: str):
+    """Read MUATAN sheet → DataFrame(LORRY, TON, USER).
+
+    LORRY NAIK (5%) column (kg) is used as the rated capacity.
+    Section headers (ABI / VIVIAN / SPARE …) set the USER field.
+    Returns None on failure so callers can fall back to master_lorry.xlsx.
+    """
+    try:
+        df = pd.read_excel(planning_path, sheet_name="MUATAN", header=None)
+    except Exception:
+        return None
+
+    current_user = None
+    rows = []
+    for _, row in df.iterrows():
+        val0 = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+        up0  = val0.upper()
+
+        if up0 in _PLANNING_SECTION_USER:
+            current_user = _PLANNING_SECTION_USER[up0]
+            continue
+        if current_user is None or not val0 or up0 in {"LORRY", "NAN", ""}:
+            continue
+        try:
+            lorry_naik_kg = float(row.iloc[4])   # "LORRY NAIK (5%)" column
+        except (ValueError, TypeError, IndexError):
+            continue
+        rows.append({"LORRY": up0, "TON": round(lorry_naik_kg / 1000, 4), "USER": current_user})
+
+    return pd.DataFrame(rows) if rows else None
+
+
+def load_planning_route_prefixes(planning_path: str, user: str) -> "set | None":
+    """Read ABI ROUTE / VIVIAN ROUTE sheet → set of route-code prefixes.
+
+    Used as a fallback / supplement when route history is thin.
+    """
+    sheet = {"ABI": "ABI ROUTE", "VIVIAN": "VIVIAN ROUTE"}.get(user.upper())
+    if not sheet:
+        return None
+    try:
+        df = pd.read_excel(planning_path, sheet_name=sheet, header=None)
+    except Exception:
+        return None
+
+    prefixes: set = set()
+    for _, row in df.iterrows():
+        val = str(row.iloc[2]).strip() if len(row) > 2 and pd.notna(row.iloc[2]) else ""
+        if not val or val.upper() == "NAN":
+            continue
+        m = re.match(r"^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)", val)
+        if m:
+            prefixes.add(m.group(1).upper())
+    return prefixes or None
+
+
 class LorryEngine:
-    def __init__(self, master_path: str, history_path: str, owner_user: str):
+    def __init__(self, master_path: str, history_path: str, owner_user: str,
+                 planning_path: str = ""):
         self.owner_user = owner_user.upper()
-        self._load_master(master_path)
+        self._load_master(master_path, planning_path)
         self._load_history(history_path)
         self._build_route_frequency()
         self._build_daily_stop_counts()
 
-    def _load_master(self, path):
+    def _load_master(self, path, planning_path: str = ""):
+        # Prefer LORRY_DAILY_PLANNING.xlsx (MUATAN sheet) when available —
+        # it has the latest LORRY NAIK (5%) capacity values for every lorry.
+        if planning_path:
+            planning_df = load_planning_lorries(planning_path)
+            if planning_df is not None and not planning_df.empty:
+                planning_df = planning_df.drop_duplicates(subset=["LORRY"], keep="first")
+                self.eligible_lorries = planning_df[
+                    planning_df["USER"].isin({self.owner_user, "SPARE"})
+                ].copy()
+                self.all_lorries = planning_df.copy()
+                return
+
+        # Fallback: original master lorry file
         df = pd.read_excel(path)
         df.columns = [c.strip().upper() for c in df.columns]
         df["USER"] = df["USER"].str.strip().str.upper()
@@ -709,10 +789,10 @@ class LorryEngine:
         intel   = _extract_route_intelligence(route)
         cluster = intel["cluster"]
 
-        # Allow up to 10 % over rated capacity when all DOs share the same
+        # Allow up to 5 % over rated capacity when all DOs share the same
         # route — same-route items must never be split just because the total
         # is marginally above the lorry's rated tonnage.
-        _SAME_ROUTE_OVERLOAD = 1.10
+        _SAME_ROUTE_OVERLOAD = 1.05
         eligible = self.eligible_lorries[
             (self.eligible_lorries["TON"] * _SAME_ROUTE_OVERLOAD >= total_ton) &
             (~self.eligible_lorries["LORRY"].isin(unavailable))

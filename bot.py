@@ -23,18 +23,34 @@ _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
 MASTER_PATH    = os.path.join(_DATA_DIR, "master lorry.xlsx")
+PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY_DAILY_PLANNING.xlsx")   # latest capacity + route ownership
 # History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
 HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
-ROUTE_CODES_PATH = os.path.join(_DATA_DIR, "route_codes.xlsx")                  # user→route mapping
+ROUTE_CODES_PATH = os.path.join(_DATA_DIR, "route_codes.xlsx")                  # user→route mapping (legacy fallback)
 
 def _load_user_route_prefixes(user: str) -> set | None:
     """Return the set of route-code prefixes (e.g. 'KV19A', 'PH09') assigned to
-    *user* (case-insensitive).  Returns None if the mapping file doesn't exist,
-    meaning no filtering is applied and all routes are processed.
+    *user* (case-insensitive).
+
+    Checks LORRY_DAILY_PLANNING.xlsx (ABI ROUTE / VIVIAN ROUTE sheets) first —
+    this is the authoritative source.  Falls back to the legacy route_codes.xlsx
+    if the planning file is absent.  Returns None if neither file exists, meaning
+    no route filtering is applied.
     """
+    # Primary: LORRY_DAILY_PLANNING.xlsx ABI ROUTE / VIVIAN ROUTE sheets
+    if os.path.exists(PLANNING_PATH):
+        try:
+            from lorry_engine import load_planning_route_prefixes
+            prefixes = load_planning_route_prefixes(PLANNING_PATH, user)
+            if prefixes:
+                return prefixes
+        except Exception:
+            pass
+
+    # Fallback: legacy route_codes.xlsx
     if not os.path.exists(ROUTE_CODES_PATH):
         return None
     try:
@@ -400,7 +416,7 @@ def handle_message(phone: str, text: str = None,
         _e = sess.get("engine")
         if _e is None and sess.get("user_id"):
             try:
-                _e = LorryEngine(MASTER_PATH, HISTORY_PATH, owner_user=sess["user_id"])
+                _e = LorryEngine(MASTER_PATH, HISTORY_PATH, owner_user=sess["user_id"], planning_path=PLANNING_PATH)
             except Exception:
                 pass
         return _e
@@ -1066,7 +1082,7 @@ def handle_message(phone: str, text: str = None,
         if _eng is None and sess.get("user_id"):
             try:
                 _hist = _resolve_history_path()
-                _eng = LorryEngine(MASTER_PATH, _hist, owner_user=sess["user_id"])
+                _eng = LorryEngine(MASTER_PATH, _hist, owner_user=sess["user_id"], planning_path=PLANNING_PATH)
             except Exception:
                 pass
         _ul = set(_eng.eligible_lorries["LORRY"].str.upper()) if _eng else set()
@@ -1159,7 +1175,7 @@ def _handle_user_id(phone, sess, text):
     sess["user_id"] = user
     # Use new-format history if it exists, else fall back to old format
     _hist = _resolve_history_path()
-    sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user)
+    sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user, planning_path=PLANNING_PATH)
     sess["state"] = "AWAIT_EXCEL"
 
     lorries = sess["engine"].get_eligible_lorry_list()
@@ -2167,10 +2183,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if _route_a and _routes_b:
                         if not any(_routes_on_same_way(_route_a, _rb) for _rb in _routes_b):
                             continue
-                    # Same-route items may fill up to 10 % over rated capacity
+                    # Same-route items may fill up to 5 % over rated capacity
                     # so they are never split across lorries unnecessarily.
                     _same_rt = bool(_route_a and _route_a in _routes_b)
-                    _eff_cap_b = _cap_b * (1.10 if _same_rt else 1.0)
+                    _eff_cap_b = _cap_b * (1.05 if _same_rt else 1.0)
                     if _load_a + _load_b > _eff_cap_b:
                         continue
                     # Score by utilisation GAIN on the destination lorry so that
@@ -2265,11 +2281,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _cap <= 0:
                 continue
             _total = sum(x["WEIGHT"] for x in _pl_items)
-            # Same-route items may run up to 10 % over rated capacity so they
+            # Same-route items may run up to 5 % over rated capacity so they
             # are never split.  Multi-route lorries use the hard cap exactly.
             _pl_routes = {it.get("ROUTE", "").strip().upper() for it in _pl_items
                           if it.get("ROUTE")}
-            _eff_cap = _cap * (1.10 if len(_pl_routes) == 1 else 1.0)
+            _eff_cap = _cap * (1.05 if len(_pl_routes) == 1 else 1.0)
             if _total <= _eff_cap:
                 continue
             # Sort by distance from depot — nearest first
