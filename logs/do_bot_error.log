@@ -182,3 +182,11 @@ Traceback (most recent call last):
   File "C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot\app.py", line 13, in <module>
     import bot
 ModuleNotFoundError: No module named 'bot'
+C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot\bot.py:1578: UserWarning: Parsing dates in %d-%m-%Y format when dayfirst=False (the default) was specified. Pass `dayfirst=True` or specify a format to silence this warning.
+  ts = pd.to_datetime(v, errors="coerce")
+C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot\bot.py:1578: UserWarning: Parsing dates in %d-%m-%Y format when dayfirst=False (the default) was specified. Pass `dayfirst=True` or specify a format to silence this warning.
+  ts = pd.to_datetime(v, errors="coerce")
+C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot\bot.py:1578: UserWarning: Parsing dates in %d-%m-%Y format when dayfirst=False (the default) was specified. Pass `dayfirst=True` or specify a format to silence this warning.
+  ts = pd.to_datetime(v, errors="coerce")
+C:\Users\Administrator\OneDrive\Documents\GitHub\DO_bot\bot.py:1578: UserWarning: Parsing dates in %d-%m-%Y format when dayfirst=False (the default) was specified. Pass `dayfirst=True` or specify a format to silence this warning.
+  ts = pd.to_datetime(v, errors="coerce")
