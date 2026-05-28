@@ -2144,7 +2144,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         while _merge_ok:
             _merge_ok = False
             _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
-            _best_util, _best_src, _best_dst = -1.0, None, None
+            _best_gain, _best_src, _best_dst = 0.0, None, None
             for _pa in list(_pit.keys()):
                 _load_a = _ploads[_pa]
                 # Use the first item's route as the representative route for
@@ -2167,9 +2167,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if _route_a and _route_b:
                         if not _routes_on_same_way(_route_a, _route_b):
                             continue
-                    _util = (_load_a + _load_b) / _cap_b if _cap_b else 0
-                    if _util > _best_util:
-                        _best_util = _util
+                    # Score by utilisation GAIN on the destination lorry so that
+                    # underloaded lorries are filled first.  Previously we scored
+                    # by resulting utilisation which caused a well-loaded large
+                    # lorry (e.g. BQU3875 74%→92%) to beat a sparse smaller lorry
+                    # (e.g. BQX9983 40%→73%) even though the latter benefits more.
+                    _gain = _load_a / _cap_b if _cap_b else 0
+                    if _gain > _best_gain:
+                        _best_gain = _gain
                         _best_src, _best_dst = _pa, _pb
             if _best_src:
                 for _it in _pit[_best_src]:
