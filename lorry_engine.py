@@ -446,13 +446,15 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
                 _corridors_adjacent(ib["corridor"], ia["corridor"])):
             return False
     elif ia["corridor"] == "GENERAL" and ib["corridor"] == "GENERAL":
-        # Path B: BOTH are GENERAL → need shared waypoints to confirm direction
+        # Path B: BOTH are GENERAL → waypoints confirm direction when available.
+        # If neither route has waypoints (bare codes like "PH07", "PH01"), skip
+        # the waypoint check and let the bearing check below decide — both routes
+        # are same-cluster so GPS direction is sufficient evidence.
         wp1 = _extract_waypoints(route1)
         wp2 = _extract_waypoints(route2)
-        if not wp1 or not wp2:
-            return False
-        if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
-            return False
+        if wp1 and wp2:
+            if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
+                return False
     # else: one has a named corridor and the other is GENERAL (same cluster).
     # The named corridor gives directional context; let the bearing check below
     # decide whether they actually point the same way.  This handles routes like
