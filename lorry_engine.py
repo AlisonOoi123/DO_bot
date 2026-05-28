@@ -446,15 +446,12 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
                 _corridors_adjacent(ib["corridor"], ia["corridor"])):
             return False
     elif ia["corridor"] == "GENERAL" and ib["corridor"] == "GENERAL":
-        # Path B: BOTH are GENERAL → waypoints confirm direction when available.
-        # If neither route has waypoints (bare codes like "PH07", "PH01"), skip
-        # the waypoint check and let the bearing check below decide — both routes
-        # are same-cluster so GPS direction is sufficient evidence.
-        wp1 = _extract_waypoints(route1)
-        wp2 = _extract_waypoints(route2)
-        if wp1 and wp2:
-            if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
-                return False
+        # Path B: BOTH are GENERAL — let the bearing check decide.
+        # Matching waypoints confirm same direction, but a mismatch does NOT
+        # confirm incompatibility: two same-state routes (e.g. PK04/Ipoh and
+        # PK05/Batu Gajah) share no waypoints yet both point ~340° NW from depot.
+        # The bearing check below is the authoritative geographic gate.
+        pass
     # else: one has a named corridor and the other is GENERAL (same cluster).
     # The named corridor gives directional context; let the bearing check below
     # decide whether they actually point the same way.  This handles routes like
@@ -925,11 +922,22 @@ class LorryEngine:
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
         merged["UTIL_OK"]   = (merged["UTIL"] >= UTIL_OK_THRESHOLD).astype(int)
 
-        tier2 = merged[merged["UTIL_GOOD"] == 1].sort_values(_sort_cols, ascending=_sort_asc)
-        tier1 = merged[(merged["UTIL_GOOD"] == 0) & (merged["UTIL_OK"] == 1)].sort_values(_sort_cols, ascending=_sort_asc)
-        tier0 = merged[merged["UTIL_OK"] == 0].sort_values(_sort_cols, ascending=_sort_asc)
+        # FLEET_OWN_OK: lorry belongs to the session user AND achieves ≥40% util.
+        # This overrides the utilisation-tier system so that an idle VIVIAN lorry
+        # at 41% is always preferred over a SPARE lorry at 67%.  Without this, the
+        # tier-2 SPARE beat the tier-1 owned lorry even though IS_OWNER was already
+        # in _sort_cols (it was too far down the list to matter across tier boundaries).
+        # For tiny DOs where even the smallest owned lorry would be <40% utilised,
+        # FLEET_OWN_OK=0 for everyone and the normal surplus-first sort applies.
+        merged["FLEET_OWN_OK"] = (
+            (merged["IS_OWNER"] == 1) & (merged["UTIL"] >= UTIL_OK_THRESHOLD)
+        ).astype(int)
+
         import pandas as _pd
-        merged = _pd.concat([tier2, tier1, tier0]).reset_index(drop=True)
+        merged = merged.sort_values(
+            ["FLEET_OWN_OK", "UTIL_GOOD", "UTIL_OK"] + _sort_cols,
+            ascending=[False, False, False] + _sort_asc
+        ).reset_index(drop=True)
 
         results = []
         for _, row in merged.head(top_n).iterrows():
@@ -1013,12 +1021,14 @@ class LorryEngine:
         small_pool["IS_OWNER"] = (small_pool["USER"].str.upper() == self.owner_user).astype(int)
         small_pool = small_pool.sort_values(["IS_OWNER", "FREQ", "TON"], ascending=[False, False, False])
 
-        remain = total_ton
-        used   = set(unavailable)
-        chosen = []
+        # ── Pass 1: greedy selection — find the lorry set ────────────────────
+        # (just determine WHICH lorries participate; portions are set in pass 2)
+        used         = set(unavailable)
+        selected     = []   # list of (plate, cap, row) in participation order
+        remain_check = total_ton
 
         for _, row in small_pool.iterrows():
-            if remain <= 0:
+            if remain_check <= 0:
                 break
             plate = row["LORRY"]
             if plate in used:
@@ -1026,10 +1036,36 @@ class LorryEngine:
             stops = today_stop_counts.get(plate, 0) or self.get_stop_count_today(plate, today_date_str)
             if stops >= MAX_STOPS_PER_LORRY:
                 continue
-            cap     = float(row["TON"])
-            portion = round(min(cap, remain), 6)
-            surplus = round(cap - portion, 2)
-            util_pct = round(portion / cap * 100, 1)
+            cap = float(row["TON"])
+            selected.append((plate, cap, row))
+            used.add(plate)
+            remain_check = round(remain_check - cap, 6)
+            if len(selected) >= max_lorries:
+                break
+
+        if remain_check > 0:
+            return None
+
+        # ── Pass 2: proportional allocation ──────────────────────────────────
+        # Distribute total_ton across the selected lorries in proportion to
+        # their capacities so each lorry carries a similar utilisation fraction.
+        # Greedy "first lorry takes its full cap" leaves the last lorry with a
+        # tiny overflow (e.g. 27% util) that triggers the _MIN_SPLIT_UTIL reject.
+        # Proportional allocation gives each lorry a fair share (~65% each when
+        # two similarly-sized lorries split a 5.8T load).
+        total_cap_selected = sum(c for _, c, _ in selected)
+        chosen = []
+        allocated = 0.0
+        for i, (plate, cap, row) in enumerate(selected):
+            if i < len(selected) - 1:
+                portion = round(cap / total_cap_selected * total_ton, 6)
+                portion = min(portion, cap)          # never exceed lorry capacity
+            else:
+                portion = round(total_ton - allocated, 6)  # absorb rounding remainder
+                portion = min(portion, cap)
+            allocated += portion
+            surplus   = round(cap - portion, 2)
+            util_pct  = round(portion / cap * 100, 1)
             chosen.append({
                 "LORRY": plate, "TON_CAPACITY": round(cap, 2),
                 "SURPLUS": surplus, "UTIL_PCT": util_pct,
@@ -1037,18 +1073,10 @@ class LorryEngine:
                 "REASON": f"Split {util_pct}% utilised, {surplus}T spare",
                 "PORTION": portion,
             })
-            used.add(plate)
-            remain = round(remain - cap, 6)
-            if len(chosen) >= max_lorries:
-                break
 
-        if remain > 0:
-            return None
         if sum(c["SURPLUS"] for c in chosen) >= best_surplus:
             return None
         # Reject if any lorry in the split would be severely underutilised.
-        # (e.g. VEA2818 1.07T carrying 58 kg overflow = 5% — better to use a
-        # single slightly-large lorry at 59% than two lorries where one is empty)
         _MIN_SPLIT_UTIL = 40.0   # each split lorry must carry ≥ 40% of its capacity
         if any(c["UTIL_PCT"] < _MIN_SPLIT_UTIL for c in chosen):
             return None
