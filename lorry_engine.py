@@ -709,8 +709,12 @@ class LorryEngine:
         intel   = _extract_route_intelligence(route)
         cluster = intel["cluster"]
 
+        # Allow up to 10 % over rated capacity when all DOs share the same
+        # route — same-route items must never be split just because the total
+        # is marginally above the lorry's rated tonnage.
+        _SAME_ROUTE_OVERLOAD = 1.10
         eligible = self.eligible_lorries[
-            (self.eligible_lorries["TON"] >= total_ton) &
+            (self.eligible_lorries["TON"] * _SAME_ROUTE_OVERLOAD >= total_ton) &
             (~self.eligible_lorries["LORRY"].isin(unavailable))
         ].copy()
         if eligible.empty:

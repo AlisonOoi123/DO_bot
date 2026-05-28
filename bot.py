@@ -2154,8 +2154,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         continue
                     _load_b = _ploads[_pb]
                     _cap_b  = float(_lorry_cap_map.get(_pb, 0))
-                    if _load_a + _load_b > _cap_b:
-                        continue
                     # Route compatibility: check source route against ALL routes
                     # already on the destination lorry (not just the first item).
                     # This lets PH07 merge into BQX9983 via the shared-waypoint
@@ -2169,6 +2167,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if _route_a and _routes_b:
                         if not any(_routes_on_same_way(_route_a, _rb) for _rb in _routes_b):
                             continue
+                    # Same-route items may fill up to 10 % over rated capacity
+                    # so they are never split across lorries unnecessarily.
+                    _same_rt = bool(_route_a and _route_a in _routes_b)
+                    _eff_cap_b = _cap_b * (1.10 if _same_rt else 1.0)
+                    if _load_a + _load_b > _eff_cap_b:
+                        continue
                     # Score by utilisation GAIN on the destination lorry so that
                     # underloaded lorries are filled first.
                     _gain = _load_a / _cap_b if _cap_b else 0
@@ -2261,7 +2265,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _cap <= 0:
                 continue
             _total = sum(x["WEIGHT"] for x in _pl_items)
-            if _total <= _cap:
+            # Same-route items may run up to 10 % over rated capacity so they
+            # are never split.  Multi-route lorries use the hard cap exactly.
+            _pl_routes = {it.get("ROUTE", "").strip().upper() for it in _pl_items
+                          if it.get("ROUTE")}
+            _eff_cap = _cap * (1.10 if len(_pl_routes) == 1 else 1.0)
+            if _total <= _eff_cap:
                 continue
             # Sort by distance from depot — nearest first
             def _dist_hq_guard(it):
@@ -2272,7 +2281,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _sorted_items = sorted(_pl_items, key=_dist_hq_guard)
             _kept, _fill = [], 0.0
             for _it in _sorted_items:
-                if _fill + _it["WEIGHT"] <= _cap:
+                if _fill + _it["WEIGHT"] <= _eff_cap:
                     _kept.append(_it)
                     _fill += _it["WEIGHT"]
                 else:
