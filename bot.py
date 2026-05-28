@@ -22,12 +22,42 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
-MASTER_PATH    = os.path.join(_HERE, "master lorry.xlsx")      # read-only, stays in root
+MASTER_PATH    = os.path.join(_DATA_DIR, "master lorry.xlsx")
 # History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
 HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
+ROUTE_CODES_PATH = os.path.join(_DATA_DIR, "route_codes.xlsx")                  # user→route mapping
+
+def _load_user_route_prefixes(user: str) -> set | None:
+    """Return the set of route-code prefixes (e.g. 'KV19A', 'PH09') assigned to
+    *user* (case-insensitive).  Returns None if the mapping file doesn't exist,
+    meaning no filtering is applied and all routes are processed.
+    """
+    if not os.path.exists(ROUTE_CODES_PATH):
+        return None
+    try:
+        df = pd.read_excel(ROUTE_CODES_PATH)
+        df.columns = [c.strip().upper() for c in df.columns]
+        name_col  = next((c for c in df.columns if "NAME" in c), None)
+        route_col = next((c for c in df.columns if "ROUTE" in c), None)
+        if name_col is None or route_col is None:
+            return None
+        user_rows = df[df[name_col].str.strip().str.upper() == user.upper()]
+        prefixes = set()
+        for route in user_rows[route_col].dropna().astype(str):
+            m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
+            if m:
+                prefixes.add(m.group(1).upper())
+        return prefixes if prefixes else None
+    except Exception:
+        return None
+
+def _extract_route_prefix(route: str) -> str:
+    """Extract the leading route code token (e.g. 'KV19A', 'PH09', 'JH09')."""
+    m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
+    return m.group(1).upper() if m else ""
 
 def _resolve_history_path() -> str:
     """Return the best available history file.
@@ -1404,20 +1434,35 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Each row is an independent item that needs its own lorry.
         # Items with the same DO NUMBER belong to the same customer/route
         # but may end up on different lorries (e.g. 17.5T row vs 3.5T row).
+
+        # Route-code filtering: only assign rows whose route prefix belongs to
+        # the logged-in user.  Rows for other users are kept in items (so they
+        # appear in the export) but pre-marked as OTHER_USER so they get a
+        # blank LICENSE in the exported file.
+        _user_prefixes = _load_user_route_prefixes(sess.get("user_id", ""))
+
         items = []
+        _other_user_count = 0
         for idx, row in raw.iterrows():
+            route_str = str(row["ROUTE"]).strip()
+            _is_mine  = True
+            if _user_prefixes:
+                pfx = _extract_route_prefix(route_str)
+                if pfx and pfx not in _user_prefixes:
+                    _is_mine = False
+                    _other_user_count += 1
+
             items.append({
-                "ROW_IDX":       idx,                         # original df index
+                "ROW_IDX":       idx,
                 "DO NUMBER":     str(row["DO NUMBER"]).strip(),
                 "CUSTOMER NAME": str(row["CUSTOMER NAME"]).strip(),
-                "ROUTE":         str(row["ROUTE"]).strip(),
+                "ROUTE":         route_str,
                 "CODE":          str(row["CODE"]).strip(),
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
                 "DATE":          str(row.get("DATE", "")).strip(),
-                # assignment fields filled below
-                "LORRY":         None,   # plate string, or "SPLIT", "NO_LORRY"
-                "SPLIT_LORRIES": None,   # list of bins if split
+                "LORRY":         None if _is_mine else "OTHER_USER",
+                "SPLIT_LORRIES": None,
             })
 
         sess["items"]      = items          # row-level item list
@@ -1472,9 +1517,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             MIN_UTIL_TO_ASSIGN  as _MIN_UTIL,
         )
 
-        # Step 1 — exact-route buckets
+        # Step 1 — exact-route buckets (skip other-user rows — they stay blank)
         route_buckets: dict[str, list] = defaultdict(list)
         for it in items:
+            if it.get("LORRY") == "OTHER_USER":
+                continue
             route_buckets[it["ROUTE"].strip().upper()].append(it)
 
         # Step 2 — cluster same-way buckets into corridor super-groups
@@ -1689,6 +1736,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
         sorted_groups.sort(key=_group_sort_key)
 
+        # Session-level capacity tracker so groups can share a lorry when combined
+        # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
+        _session_loads: dict[str, float] = {}   # plate → tons assigned this session
+        _session_routes: dict[str, str]  = {}   # plate → representative route
+        _lorry_cap_map = {row["LORRY"]: float(row["TON"])
+                          for _, row in engine.eligible_lorries.iterrows()}
+
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
             All items in the group share the same route (one route = one lorry).
@@ -1712,13 +1766,96 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
                 return
 
+            # Rule 6b — per-lorry delivery-stop limit.
+            # When a group carries too many individual DOs, split it across two
+            # lorries so drivers aren't overloaded and idle ABI lorries get work.
+            # MAX_STOPS_PER_LORRY (=8) was designed for route-count merging;
+            # here we use a separate threshold for DO count.
+            _MAX_DOS_PER_LORRY = 15
+            if len(group_items) > _MAX_DOS_PER_LORRY:
+                # Only split when the combined weight truly exceeds every
+                # available lorry's capacity.  If the full group fits on a
+                # single lorry (even a large 14T), keep it together so that
+                # lorry reaches high utilisation instead of creating two
+                # under-filled lorries.
+                _pre_total_w = sum(it["WEIGHT"] for it in group_items)
+                _excl_check = sess["unavailable"] | get_assigned_today()
+                _avail_caps = sorted(
+                    float(row["TON"]) for _, row in engine.eligible_lorries.iterrows()
+                    if row["LORRY"] not in _excl_check
+                )
+                if not any(c >= _pre_total_w for c in _avail_caps):
+                    # Too heavy for any single lorry — split by proximity to HQ.
+                    # Nearest DOs load onto the first lorry (first round); the
+                    # remaining DOs go on a second lorry (second round).  This
+                    # ensures the driver can complete the closer deliveries even
+                    # if the full group cannot be handled in one trip.
+                    def _item_dist_hq(it):
+                        c = _route_centroid(it["ROUTE"])
+                        if c is None:
+                            return float("inf")
+                        return _haversine_km(_DEPOT[0], _DEPOT[1], c[0], c[1])
+
+                    _sorted_by_dist = sorted(group_items, key=_item_dist_hq)
+                    _cap1 = max(_avail_caps) if _avail_caps else 0
+                    half_a, half_b = [], []
+                    _fill_w = 0.0
+                    for _it in _sorted_by_dist:
+                        if _fill_w + _it["WEIGHT"] <= _cap1:
+                            half_a.append(_it)
+                            _fill_w += _it["WEIGHT"]
+                        else:
+                            half_b.append(_it)
+                    _assign_group(half_a)
+                    _assign_group(half_b)
+                    # Propagate back to _all_group items that were pre-filtered NO_LORRY
+                    for it in _all_group:
+                        if it.get("LORRY") == "NO_LORRY":
+                            sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                    return
+                # else: weight fits one lorry — fall through to normal single-lorry path
+
             total_w  = sum(it["WEIGHT"] for it in group_items)
             route    = group_items[0]["ROUTE"]
             customer = group_items[0]["CUSTOMER NAME"]
 
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
-            excluded = sess["unavailable"] | get_assigned_today()
+            # Also exclude lorries already full or incompatible with this route
+            _session_full = {p for p in _session_loads
+                             if _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) < total_w}
+            _session_incompatible = {
+                p for p in _session_loads
+                if _session_routes.get(p)
+                and not _routes_on_same_way(route, _session_routes.get(p, ""))
+                and _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) >= total_w
+            }
+            excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
+
+            # ── Within-session lorry sharing ──────────────────────────────────
+            # Before consuming a new lorry, check if a lorry already used this
+            # session has enough remaining capacity.  Prefer same-corridor lorries
+            # (same direction); fall back only if no compatible match exists.
+            _share_pool = [
+                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                for p in _session_loads
+                if p in _lorry_cap_map
+                and float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= total_w
+                and p not in excluded
+            ]
+            if _share_pool:
+                _compat = sorted(
+                    [(r, p) for r, p in _share_pool
+                     if _routes_on_same_way(route, _session_routes.get(p, ""))]
+                )
+                if _compat:
+                    _shared = _compat[0][1]
+                    for it in group_items:
+                        it["LORRY"] = _shared
+                    _session_loads[_shared] = float(_session_loads.get(_shared, 0)) + total_w
+                    for it in _all_group:
+                        sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
+                    return
 
             # Try single lorry for the whole group
             suggestions = engine.suggest(
@@ -1779,7 +1916,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             it.pop("SPLIT_LORRIES", None)
                     else:
                         lorry = suggestions[0]["LORRY"]
-                        sess["unavailable"].add(lorry)
                         for it in group_items:
                             it["LORRY"] = lorry
             else:
@@ -1793,7 +1929,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 for _ in range(10):
                     if remain <= 0:
                         break
-                    excl = sess["unavailable"] | get_assigned_today()
+                    # Exclude lorries that already carry too much from this
+                    # session to accept 'remain' more tons — otherwise the
+                    # bin-pack re-picks a lorry loaded in an earlier group
+                    # (e.g. BQU3875 filled to 20T getting a second 18T run).
+                    _excl_session_full = {
+                        p for p in _session_loads
+                        if float(_lorry_cap_map.get(p, 0))
+                           - float(_session_loads.get(p, 0)) < remain
+                    }
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -1835,7 +1980,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             # Bins are full — try to grab one more lorry rather
                             # than giving up (greedy fill can leave tiny tail items
                             # stranded even when arithmetic says they should fit).
-                            excl_retry = sess["unavailable"] | get_assigned_today()
+                            _excl_retry_sf = {
+                                p for p in _session_loads
+                                if float(_lorry_cap_map.get(p, 0))
+                                   - float(_session_loads.get(p, 0)) < it["WEIGHT"]
+                            }
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -1861,7 +2011,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # Last resort: find the tightest-fitting available lorry
                     # that is NOT overloaded (combined weight ≤ capacity).
                     # If even the largest lorry can't handle the weight → NO_LORRY.
-                    excl_final = sess["unavailable"] | get_assigned_today()
+                    _excl_lr_sf = {
+                        p for p in _session_loads
+                        if float(_lorry_cap_map.get(p, 0))
+                           - float(_session_loads.get(p, 0)) < total_w
+                    }
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -1873,7 +2028,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 it["LORRY"] = "NO_LORRY"
                         else:
                             lorry = last_resort[0]["LORRY"]
-                            sess["unavailable"].add(lorry)
                             for it in group_items:
                                 it["LORRY"] = lorry
                     else:
@@ -1884,8 +2038,256 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for it in _all_group:
                 sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
 
+            # Update session load tracker so subsequent groups can share this lorry
+            for _it in _all_group:
+                _pl = _it.get("LORRY")
+                if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", None}:
+                    _session_loads[_pl] = float(_session_loads.get(_pl, 0)) + _it["WEIGHT"]
+                    if _pl not in _session_routes:
+                        _session_routes[_pl] = route
+
         for group in sorted_groups:
             _assign_group(group)
+
+        # ── Consolidation pass ────────────────────────────────────────────────
+        # Any item still marked NO_LORRY gets a second chance: find a lorry from
+        # this session with enough remaining capacity, or any eligible lorry at all.
+        _excl_consol = sess["unavailable"] | get_assigned_today()
+        for it in items:
+            if it.get("LORRY") != "NO_LORRY":
+                continue
+            w = it["WEIGHT"]
+            # Build candidates: lorries with remaining session capacity ≥ w
+            _cands = [
+                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                for p in _lorry_cap_map
+                if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
+                and p not in _excl_consol
+            ]
+            if not _cands:
+                continue
+            # Prefer same-corridor lorries with tightest remaining fit
+            _compat = sorted(
+                [(r, p) for r, p in _cands
+                 if _routes_on_same_way(it["ROUTE"], _session_routes.get(p, ""))]
+            )
+            _pick = (_compat or sorted(_cands))[0][1]
+            it["LORRY"] = _pick
+            _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
+            if _pick not in _session_routes:
+                _session_routes[_pick] = it["ROUTE"]
+            sess["assigned"][it["DO NUMBER"]] = _pick
+
+        # ── Lorry-swap optimisation ───────────────────────────────────────────
+        # Reduce waste on large lorries (≥10T) by swapping them with a smaller
+        # lorry that is currently carrying a heavier load.  Conditions for a
+        # valid swap: (A is large, B is small), A's load fits on B, B's load is
+        # heavier than A's (so A's utilisation improves after taking B's items).
+        # Pick the swap with the biggest waste reduction each round; repeat
+        # until no improving swap remains.
+        _LARGE_T = 10.0
+        _pit: dict[str, list] = {}
+        for _it in items:
+            _pl = _it.get("LORRY")
+            if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", None}:
+                _pit.setdefault(_pl, []).append(_it)
+
+        _swap_ok = True
+        while _swap_ok:
+            _swap_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _best_delta, _best_pa, _best_pb = 0.0, None, None
+            for _pa, _pa_its in list(_pit.items()):
+                _cap_a = _lorry_cap_map.get(_pa, 0)
+                if _cap_a < _LARGE_T:
+                    continue  # A must be a large lorry
+                _load_a = _ploads[_pa]
+                for _pb, _pb_its in list(_pit.items()):
+                    if _pb == _pa:
+                        continue
+                    _cap_b = _lorry_cap_map.get(_pb, 0)
+                    if _cap_b >= _LARGE_T:
+                        continue  # B must be smaller than A
+                    _load_b = _ploads[_pb]
+                    if _load_b <= _load_a:
+                        continue  # swap only improves if B is heavier
+                    if _load_a > _cap_b:
+                        continue  # A's items must physically fit on B
+                    # Only swap if A's load would fill B to ≥70%.
+                    # This prevents cascading swaps that move heavy, well-fitted
+                    # loads off their historically preferred smaller lorries
+                    # (e.g. KV19A at 92% on BMN3682 should stay there).
+                    if _load_a / _cap_b < 0.70:
+                        continue
+                    _delta = _load_a - _load_b  # negative = waste reduction
+                    if _delta < _best_delta:
+                        _best_delta = _delta
+                        _best_pa, _best_pb = _pa, _pb
+            if _best_pa:
+                for _it in _pit[_best_pa]:
+                    _it["LORRY"] = _best_pb
+                    sess["assigned"][_it["DO NUMBER"]] = _best_pb
+                for _it in _pit[_best_pb]:
+                    _it["LORRY"] = _best_pa
+                    sess["assigned"][_it["DO NUMBER"]] = _best_pa
+                _pit[_best_pa], _pit[_best_pb] = _pit[_best_pb], _pit[_best_pa]
+                _swap_ok = True
+
+        # ── Same-route merge pass ─────────────────────────────────────────────
+        # If two lorries carry compatible routes and lorry A's entire load fits
+        # inside lorry B's remaining capacity, move all of A's DOs onto B and
+        # free lorry A.  Picks the merge that maximises B's utilisation after
+        # the move so we prefer consolidating onto the tightest-fitting lorry.
+        # Example: VEA2818 (1T, PH09, 0.6T) + WLD8738 (5T, PH09, 0.538T)
+        #   → 0.6T fits on WLD8738 (remaining 4.46T) → merge → WLD8738 at 22.8%
+        _merge_ok = True
+        while _merge_ok:
+            _merge_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _best_gain, _best_src, _best_dst = 0.0, None, None
+            for _pa in list(_pit.keys()):
+                _load_a = _ploads[_pa]
+                _route_a = next((it["ROUTE"] for it in _pit[_pa] if it.get("ROUTE")), "") \
+                           or _session_routes.get(_pa, "")
+                for _pb in list(_pit.keys()):
+                    if _pb == _pa:
+                        continue
+                    _load_b = _ploads[_pb]
+                    _cap_b  = float(_lorry_cap_map.get(_pb, 0))
+                    # Route compatibility: check source route against ALL routes
+                    # already on the destination lorry (not just the first item).
+                    # This lets PH07 merge into BQX9983 via the shared-waypoint
+                    # chain  PH07↔PH03(JERANTUT)  even though PH07 and PH02
+                    # (BQX9983's first item) share no waypoints directly.
+                    _routes_b = {it["ROUTE"] for it in _pit[_pb] if it.get("ROUTE")}
+                    if not _routes_b:
+                        _sr = _session_routes.get(_pb, "")
+                        if _sr:
+                            _routes_b = {_sr}
+                    if _route_a and _routes_b:
+                        if not any(_routes_on_same_way(_route_a, _rb) for _rb in _routes_b):
+                            continue
+                    # Same-route items may fill up to 10 % over rated capacity
+                    # so they are never split across lorries unnecessarily.
+                    _same_rt = bool(_route_a and _route_a in _routes_b)
+                    _eff_cap_b = _cap_b * (1.10 if _same_rt else 1.0)
+                    if _load_a + _load_b > _eff_cap_b:
+                        continue
+                    # Score by utilisation GAIN on the destination lorry so that
+                    # underloaded lorries are filled first.
+                    _gain = _load_a / _cap_b if _cap_b else 0
+                    if _gain > _best_gain:
+                        _best_gain = _gain
+                        _best_src, _best_dst = _pa, _pb
+            if _best_src:
+                for _it in _pit[_best_src]:
+                    _it["LORRY"] = _best_dst
+                    sess["assigned"][_it["DO NUMBER"]] = _best_dst
+                _pit[_best_dst].extend(_pit.pop(_best_src))
+                _merge_ok = True
+
+        # ── Partial-transfer rebalance pass ──────────────────────────────────
+        # The merge pass moves entire lorry loads (all-or-nothing).  When two
+        # lorries carry compatible routes but their combined weight exceeds any
+        # single lorry's capacity, the merge fails and one lorry stays severely
+        # underloaded.  This pass moves individual items from well-loaded lorries
+        # onto underloaded ones (< 50 % util) when routes are compatible and
+        # the source stays above the threshold after the transfer — preventing
+        # oscillation.  Each item may only be moved once (tracked by object id).
+        # Example: BPE9788 (14T, 30% Temerloh) absorbs individual Kuantan DOs
+        # from BQX9983 (10.5T, 95%) since PH05/PH09 are both east-bound.
+        _REBAL_THRESHOLD = 0.50
+        _rebal_moved: set = set()
+        _rebal_ok = True
+        while _rebal_ok:
+            _rebal_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _underloaded = sorted(
+                [p for p in _pit
+                 if _pit[p]
+                 and float(_lorry_cap_map.get(p, 0)) > 0
+                 and _ploads[p] / float(_lorry_cap_map.get(p, 0)) < _REBAL_THRESHOLD],
+                key=lambda p: _ploads[p] / float(_lorry_cap_map.get(p, 1))
+            )
+            if not _underloaded:
+                break
+            _best_gain, _best_item, _best_src, _best_dst = 0.0, None, None, None
+            for _dst in _underloaded:
+                _cap_dst  = float(_lorry_cap_map.get(_dst, 0))
+                _load_dst = _ploads[_dst]
+                _routes_dst = {x["ROUTE"] for x in _pit[_dst] if x.get("ROUTE")}
+                if not _routes_dst:
+                    _sr = _session_routes.get(_dst, "")
+                    if _sr:
+                        _routes_dst = {_sr}
+                for _src in list(_pit.keys()):
+                    if _src == _dst:
+                        continue
+                    _cap_src  = float(_lorry_cap_map.get(_src, 0))
+                    _load_src = _ploads[_src]
+                    for _it in _pit[_src]:
+                        if id(_it) in _rebal_moved:
+                            continue
+                        if _load_dst + _it["WEIGHT"] > _cap_dst:
+                            continue
+                        # Don't make the source lorry itself underloaded
+                        # (skip only when source has multiple items remaining)
+                        if len(_pit[_src]) > 1 and _cap_src > 0:
+                            if (_load_src - _it["WEIGHT"]) / _cap_src < _REBAL_THRESHOLD:
+                                continue
+                        _route_it = _it.get("ROUTE", "")
+                        if _routes_dst and _route_it:
+                            if not any(_routes_on_same_way(_route_it, _rd) for _rd in _routes_dst):
+                                continue
+                        _gain = _it["WEIGHT"] / _cap_dst
+                        if _gain > _best_gain:
+                            _best_gain = _gain
+                            _best_item = _it
+                            _best_src  = _src
+                            _best_dst  = _dst
+            if _best_item:
+                _best_item["LORRY"] = _best_dst
+                sess["assigned"][_best_item["DO NUMBER"]] = _best_dst
+                _pit[_best_src].remove(_best_item)
+                _pit[_best_dst].append(_best_item)
+                _rebal_moved.add(id(_best_item))
+                if not _pit[_best_src]:
+                    del _pit[_best_src]
+                _rebal_ok = True
+
+        # ── Hard capacity guard ───────────────────────────────────────────────
+        # After all passes, any lorry whose assigned weight still exceeds its
+        # physical capacity is trimmed: keep the nearest DOs (to Shah Alam HQ)
+        # up to the lorry's capacity and mark the overflow as NO_LORRY so the
+        # user can handle them manually or in a second trip.
+        for _pl, _pl_items in list(_pit.items()):
+            _cap = float(_lorry_cap_map.get(_pl, 0))
+            if _cap <= 0:
+                continue
+            _total = sum(x["WEIGHT"] for x in _pl_items)
+            # Same-route items may run up to 10 % over rated capacity so they
+            # are never split.  Multi-route lorries use the hard cap exactly.
+            _pl_routes = {it.get("ROUTE", "").strip().upper() for it in _pl_items
+                          if it.get("ROUTE")}
+            _eff_cap = _cap * (1.10 if len(_pl_routes) == 1 else 1.0)
+            if _total <= _eff_cap:
+                continue
+            # Sort by distance from depot — nearest first
+            def _dist_hq_guard(it):
+                c = _route_centroid(it["ROUTE"])
+                if c is None:
+                    return float("inf")
+                return _haversine_km(_DEPOT[0], _DEPOT[1], c[0], c[1])
+            _sorted_items = sorted(_pl_items, key=_dist_hq_guard)
+            _kept, _fill = [], 0.0
+            for _it in _sorted_items:
+                if _fill + _it["WEIGHT"] <= _eff_cap:
+                    _kept.append(_it)
+                    _fill += _it["WEIGHT"]
+                else:
+                    _it["LORRY"] = "NO_LORRY"
+                    sess["assigned"][_it["DO NUMBER"]] = "NO_LORRY"
+            _pit[_pl] = _kept
 
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
@@ -1898,6 +2300,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
         seen_do = {}
         pending_dos = []
         for item in items:
+            if item.get("LORRY") == "OTHER_USER":
+                continue          # keep in raw_df for export blank; hide from UI
             do_num = item["DO NUMBER"]
             if do_num not in seen_do:
                 seen_do[do_num] = len(pending_dos)
@@ -1920,8 +2324,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
         sess["change_do_page"] = 0   # reset Change DO pagination on new upload
 
         # ── Build and return summary ──────────────────────────────────────────
-        total_items = len(items)
+        my_items    = [it for it in items if it.get("LORRY") != "OTHER_USER"]
+        total_items = len(my_items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
+        if _other_user_count:
+            header += f"\n📌 _{_other_user_count} row(s) from other users' routes left blank — only your route codes were assigned._"
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
             return [header + "\n\n" + _summ[0]] + _summ[1:]
@@ -2395,8 +2802,9 @@ def _build_summary(sess) -> str:
     engine = sess.get("engine")
 
     # ── Build lorry-grouped view ──────────────────────────────────────────
-    # Collect all items and build per-lorry buckets
-    all_items = [it for do in pending for it in do.get("ITEMS", [])]
+    # Collect all items and build per-lorry buckets (exclude other-user rows)
+    all_items = [it for do in pending for it in do.get("ITEMS", [])
+                 if it.get("LORRY") != "OTHER_USER"]
 
     # Map DO NUMBER → (customer_short, route_code, date)
     do_meta: dict[str, tuple] = {}
@@ -2939,7 +3347,7 @@ def _export_result_inner(sess) -> list[str]:
     # Blank out any stale sentinel strings in LICENSE so we only write real plates
     new_df["LICENSE"] = new_df["LICENSE"].astype(str).replace({"nan": "", "None": ""})
 
-    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "", None}
+    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "OTHER_USER", "", None}
     confirmed_plates = []
     assigned_row_idxs = set()
 

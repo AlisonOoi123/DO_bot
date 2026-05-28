@@ -440,18 +440,21 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
     if ia["cluster"] == "UNKNOWN":
         return False
 
-    # Path A: both have a named directional corridor — they must match
+    # Path A: both have a named directional corridor — must be same or adjacent
     if ia["corridor"] != "GENERAL" and ib["corridor"] != "GENERAL":
-        if ia["corridor"] != ib["corridor"]:
+        if not (_corridors_adjacent(ia["corridor"], ib["corridor"]) or
+                _corridors_adjacent(ib["corridor"], ia["corridor"])):
             return False
     elif ia["corridor"] == "GENERAL" and ib["corridor"] == "GENERAL":
-        # Path B: BOTH are GENERAL → need shared waypoints to confirm direction
+        # Path B: BOTH are GENERAL → waypoints confirm direction when available.
+        # If neither route has waypoints (bare codes like "PH07", "PH01"), skip
+        # the waypoint check and let the bearing check below decide — both routes
+        # are same-cluster so GPS direction is sufficient evidence.
         wp1 = _extract_waypoints(route1)
         wp2 = _extract_waypoints(route2)
-        if not wp1 or not wp2:
-            return False
-        if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
-            return False
+        if wp1 and wp2:
+            if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
+                return False
     # else: one has a named corridor and the other is GENERAL (same cluster).
     # The named corridor gives directional context; let the bearing check below
     # decide whether they actually point the same way.  This handles routes like
@@ -498,6 +501,7 @@ class LorryEngine:
         df = pd.read_excel(path)
         df.columns = [c.strip().upper() for c in df.columns]
         df["USER"] = df["USER"].str.strip().str.upper()
+        df = df.drop_duplicates(subset=["LORRY"], keep="first")
         self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
         self.all_lorries = df.copy()
 
@@ -705,8 +709,12 @@ class LorryEngine:
         intel   = _extract_route_intelligence(route)
         cluster = intel["cluster"]
 
+        # Allow up to 10 % over rated capacity when all DOs share the same
+        # route — same-route items must never be split just because the total
+        # is marginally above the lorry's rated tonnage.
+        _SAME_ROUTE_OVERLOAD = 1.10
         eligible = self.eligible_lorries[
-            (self.eligible_lorries["TON"] >= total_ton) &
+            (self.eligible_lorries["TON"] * _SAME_ROUTE_OVERLOAD >= total_ton) &
             (~self.eligible_lorries["LORRY"].isin(unavailable))
         ].copy()
         if eligible.empty:
@@ -759,12 +767,39 @@ class LorryEngine:
             lambda u: 1.0 if u >= CAPACITY_TARGET else u / CAPACITY_TARGET)
         merged["IS_OWNER"] = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
-        # Per-tier sort — SURPLUS (tightest fit) is the primary key in every tier.
-        # History (CUST_FREQ / CLUSTER_FREQ) breaks ties within the same capacity class
-        # so a familiar driver is preferred when two lorries are equally efficient.
-        # This ensures minimum capacity waste regardless of route history.
-        _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
-        _sort_asc  = [True,      False,       False,          False,        False,       False]
+        # ── Distance-aware scoring ────────────────────────────────────────────
+        # Routes >100 km: drop undersized lorries, sort by utilisation first.
+        # Routes >200 km (cross-state, e.g. Kuantan ~280 km): raise minimum to
+        # 10T so an 8.5T lorry is never dispatched on a 280 km highway run when
+        # a 14T lorry is available.  Fixing this also frees the 8.5T lorry for
+        # medium routes (~150 km Temerloh) where it is a better-utilised fit.
+        # Local/medium routes keep SURPLUS-primary (tightest fit, minimise waste).
+        _centroid      = _route_centroid(route)
+        _route_dist_km = (
+            _haversine_km(_DEPOT[0], _DEPOT[1], _centroid[0], _centroid[1])
+            if _centroid else 0.0
+        )
+        ULTRA_LONG_HAUL_KM       = 200.0
+        LONG_HAUL_KM             = 100.0
+        _ULTRA_LONG_HAUL_MIN_TON = 10.0  # 10T+ for cross-state runs (>200 km)
+        _LONG_HAUL_MIN_TON       = 8.0   # 8T+ for regional runs (100–200 km)
+
+        if _route_dist_km >= ULTRA_LONG_HAUL_KM:
+            _lh_big = merged[merged["TON"] >= _ULTRA_LONG_HAUL_MIN_TON]
+            if not _lh_big.empty:
+                merged = _lh_big
+            _sort_cols = ["UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
+            _sort_asc  = [False,        False,       False,           True,     False,       False]
+        elif _route_dist_km >= LONG_HAUL_KM:
+            _lh_big = merged[merged["TON"] >= _LONG_HAUL_MIN_TON]
+            if not _lh_big.empty:
+                merged = _lh_big
+            _sort_cols = ["UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
+            _sort_asc  = [False,        False,       False,           True,     False,       False]
+        else:
+            _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
+            _sort_asc  = [True,      False,       False,          False,        False,       False]
+
         UTIL_GOOD_THRESHOLD = 0.60
         UTIL_OK_THRESHOLD   = 0.40
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
