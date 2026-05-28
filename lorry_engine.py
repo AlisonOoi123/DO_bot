@@ -495,8 +495,8 @@ _PLANNING_SECTION_USER = {
     "ABI":      "ABI",
     "VIVIAN":   "VIVIAN",
     "SPARE":    "SPARE",
-    "SELAYANG": "ABI",   # ABI sub-contractor — not available to VIVIAN
-    "BIG":      "ABI",   # ABI sub-contractor — not available to VIVIAN
+    "SELAYANG": "SELAYANG",
+    "BIG":      "BIG",
 }
 
 def load_planning_lorries(planning_path: str):
