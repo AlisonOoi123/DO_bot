@@ -502,32 +502,72 @@ _PLANNING_SECTION_USER = {
 def load_planning_lorries(planning_path: str):
     """Read MUATAN sheet → DataFrame(LORRY, TON, USER).
 
-    LORRY NAIK (5%) column (kg) is used as the rated capacity.
-    Section headers (ABI / VIVIAN / SPARE …) set the USER field.
+    Handles two layouts:
+      New (6-col): header row NAME|LORRY|BDM|BTM|MUATAN|LORRY NAIK(5%)
+                   NAME and LORRY are proper columns in every data row.
+      Old (5-col): no NAME column; section labels (ABI/VIVIAN/SPARE …)
+                   appear as standalone rows in col 0 above the lorry data.
+
+    LORRY NAIK (5%) column (kg) is divided by 1000 → tonnes.
     Returns None on failure so callers can fall back to master_lorry.xlsx.
     """
     try:
-        df = pd.read_excel(planning_path, sheet_name="MUATAN", header=None)
+        raw = pd.read_excel(planning_path, sheet_name="MUATAN", header=None)
     except Exception:
         return None
 
+    # ── Detect format ────────────────────────────────────────────────────────
+    # New format: first non-blank row has "NAME" and "LORRY" in consecutive cols.
+    header_row = None
+    for idx, row in raw.iterrows():
+        vals = [str(v).strip().upper() for v in row if pd.notna(v)]
+        if "NAME" in vals and "LORRY" in vals:
+            header_row = idx
+            break
+
+    if header_row is not None:
+        # ── New format ───────────────────────────────────────────────────────
+        df = pd.read_excel(planning_path, sheet_name="MUATAN",
+                           header=header_row)
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        # Normalise the LORRY NAIK column name (may contain spaces/%)
+        naik_col = next((c for c in df.columns if "NAIK" in c), None)
+        if naik_col is None or "LORRY" not in df.columns or "NAME" not in df.columns:
+            return None
+        rows = []
+        for _, row in df.iterrows():
+            name_val  = str(row["NAME"]).strip().upper()
+            lorry_val = str(row["LORRY"]).strip().upper()
+            user_val  = _PLANNING_SECTION_USER.get(name_val)
+            if user_val is None or not lorry_val or lorry_val == "NAN":
+                continue
+            try:
+                lorry_naik_kg = float(row[naik_col])
+            except (ValueError, TypeError):
+                continue
+            rows.append({"LORRY": lorry_val,
+                         "TON":   round(lorry_naik_kg / 1000, 4),
+                         "USER":  user_val})
+        return pd.DataFrame(rows) if rows else None
+
+    # ── Old format (section-header rows) ────────────────────────────────────
     current_user = None
     rows = []
-    for _, row in df.iterrows():
+    for _, row in raw.iterrows():
         val0 = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
         up0  = val0.upper()
-
         if up0 in _PLANNING_SECTION_USER:
             current_user = _PLANNING_SECTION_USER[up0]
             continue
         if current_user is None or not val0 or up0 in {"LORRY", "NAN", ""}:
             continue
         try:
-            lorry_naik_kg = float(row.iloc[4])   # "LORRY NAIK (5%)" column
+            lorry_naik_kg = float(row.iloc[4])
         except (ValueError, TypeError, IndexError):
             continue
-        rows.append({"LORRY": up0, "TON": round(lorry_naik_kg / 1000, 4), "USER": current_user})
-
+        rows.append({"LORRY": up0,
+                     "TON":   round(lorry_naik_kg / 1000, 4),
+                     "USER":  current_user})
     return pd.DataFrame(rows) if rows else None
 
 
