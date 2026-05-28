@@ -2147,9 +2147,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _best_gain, _best_src, _best_dst = 0.0, None, None
             for _pa in list(_pit.keys()):
                 _load_a = _ploads[_pa]
-                # Use the first item's route as the representative route for
-                # this lorry — more reliable than _session_routes when the lorry
-                # received items from a new route with no history record.
                 _route_a = next((it["ROUTE"] for it in _pit[_pa] if it.get("ROUTE")), "") \
                            or _session_routes.get(_pa, "")
                 for _pb in list(_pit.keys()):
@@ -2159,19 +2156,21 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _cap_b  = float(_lorry_cap_map.get(_pb, 0))
                     if _load_a + _load_b > _cap_b:
                         continue
-                    _route_b = next((it["ROUTE"] for it in _pit[_pb] if it.get("ROUTE")), "") \
-                               or _session_routes.get(_pb, "")
-                    # Route compatibility: use route/GPS/weight rules so that
-                    # lorries carrying new routes (no history) are still checked
-                    # correctly against cluster, bearing, and direction.
-                    if _route_a and _route_b:
-                        if not _routes_on_same_way(_route_a, _route_b):
+                    # Route compatibility: check source route against ALL routes
+                    # already on the destination lorry (not just the first item).
+                    # This lets PH07 merge into BQX9983 via the shared-waypoint
+                    # chain  PH07↔PH03(JERANTUT)  even though PH07 and PH02
+                    # (BQX9983's first item) share no waypoints directly.
+                    _routes_b = {it["ROUTE"] for it in _pit[_pb] if it.get("ROUTE")}
+                    if not _routes_b:
+                        _sr = _session_routes.get(_pb, "")
+                        if _sr:
+                            _routes_b = {_sr}
+                    if _route_a and _routes_b:
+                        if not any(_routes_on_same_way(_route_a, _rb) for _rb in _routes_b):
                             continue
                     # Score by utilisation GAIN on the destination lorry so that
-                    # underloaded lorries are filled first.  Previously we scored
-                    # by resulting utilisation which caused a well-loaded large
-                    # lorry (e.g. BQU3875 74%→92%) to beat a sparse smaller lorry
-                    # (e.g. BQX9983 40%→73%) even though the latter benefits more.
+                    # underloaded lorries are filled first.
                     _gain = _load_a / _cap_b if _cap_b else 0
                     if _gain > _best_gain:
                         _best_gain = _gain
@@ -2212,15 +2211,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for _dst in _underloaded:
                 _cap_dst  = float(_lorry_cap_map.get(_dst, 0))
                 _load_dst = _ploads[_dst]
-                _route_dst = next((x["ROUTE"] for x in _pit[_dst] if x.get("ROUTE")), "") \
-                             or _session_routes.get(_dst, "")
+                _routes_dst = {x["ROUTE"] for x in _pit[_dst] if x.get("ROUTE")}
+                if not _routes_dst:
+                    _sr = _session_routes.get(_dst, "")
+                    if _sr:
+                        _routes_dst = {_sr}
                 for _src in list(_pit.keys()):
                     if _src == _dst:
                         continue
                     _cap_src  = float(_lorry_cap_map.get(_src, 0))
                     _load_src = _ploads[_src]
-                    _route_src = next((x["ROUTE"] for x in _pit[_src] if x.get("ROUTE")), "") \
-                                 or _session_routes.get(_src, "")
                     for _it in _pit[_src]:
                         if id(_it) in _rebal_moved:
                             continue
@@ -2231,9 +2231,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if len(_pit[_src]) > 1 and _cap_src > 0:
                             if (_load_src - _it["WEIGHT"]) / _cap_src < _REBAL_THRESHOLD:
                                 continue
-                        _route_it = _it.get("ROUTE", "") or _route_src
-                        if _route_dst and _route_it:
-                            if not _routes_on_same_way(_route_dst, _route_it):
+                        _route_it = _it.get("ROUTE", "")
+                        if _routes_dst and _route_it:
+                            if not any(_routes_on_same_way(_route_it, _rd) for _rd in _routes_dst):
                                 continue
                         _gain = _it["WEIGHT"] / _cap_dst
                         if _gain > _best_gain:
