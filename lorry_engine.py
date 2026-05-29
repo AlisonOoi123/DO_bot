@@ -531,7 +531,6 @@ def load_planning_lorries(planning_path: str):
         naik_col = next((c for c in df.columns if "NAIK" in c), None)
         if naik_col is None or "LORRY" not in df.columns or "NAME" not in df.columns:
             return None
-        muatan_col = next((c for c in df.columns if c == "MUATAN"), None)
         rows = []
         for _, row in df.iterrows():
             name_val  = str(row["NAME"]).strip().upper()
@@ -543,15 +542,6 @@ def load_planning_lorries(planning_path: str):
                 lorry_naik_kg = float(row[naik_col])
             except (ValueError, TypeError):
                 continue
-            # The NAIK column sometimes holds the GVW floor (e.g. 4200 kg) for
-            # small lorries instead of MUATAN×1.05. Cap at MUATAN×1.05 to
-            # prevent the bot from treating a 1.47T lorry as a 4.2T lorry.
-            if muatan_col is not None:
-                try:
-                    muatan_kg = float(row[muatan_col])
-                    lorry_naik_kg = min(lorry_naik_kg, muatan_kg * 1.05)
-                except (ValueError, TypeError):
-                    pass
             rows.append({"LORRY": lorry_val,
                          "TON":   round(lorry_naik_kg / 1000, 4),
                          "USER":  user_val})
@@ -570,12 +560,6 @@ def load_planning_lorries(planning_path: str):
             continue
         try:
             lorry_naik_kg = float(row.iloc[4])
-            # col 3 = MUATAN; cap NAIK at MUATAN×1.05 (same fix as new format)
-            try:
-                muatan_kg = float(row.iloc[3])
-                lorry_naik_kg = min(lorry_naik_kg, muatan_kg * 1.05)
-            except (ValueError, TypeError, IndexError):
-                pass
         except (ValueError, TypeError, IndexError):
             continue
         rows.append({"LORRY": up0,
