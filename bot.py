@@ -3554,6 +3554,77 @@ def _export_result_inner(sess) -> list[str]:
         if "DATE" in out_df.columns:
             out_df["DATE"] = out_df["DATE"].astype(str)
 
+    # ── Sort rows by lorry then by LONGITUD delivery order ───────────────────
+    # Within each lorry, order DOs by nearest-neighbour from the depot using
+    # the GPS coordinates in the LONGITUD column so the driver can follow the
+    # printed sheet stop-by-stop.  Rows with no/invalid LONGITUD go at the
+    # end of their lorry group.  Unassigned rows (blank LICENSE) go last.
+    if "LONGITUD" in out_df.columns and "LICENSE" in out_df.columns:
+        import math as _math
+
+        def _parse_ll(v):
+            try:
+                s = str(v).replace(",", " ").strip()
+                if not s or s.lower() in ("nan", "none", ""):
+                    return None
+                p = s.split()
+                if len(p) >= 2:
+                    return (float(p[0]), float(p[1]))
+            except Exception:
+                pass
+            return None
+
+        def _hav(lat1, lon1, lat2, lon2):
+            R = 6371.0
+            dlat = _math.radians(lat2 - lat1)
+            dlon = _math.radians(lon2 - lon1)
+            a = (_math.sin(dlat / 2) ** 2
+                 + _math.cos(_math.radians(lat1)) * _math.cos(_math.radians(lat2))
+                 * _math.sin(dlon / 2) ** 2)
+            return R * 2 * _math.asin(_math.sqrt(min(1.0, a)))
+
+        _DEP = (3.0340, 101.5563)
+
+        # Classify rows
+        _lorry_rows: dict[str, list] = {}
+        _blank_rows: list = []
+        for _idx, _row in out_df.iterrows():
+            _pl = str(_row.get("LICENSE", "")).strip()
+            if _pl and _pl not in ("nan", "None", ""):
+                _lorry_rows.setdefault(_pl, []).append(_idx)
+            else:
+                _blank_rows.append(_idx)
+
+        # Sort lorries heaviest-total-weight first
+        def _lorry_wt(pl):
+            col = "GROSS WEIGHT" if "GROSS WEIGHT" in out_df.columns else None
+            if col:
+                return sum(pd.to_numeric(out_df.loc[i, col], errors="coerce")
+                           for i in _lorry_rows[pl])
+            return 0
+
+        _sorted_idxs: list = []
+        for _pl in sorted(_lorry_rows.keys(), key=_lorry_wt, reverse=True):
+            _with_ll, _without_ll = [], []
+            for _i in _lorry_rows[_pl]:
+                _ll = _parse_ll(out_df.at[_i, "LONGITUD"])
+                if _ll:
+                    _with_ll.append((_i, _ll))
+                else:
+                    _without_ll.append(_i)
+            # Greedy nearest-neighbour from depot
+            _cur = _DEP
+            _unvis = list(_with_ll)
+            while _unvis:
+                _near = min(_unvis, key=lambda x: _hav(_cur[0], _cur[1], x[1][0], x[1][1]))
+                _sorted_idxs.append(_near[0])
+                _cur = _near[1]
+                _unvis.remove(_near)
+            _sorted_idxs.extend(_without_ll)
+
+        _sorted_idxs.extend(_blank_rows)
+        out_df = out_df.loc[_sorted_idxs].reset_index(drop=True)
+
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
 
