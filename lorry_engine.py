@@ -128,6 +128,9 @@ _MY_COORDS: dict[str, tuple] = {
     "SUNWAY": (3.0692, 101.6014), "GLENMARIE": (3.1033, 101.5697),
     "PJ OLD TOWN": (3.1075, 101.6072), "PUTRA PERDANA": (2.9811, 101.6683),
     "BANTING": (2.8128, 101.5027), "JENJAROM": (2.7978, 101.5456),
+    "DENGKIL": (2.8490, 101.7828), "CYBERJAYA": (2.9220, 101.6503),
+    "S.ALAM": (3.0733, 101.5185), "K.KEMUNING": (3.0317, 101.5419),
+    "PKLANG": (2.9993, 101.3931),
     "TELOK PANGLIMA GARANG": (2.8667, 101.4833),
     "TELUK PANGLIMA GARANG": (2.8667, 101.4833),
     "PANDAMARAN": (2.9869, 101.3975), "TELUK GONG": (2.9681, 101.3838),
@@ -402,7 +405,15 @@ def _extract_waypoints(route: str) -> frozenset:
         if not tok:
             continue
         if i == 0 and _code_re.match(tok):
-            continue             # skip leading route code (KV04A, JH09, …)
+            # Also capture any place names embedded after the route code in the
+            # first token: "KV24A Dengkil/Cyberjaya" → ["DENGKIL","CYBERJAYA"],
+            # "NS01 Nilai" (from "NS01 Nilai-Mantin" split) → ["NILAI"].
+            _post = re.sub(r'^[A-Z]{2}\d+[A-Z]?', '', tok, flags=re.IGNORECASE).strip()
+            for _sub in re.split(r'[/,]+', _post):
+                _sub = re.sub(r'\s+\d+\s*$', '', _sub.strip()).strip()
+                if _sub and not _sub.isdigit() and len(_sub) > 1 and not _dir_re.match(_sub):
+                    waypoints.append(_sub)
+            continue             # skip the leading route code itself
         if _dir_re.match(tok):
             continue             # skip direction suffix (N 4, WN 1, SE 3, …)
         tok = re.sub(r'\s+\d+\s*$', '', tok).strip()   # strip trailing numbers
@@ -436,7 +447,24 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
     ib = _extract_route_intelligence(route2)
 
     if ia["cluster"] != ib["cluster"]:
-        return False
+        # Cross-cluster: allow if both route centroids are ≤40 km apart AND their
+        # bearings from the depot are within 65°.  This lets genuinely adjacent
+        # local routes from neighbouring states (e.g. KV24A Dengkil and NS01 Nilai)
+        # share a lorry without enabling long-haul mismatches (KV west vs PK north).
+        _cx1 = _route_centroid(route1)
+        _cx2 = _route_centroid(route2)
+        if _cx1 is None or _cx2 is None:
+            return False
+        if _haversine_km(_cx1[0], _cx1[1], _cx2[0], _cx2[1]) > 40.0:
+            return False
+        _dx1 = _haversine_km(_DEPOT[0], _DEPOT[1], _cx1[0], _cx1[1])
+        _dx2 = _haversine_km(_DEPOT[0], _DEPOT[1], _cx2[0], _cx2[1])
+        if _dx1 >= 3.0 and _dx2 >= 3.0:
+            _bx1 = _bearing_deg(_DEPOT[0], _DEPOT[1], _cx1[0], _cx1[1])
+            _bx2 = _bearing_deg(_DEPOT[0], _DEPOT[1], _cx2[0], _cx2[1])
+            if _bearing_diff(_bx1, _bx2) > 65.0:
+                return False
+        return True
     if ia["cluster"] == "UNKNOWN":
         return False
 
@@ -922,15 +950,15 @@ class LorryEngine:
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
         merged["UTIL_OK"]   = (merged["UTIL"] >= UTIL_OK_THRESHOLD).astype(int)
 
-        # FLEET_OWN_OK: lorry belongs to the session user AND achieves ≥40% util.
-        # This overrides the utilisation-tier system so that an idle VIVIAN lorry
-        # at 41% is always preferred over a SPARE lorry at 67%.  Without this, the
-        # tier-2 SPARE beat the tier-1 owned lorry even though IS_OWNER was already
-        # in _sort_cols (it was too far down the list to matter across tier boundaries).
-        # For tiny DOs where even the smallest owned lorry would be <40% utilised,
+        # FLEET_OWN_OK: lorry belongs to the session user AND achieves ≥35% util.
+        # This overrides the utilisation-tier system so that an idle fleet lorry
+        # at 36-39% is always preferred over a SPARE lorry at a higher util.
+        # Threshold is deliberately 5 pp below UTIL_OK (40%) so that fleet lorries
+        # near the boundary (e.g. BPE9878 at 38.5% for NS01) still beat SPARE.
+        # For tiny DOs where even the smallest owned lorry would be <35% utilised,
         # FLEET_OWN_OK=0 for everyone and the normal surplus-first sort applies.
         merged["FLEET_OWN_OK"] = (
-            (merged["IS_OWNER"] == 1) & (merged["UTIL"] >= UTIL_OK_THRESHOLD)
+            (merged["IS_OWNER"] == 1) & (merged["UTIL"] >= 0.35)
         ).astype(int)
 
         import pandas as _pd

@@ -1931,9 +1931,92 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             it["LORRY"] = item_bin.get(it["DO NUMBER"], bins[0]["lorry"])
                             it.pop("SPLIT_LORRIES", None)
                     else:
-                        lorry = suggestions[0]["LORRY"]
-                        for it in group_items:
-                            it["LORRY"] = lorry
+                        lorry      = suggestions[0]["LORRY"]
+                        single_cap_t = suggestions[0]["TON_CAPACITY"]
+
+                        # Right-size split: if the chosen lorry has >15% headroom
+                        # AND the group spans multiple routes, try to offload one
+                        # route-subset onto an idle fleet-owned smaller lorry so
+                        # that BPE9878 / VCC3998 don't sit idle while a large
+                        # lorry handles urban short-haul DOs alone.
+                        #
+                        # Try A — full route: all items of a sub-route fit on the
+                        #   small lorry at ≥60% utilisation.
+                        # Try B — partial DO fill: the sub-route weight exceeds the
+                        #   small lorry's capacity, but greedy-filling (heaviest
+                        #   first) still achieves ≥60% fill.  The spill DOs stay
+                        #   on the main lorry together with the other routes.
+                        _did_rsplit = False
+                        _routes_in_group = {it["ROUTE"] for it in group_items}
+                        if single_cap_t > total_w * 1.15 and len(_routes_in_group) > 1:
+                            _by_route: dict = defaultdict(list)
+                            for _it in group_items:
+                                _by_route[_it["ROUTE"]].append(_it)
+                            _best_split = None
+
+                            # Idle fleet-owned lorries smaller than the main lorry
+                            _idle_small = sorted(
+                                [
+                                    (float(row["TON"]), row["LORRY"])
+                                    for _, row in engine.eligible_lorries.iterrows()
+                                    if row["USER"] == sess["user_id"]
+                                    and float(row["TON"]) < single_cap_t
+                                    and row["LORRY"] not in excluded
+                                    and row["LORRY"] not in _session_loads
+                                ],
+                                reverse=True,   # largest capacity first
+                            )
+
+                            for _sr, _si in sorted(
+                                _by_route.items(),
+                                key=lambda kv: sum(x["WEIGHT"] for x in kv[1]),
+                            ):
+                                _sw = sum(x["WEIGHT"] for x in _si)
+                                _rem_w = total_w - _sw
+                                if _rem_w > single_cap_t:
+                                    continue   # remainder wouldn't fit on main lorry
+                                _sorted_si = sorted(_si, key=lambda x: x["WEIGHT"],
+                                                    reverse=True)
+
+                                for _scap, _sl in _idle_small:
+                                    if _sl in (excluded | {lorry}):
+                                        continue
+                                    # Try A: whole sub-route fits
+                                    if _sw <= _scap and _sw / _scap >= 0.60:
+                                        _rest_a = [x for x in group_items
+                                                   if x["ROUTE"] != _sr]
+                                        _best_split = (_sl, _sr, _si, _rest_a)
+                                        break
+                                    # Try B: greedy partial fill
+                                    _bite, _spill = [], []
+                                    _bfill = 0.0
+                                    for _it in _sorted_si:
+                                        if _bfill + _it["WEIGHT"] <= _scap + 0.001:
+                                            _bite.append(_it)
+                                            _bfill += _it["WEIGHT"]
+                                        else:
+                                            _spill.append(_it)
+                                    if _bite and _bfill / _scap >= 0.60:
+                                        _rest_b = _spill + [
+                                            x for x in group_items if x["ROUTE"] != _sr
+                                        ]
+                                        _best_split = (_sl, _sr, _bite, _rest_b)
+                                        break
+                                if _best_split:
+                                    break
+
+                            if _best_split:
+                                _bl, _bsr, _bite, _rest = _best_split
+                                for _it in _bite:
+                                    _it["LORRY"] = _bl
+                                for _it in _rest:
+                                    _it["LORRY"] = lorry
+                                sess["unavailable"].add(_bl)
+                                _session_routes.setdefault(_bl, _bsr)
+                                _did_rsplit = True
+                        if not _did_rsplit:
+                            for it in group_items:
+                                it["LORRY"] = lorry
             else:
                 # No single lorry fits — bin-pack across multiple lorries.
                 # Build bins using tightest-fit first: ask suggest() for the
