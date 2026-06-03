@@ -1742,14 +1742,26 @@ def _handle_excel_upload(phone, sess, file_bytes):
             return "9999-12-31"
 
         def _group_sort_key(g):
-            """Primary: earliest delivery date in group (ascending).
-            Secondary: total weight (descending) so heavy groups within the same
-            date claim the best-fit lorries before lighter ones."""
-            dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
-            earliest = min(dates) if dates else "9999-12-31"
-            return (earliest, -sum(it["WEIGHT"] for it in g))
+            """Primary: ISO week-of-year of earliest delivery date.
+            Secondary: total weight (descending) within the same week.
 
-        # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
+            Using a week bucket instead of exact date ensures the heaviest
+            route bundles (e.g. Kuantan 77T on May 26) claim the right large
+            lorry before a lighter same-week bundle (Pahang interior 23T on
+            May 25) grabs it first.  Different-week groups still sort by
+            ascending week so older-dated DOs are dispatched before newer ones.
+            """
+            dates    = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
+            earliest = min(dates) if dates else "9999-12-31"
+            try:
+                _d = date.fromisoformat(earliest)
+                week_bucket = _d.isocalendar()[:2]   # (year, iso_week)
+            except Exception:
+                week_bucket = (9999, 99)
+            return (week_bucket, -sum(it["WEIGHT"] for it in g))
+
+        # Week-bucket first, then heaviest — within the same dispatch week the
+        # largest bundles claim their best-fit lorry before lighter corridors do.
         sorted_groups.sort(key=_group_sort_key)
 
         # Session-level capacity tracker so groups can share a lorry when combined
@@ -2388,6 +2400,46 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     sess["assigned"][_it["DO NUMBER"]] = "NO_LORRY"
             _pit[_pl] = _kept
 
+        # ── Long-haul underutilisation warnings ──────────────────────────────
+        # Flag any lorry below 70% utilisation whose routes are >150 km from
+        # the depot — these are long-haul corridors where low volume is a real
+        # operational signal, not just an algorithmic gap.
+        _LONGHAUL_KM     = 150.0
+        _LOW_UTIL_THRESH = 0.70
+        _util_warnings: list[str] = []
+        for _wpl, _w_items in list(_pit.items()):
+            if not _w_items:
+                continue
+            _wcap = float(_lorry_cap_map.get(_wpl, 0))
+            if _wcap <= 0:
+                continue
+            _wtotal = sum(x["WEIGHT"] for x in _w_items)
+            _wutil  = _wtotal / _wcap
+            if _wutil >= _LOW_UTIL_THRESH:
+                continue
+            _lh_routes, _max_dist = [], 0.0
+            for _wr in {it.get("ROUTE", "") for it in _w_items}:
+                if not _wr:
+                    continue
+                _wc = _route_centroid(_wr)
+                if _wc is None:
+                    continue
+                _wd = _haversine_km(_DEPOT[0], _DEPOT[1], _wc[0], _wc[1])
+                if _wd >= _LONGHAUL_KM:
+                    _code = (_wr.split(" - ")[0].strip() if " - " in _wr else _wr)[:12]
+                    _lh_routes.append(_code)
+                    _max_dist = max(_max_dist, _wd)
+            if not _lh_routes:
+                continue
+            _route_str = "/".join(sorted(set(_lh_routes)))
+            _util_warnings.append(
+                f"⚠ *{_wpl}* {_route_str} — {round(_wutil * 100, 1)}%"
+                f" ({int(_wtotal):,} kg / {int(_wcap * 1000):,} kg)."
+                f" Long-haul >{int(_max_dist)} km."
+                f" Consider holding 1–2 days for more DOs."
+            )
+        sess["util_warnings"] = _util_warnings
+
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
@@ -3013,6 +3065,16 @@ def _build_summary(sess) -> str:
     unassigned  = len(no_lorry_items)
 
     lines.append(f"✅ {assigned_ok} assigned  ❌ {unassigned} unassigned  🚛 {len(sorted_lorries)} lorry(s)")
+
+    # ── Long-haul underutilisation alerts ────────────────────────────────────
+    _uw = sess.get("util_warnings", [])
+    if _uw:
+        lines.append("")
+        lines.append("─" * 20)
+        lines.append("📊 *Utilisation alerts (long-haul < 70%):*")
+        for _w in _uw:
+            lines.append(_w)
+
     summary_text = "\n".join(lines)
 
     result = [summary_text]
