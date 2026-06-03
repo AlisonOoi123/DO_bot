@@ -32,6 +32,10 @@ HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # b
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
 ROUTE_CODES_PATH = os.path.join(_DATA_DIR, "route_codes.xlsx")                  # user→route mapping (legacy fallback)
 
+# KV-prefix routes (KV01A–KV25A) are all Selangor/KL urban short-haul routes
+# that can complete two full lorry loads per day (morning trip + afternoon trip).
+_DOUBLE_TRIP_RE = re.compile(r'^KV\d', re.IGNORECASE)
+
 def _load_user_route_prefixes(user: str) -> set | None:
     """Return the set of route-code prefixes (e.g. 'KV19A', 'PH09') assigned to
     *user* (case-insensitive).
@@ -1877,23 +1881,30 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     _session_routes[_pa_pl] = _pa_item["ROUTE"]
 
         def _daily_overflow_group(lorry: str, grp) -> bool:
-            """True if assigning grp to lorry would exceed its capacity on ANY date."""
+            """True if assigning grp to lorry would exceed its capacity on ANY date.
+            KV (Selangor/KL) routes allow 2 trips/day → effective cap = 2×."""
             cap = float(_lorry_cap_map.get(lorry, 0.0))
             if cap <= 0:
                 return True
+            _grp_kv   = any(_DOUBLE_TRIP_RE.match(str(_it.get("ROUTE", ""))) for _it in grp)
+            _lorry_kv = bool(_DOUBLE_TRIP_RE.match(str(_session_routes.get(lorry, ""))))
+            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) else cap
             dl = _daily_loads.get(lorry, {})
             by_date: dict[str, float] = {}
             for _it in grp:
                 _d = str(_it.get("DATE", ""))
                 by_date[_d] = by_date.get(_d, 0.0) + _it["WEIGHT"]
-            return any(dl.get(_d, 0.0) + _w > cap + 0.001 for _d, _w in by_date.items())
+            return any(dl.get(_d, 0.0) + _w > _eff_cap + 0.001 for _d, _w in by_date.items())
 
         def _daily_min_slack(lorry: str, grp) -> float:
             """Minimum remaining daily capacity across the dates covered by grp."""
             cap = float(_lorry_cap_map.get(lorry, 0.0))
-            dl  = _daily_loads.get(lorry, {})
+            _grp_kv   = any(_DOUBLE_TRIP_RE.match(str(_it.get("ROUTE", ""))) for _it in grp)
+            _lorry_kv = bool(_DOUBLE_TRIP_RE.match(str(_session_routes.get(lorry, ""))))
+            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) else cap
+            dl    = _daily_loads.get(lorry, {})
             dates = {str(_it.get("DATE", "")) for _it in grp}
-            return min((cap - dl.get(_d, 0.0) for _d in dates), default=cap)
+            return min((_eff_cap - dl.get(_d, 0.0) for _d in dates), default=_eff_cap)
 
         def _update_daily_loads(pl: str, items) -> None:
             """Record weight per date for plate pl from the given items."""
@@ -3833,6 +3844,59 @@ def _export_result_inner(sess) -> list[str]:
         _sorted_idxs.extend(_blank_rows)
         out_df = out_df.loc[_sorted_idxs].reset_index(drop=True)
 
+    # ── TRIP column for KV (Selangor/KL) double-trip routes ──────────────────
+    # KV lorries (KV01A–KV25A) cover short urban routes and can complete a
+    # morning trip (TRIP=1) and afternoon trip (TRIP=2) in the same day.
+    # After GPS reordering: fill Trip 1 to single-lorry capacity, then Trip 2.
+    # Non-KV rows and unassigned rows get an empty TRIP value.
+    if "LICENSE" in out_df.columns and "ROUTE" in out_df.columns:
+        _engine_out = sess.get("engine")
+        _cap_map_out: dict[str, float] = {}
+        if _engine_out is not None:
+            for _, _er in _engine_out.eligible_lorries.iterrows():
+                _cap_map_out[str(_er["LORRY"]).strip().upper()] = float(_er["TON"])
+
+        # Rebuild lorry→row-index mapping after reset_index
+        _lrows_out: dict[str, list] = {}
+        for _i2, _r2 in out_df.iterrows():
+            _p2 = str(_r2.get("LICENSE", "")).strip()
+            if _p2 and _p2.lower() not in ("nan", "none", ""):
+                _lrows_out.setdefault(_p2.upper(), []).append(int(_i2))
+
+        _trip_col_vals = [""] * len(out_df)
+        _kv_trip_map: dict[int, int] = {}   # row_index → trip number (1 or 2)
+        for _pl2, _idxs2 in _lrows_out.items():
+            _cap2 = _cap_map_out.get(_pl2, 0.0)
+            if _cap2 <= 0:
+                continue
+            # Only process rows that belong to a KV route
+            _kv_idxs = [_i for _i in _idxs2
+                        if _DOUBLE_TRIP_RE.match(str(out_df.at[_i, "ROUTE"]).strip())]
+            if not _kv_idxs:
+                continue
+            # Group by date (rows already in GPS nearest-neighbour order)
+            _dg2: dict[str, list] = {}
+            for _i in _kv_idxs:
+                _d2 = str(out_df.at[_i, "DATE"]).strip()
+                _dg2.setdefault(_d2, []).append(_i)
+            for _d2, _di2 in _dg2.items():
+                _run2 = 0.0
+                _trip_num = 1
+                for _i in _di2:
+                    _gw2 = pd.to_numeric(out_df.at[_i, "GROSS WEIGHT"], errors="coerce")
+                    _wt2 = float(_gw2) / 1000.0 if not pd.isna(_gw2) else 0.0
+                    if _trip_num == 1 and _run2 + _wt2 > _cap2 + 0.001:
+                        _trip_num = 2
+                        _run2 = 0.0
+                    _trip_col_vals[_i] = str(_trip_num)
+                    _kv_trip_map[_i] = _trip_num
+                    _run2 += _wt2
+
+        if any(_trip_col_vals):
+            _lic_loc = out_df.columns.get_loc("LICENSE")
+            out_df.insert(_lic_loc, "TRIP", _trip_col_vals)
+            sess["_kv_trip_map"] = _kv_trip_map   # pass to trip manifest
+
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
 
@@ -4057,22 +4121,41 @@ def _generate_trip_manifest(sess) -> bytes:
             return ""
 
     # ── One sheet per lorry ───────────────────────────────────────────────────
-    last_col = get_column_letter(len(HEADERS))
+    last_col    = get_column_letter(len(HEADERS))
+    kv_trip_map = sess.get("_kv_trip_map", {})   # row_idx → 1 or 2
+    _TRIP2_FILL = PatternFill("solid", fgColor="F4B942")   # amber = afternoon trip divider
+    _TRIP2_FONT = Font(bold=True, color="FFFFFF", size=9)
+
     for plate in sorted_lorries:
-        pairs    = lorry_pairs[plate]
-        cap      = cap_map.get(plate, 0)
-        total_w  = round(sum(it["WEIGHT"] for _, it in pairs), 3)
+        pairs   = lorry_pairs[plate]
+        cap     = cap_map.get(plate, 0)
+        total_w = round(sum(it["WEIGHT"] for _, it in pairs), 3)
+
+        # Detect KV (double-trip) lorry: any of its items is on a KV route
+        _is_kv = any(_DOUBLE_TRIP_RE.match(str(do.get("ROUTE", "")).strip())
+                     for do, it in pairs)
+        trip1_w  = round(sum(it["WEIGHT"] for _, it in pairs
+                             if kv_trip_map.get(it.get("ROW_IDX"), 1) == 1), 3)
+        trip2_w  = round(total_w - trip1_w, 3) if _is_kv else 0.0
         util_pct = round(total_w / cap * 100, 1) if cap > 0 else 0
 
         ws = wb.create_sheet(title=plate[:31].replace("/", "-"))
         ws.freeze_panes = "A3"
 
-        # Title
+        # Title — show both trip weights for KV lorries
         ws.merge_cells(f"A1:{last_col}1")
         util_icon = "✅" if util_pct >= 75 else ("🟡" if util_pct >= 50 else "⚠️")
-        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
-                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   "
-                     f"|   Generated: {generated_str}")
+        if _is_kv and trip2_w > 0:
+            u1 = round(trip1_w / cap * 100, 1) if cap > 0 else 0
+            u2 = round(trip2_w / cap * 100, 1) if cap > 0 else 0
+            title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T cap   "
+                         f"|   Trip 1 ☀: {trip1_w}T ({u1}%)   "
+                         f"|   Trip 2 🌇: {trip2_w}T ({u2}%)   "
+                         f"|   Generated: {generated_str}")
+        else:
+            title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
+                         f"|   {total_w}T loaded ({util_pct}%) {util_icon}   "
+                         f"|   Generated: {generated_str}")
         t = ws.cell(1, 1, title_txt)
         t.font = _TITLE_FONT; t.fill = _TITLE_FILL
         t.alignment = Alignment(horizontal="center", vertical="center")
@@ -4080,46 +4163,70 @@ def _generate_trip_manifest(sess) -> bytes:
 
         _apply_headers(ws, 2)
 
-        # Sort: group by date chronologically, then nearest-neighbour within each date
+        # Sort: date → (trip for KV) → nearest-neighbour GPS
         date_groups: dict[str, list] = _dd(list)
         for do, it in pairs:
             dk = _date_sortkey(do.get("DATE", ""))
             date_groups[dk].append((do, it))
 
-        sorted_pairs: list = []
+        # Each element: (do, it, trip_num)
+        sorted_triples: list = []
         for dk in sorted(date_groups.keys()):
-            sorted_pairs.extend(_nn_sort(date_groups[dk]))
+            if _is_kv:
+                _t1 = [(do, it) for do, it in date_groups[dk]
+                       if kv_trip_map.get(it.get("ROW_IDX"), 1) == 1]
+                _t2 = [(do, it) for do, it in date_groups[dk]
+                       if kv_trip_map.get(it.get("ROW_IDX"), 1) == 2]
+                sorted_triples.extend((do, it, 1) for do, it in _nn_sort(_t1))
+                sorted_triples.extend((do, it, 2) for do, it in _nn_sort(_t2))
+            else:
+                sorted_triples.extend((do, it, 1) for do, it in _nn_sort(date_groups[dk]))
 
         prev_date = None
-        for seq, (do, it) in enumerate(sorted_pairs, 1):
-            dr      = seq + 2
-            row_idx = it.get("ROW_IDX")
+        prev_trip = None
+        excel_row = 3   # actual Excel row; may skip rows when we insert dividers
+        seq       = 0
+        for (do, it, trip_num) in sorted_triples:
+            row_idx     = it.get("ROW_IDX")
             dist_val    = _raw_val(row_idx, "DISTANCE")
             remarks_val = _raw_val(row_idx, "REMARKS")
+            dn_short    = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            date_disp   = _fmt_date(do.get("DATE", ""))
 
-            dn_short  = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
-            date_disp = _fmt_date(do.get("DATE", ""))
+            # Insert afternoon-trip divider banner before first Trip-2 row
+            if _is_kv and trip_num == 2 and prev_trip != 2:
+                ws.merge_cells(f"A{excel_row}:{last_col}{excel_row}")
+                _dc = ws.cell(excel_row, 1,
+                              "⬇  AFTERNOON TRIP (Trip 2) — return to depot, reload, depart")
+                _dc.font      = _TRIP2_FONT
+                _dc.fill      = _TRIP2_FILL
+                _dc.alignment = Alignment(horizontal="center", vertical="center")
+                ws.row_dimensions[excel_row].height = 14
+                excel_row += 1
 
             date_changed = (date_disp != prev_date)
             prev_date    = date_disp
+            prev_trip    = trip_num
+            seq         += 1
             fill = _DATE_FILL if date_changed else (_ALT_FILL if seq % 2 == 0 else None)
 
             row_data = [seq, date_disp, dn_short, do["CUSTOMER NAME"][:22],
                         _route_display(do["ROUTE"]), round(it["WEIGHT"], 3),
                         dist_val, remarks_val]
             for ci, val in enumerate(row_data, 1):
-                c = ws.cell(dr, ci, val)
+                c = ws.cell(excel_row, ci, val)
                 c.border    = _brd
                 c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
                 if fill:
                     c.fill = fill
             if remarks_val:
-                ws.row_dimensions[dr].height = min(60, max(15, len(remarks_val) // 5 * 8))
+                ws.row_dimensions[excel_row].height = min(60, max(15, len(remarks_val) // 5 * 8))
+            excel_row += 1
 
         # Footer
-        fr = len(sorted_pairs) + 3
+        fr = excel_row
         ws.merge_cells(f"A{fr}:E{fr}")
-        c = ws.cell(fr, 1, f"TOTAL — {len(sorted_pairs)} stop(s)")
+        c = ws.cell(fr, 1, f"TOTAL — {len(sorted_triples)} stop(s)")
         c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
         c.alignment = Alignment(horizontal="right")
 
