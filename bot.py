@@ -1091,19 +1091,36 @@ def handle_message(phone: str, text: str = None,
         if candidate in (get_assigned_today() & _ul):
             return handle_message(phone, text=f"release {candidate}")
 
+    # ── Global: ZSDOROUTEWRH history upload (accepted in any session state) ──
+    # Detected by the LONGITUD column, which is unique to that file.
+    # The file has a metadata row before the real headers, so LONGITUD may
+    # appear in the first data row rather than in the column names themselves —
+    # check both positions.
+    if file_bytes:
+        try:
+            _peek = _read_upload_df(file_bytes, file_mime)
+            # str() guards against datetime/int column names from the metadata row
+            _peek_cols = {str(c).strip().upper() for c in _peek.columns}
+            _first_row = (set(_peek.iloc[0].astype(str).str.strip().str.upper())
+                          if len(_peek) > 0 else set())
+            if "LONGITUD" in _peek_cols or "LONGITUD" in _first_row:
+                return _save_history_as_zip(file_bytes, file_mime)
+        except Exception:
+            pass  # not Excel — let the state handler deal with it
+
     if state == "IDLE":
         return _start(phone, sess)
     elif state == "AWAIT_USER_ID":
         return _handle_user_id(phone, sess, text)
     elif state == "AWAIT_EXCEL":
         if file_bytes:
-            return _handle_excel_upload(phone, sess, file_bytes)
+            return _handle_excel_upload(phone, sess, file_bytes, file_mime)
         return ["Please upload the DO Excel file (.xlsx) to continue."]
     elif state in ("REVIEWING", "CONFIRMING"):
-        # Allow lorry-status file upload at any point during an active session
+        # Allow file uploads at any point during an active session
         if file_bytes:
             try:
-                _df_up = pd.read_excel(io.BytesIO(file_bytes))
+                _df_up = _read_upload_df(file_bytes, file_mime)
                 _df_up.columns = [c.strip().upper() for c in _df_up.columns]
                 _status_result = _handle_lorry_status_upload(phone, sess, _df_up)
                 if _status_result is not None:
@@ -1365,9 +1382,60 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
     ]
 
 
-def _handle_excel_upload(phone, sess, file_bytes):
+def _read_upload_df(file_bytes: bytes, file_mime: str = "") -> "pd.DataFrame":
+    """Read uploaded Excel bytes into a DataFrame.
+
+    WhatsApp documents carry a MIME type — use it to pick the right engine
+    so both .xls (xlrd) and .xlsx (openpyxl) files are handled correctly.
+    Falls back to the alternate engine if the primary attempt fails.
+    """
+    buf = io.BytesIO(file_bytes)
+    is_xls = "vnd.ms-excel" in (file_mime or "") and "openxml" not in (file_mime or "")
+    primary, fallback = ("xlrd", "openpyxl") if is_xls else ("openpyxl", "xlrd")
     try:
-        df = pd.read_excel(io.BytesIO(file_bytes))
+        return pd.read_excel(buf, engine=primary)
+    except Exception:
+        buf.seek(0)
+        return pd.read_excel(buf, engine=fallback)
+
+
+def _save_history_as_zip(file_bytes: bytes, file_mime: str = "") -> list[str]:
+    """Save an uploaded ZSDOROUTEWRH .xls/.xlsx as data/ZSDOROUTEWRH.zip.
+
+    Compresses on the fly — no temp file needed.  Returns a WhatsApp reply
+    confirming the row count and compressed size.
+    """
+    import zipfile as _zf
+
+    is_xls = "vnd.ms-excel" in (file_mime or "") and "openxml" not in (file_mime or "")
+    inner_name = "ZSDOROUTEWRH.xls" if is_xls else "ZSDOROUTEWRH.xlsx"
+
+    zip_buf = io.BytesIO()
+    with _zf.ZipFile(zip_buf, "w", _zf.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.writestr(inner_name, file_bytes)
+    zip_bytes = zip_buf.getvalue()
+    with open(HISTORY_PATH_ZIP, "wb") as fh:
+        fh.write(zip_bytes)
+
+    size_mb = len(zip_bytes) / 1_048_576
+    try:
+        buf = io.BytesIO(file_bytes)
+        eng = "xlrd" if is_xls else "openpyxl"
+        _tmp = pd.read_excel(buf, engine=eng, header=1)
+        row_count = f"{len(_tmp):,}"
+    except Exception:
+        row_count = "?"
+
+    return [
+        f"✅ History file updated — {row_count} rows saved "
+        f"({size_mb:.1f} MB compressed).\n"
+        f"Route-history scoring will use this file on the next planning session."
+    ]
+
+
+def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
+    try:
+        df = _read_upload_df(file_bytes, file_mime)
         df.columns = [c.strip().upper() for c in df.columns]
 
         # ── Detect lorry-status file (LORRY + STATUS columns) ───────────────
