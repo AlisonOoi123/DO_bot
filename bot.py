@@ -1741,15 +1741,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 pass
             return "9999-12-31"
 
+        # PH interior codes: PH01–PH07 (west Pahang corridor — Raub/Benta/Lipis/Jerantut).
+        # PH08+ (Kuantan/east coast) are NOT interior.
+        _PH_INTERIOR = {"PH01", "PH02", "PH03", "PH04", "PH05", "PH06", "PH07"}
+
         def _group_sort_key(g):
-            """Primary: earliest delivery date in group (ascending).
-            Secondary: total weight (descending) so heavy groups within the same
-            date claim the best-fit lorries before lighter ones."""
+            """Sort key: (date, corridor_priority, -weight).
+
+            Corridor priority within the same date:
+              0 — PH interior (PH01–PH07): processed first so BPE9788 is claimed
+                  before Kuantan's heavier DOs can pre-empt it.
+              1 — everything else (including Kuantan / KV / JH).
+
+            This preserves date-urgency while guaranteeing the interior Pahang
+            corridor always has a lorry when Kuantan DOs fall on the same date.
+            """
             dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
             earliest = min(dates) if dates else "9999-12-31"
-            return (earliest, -sum(it["WEIGHT"] for it in g))
+            _is_ph_interior = any(
+                str(it.get("CODE", "")).strip().upper()[:4] in _PH_INTERIOR
+                for it in g
+            )
+            _corridor_prio = 0 if _is_ph_interior else 1
+            return (earliest, _corridor_prio, -sum(it["WEIGHT"] for it in g))
 
-        # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
+        # Date-first → PH interior before Kuantan → heaviest within tier
         sorted_groups.sort(key=_group_sort_key)
 
         # Session-level capacity trackers so groups can share a lorry.

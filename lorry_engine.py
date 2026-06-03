@@ -151,19 +151,47 @@ _MY_COORDS: dict[str, tuple] = {
     "JERANTUT": (3.9333, 102.3667), "LANCHANG": (3.6167, 102.0833),
     "TEMERLOH": (3.4500, 102.4167), "KUANTAN": (3.8319, 103.3322),
     "MENTAKAB": (3.5000, 102.3500), "MARAN": (3.9833, 102.7667),
+    "CAMERON HIGHLAND": (4.4700, 101.3833), "CAMERON HIGHLANDS": (4.4700, 101.3833),
+    "TRIANG": (3.2167, 102.7000), "BERA": (3.4500, 102.8667),
+    "K.KRAU": (3.5500, 102.6500), "KUALA KRAU": (3.5500, 102.6500),
+    "KUALA KERAU": (3.5500, 102.6500),
     # Johor
     "JOHOR BAHRU": (1.4927, 103.7414), "JB": (1.4927, 103.7414),
-    "JOHOR BHARU": (1.4927, 103.7414),
+    "JOHOR BHARU": (1.4927, 103.7414), "JOHOR": (1.4927, 103.7414),
     "KULAI": (1.6600, 103.5935), "SENAI": (1.6372, 103.6697),
     "SKUDAI": (1.5264, 103.6700), "KLUANG": (2.0272, 103.3219),
     "BATU PAHAT": (1.8559, 102.9325), "MUAR": (2.0437, 102.5691),
     "PONTIAN": (1.4866, 103.3881), "MERSING": (2.4386, 103.8309),
     "SEGAMAT": (2.5128, 102.8158), "AYER HITAM": (1.9233, 103.1797),
+    "YONG PENG": (2.0099, 103.0710), "PARIT RAJA": (1.8543, 102.7995),
+    "TANGKAK": (2.2633, 102.5447), "PAGOH": (2.2167, 102.8733),
     # Perak
     "IPOH": (4.5975, 101.0901), "TELUK INTAN": (4.0228, 101.0202),
     "LANGKAP": (4.1000, 101.0667), "SLIM RIVER": (3.8167, 101.4000),
+    "SLIM": (3.8167, 101.4000),
     "TAIPING": (4.8500, 100.7333), "KAMPAR": (4.3000, 101.1500),
     "SITIAWAN": (4.2167, 100.7000), "LUMUT": (4.2278, 100.6250),
+    "MANJUNG": (4.2128, 100.7453), "PANTAI REMIS": (4.0926, 100.7793),
+    "SUNGAI SIPUT": (4.8333, 101.0667), "TANJUNG RAMBUTAN": (4.6167, 101.1667),
+    "TANJUNG MALIM": (3.6969, 101.5158), "T.MALIM": (3.6969, 101.5158),
+    "HUTAN MELINTANG": (3.8667, 101.1500),
+    # Selangor extra
+    "K.KUBU": (3.5634, 101.6591), "KUALA KUBU BHARU": (3.5634, 101.6591),
+    "B.KALI": (3.4617, 101.6557), "BATANG KALI": (3.4617, 101.6557),
+    "SERENDAH": (3.4621, 101.6484), "SABAK BERNAM": (3.7697, 100.9779),
+    "T.SEPAT": (2.9167, 101.4500), "TELUK SEPAT": (2.9167, 101.4500),
+    # KL suburbs
+    "BANGSAR": (3.1322, 101.6744), "SEGAMBUT": (3.1818, 101.6749),
+    "SENTUL": (3.1869, 101.6921), "WANGSAMAJU": (3.2100, 101.7200),
+    "BRICKFIELDS": (3.1284, 101.6869), "BRICKFIELD": (3.1284, 101.6869),
+    "KUCHAI LAMA": (3.0844, 101.6855), "TAMAN DESA": (3.0917, 101.6750),
+    "OUG": (3.0933, 101.6839), "SEA PARK": (3.1175, 101.6166),
+    "ARA DAMANSARA": (3.1144, 101.5724), "SRI DAMANSARA": (3.1833, 101.6167),
+    "BUKIT DAMANSARA": (3.1476, 101.6583), "BUKIT DAMAN SARA": (3.1476, 101.6583),
+    "KINRARA": (3.0333, 101.6500), "KLIA": (2.7456, 101.7098),
+    "SUBANG AIRPORT": (3.1303, 101.5468),
+    "BUKIT JALIL": (3.0547, 101.6875), "B.JALIL": (3.0547, 101.6875),
+    "BUKIT BERUNTUNG": (3.4792, 101.5872), "B.BERUNTUNG": (3.4792, 101.5872),
     # Terengganu
     "TERENGGANU": (5.3117, 103.1324), "KUALA TERENGGANU": (5.3117, 103.1324),
     "KEMAMAN": (4.2333, 103.4167), "DUNGUN": (4.7667, 103.4167),
@@ -175,22 +203,30 @@ _MY_COORDS: dict[str, tuple] = {
     # Negeri Sembilan
     "SEREMBAN": (2.7297, 101.9381), "PORT DICKSON": (2.5210, 101.7981),
     "NILAI": (2.8193, 101.7924), "SENAWANG": (2.7333, 101.9667),
+    "BAHAU": (2.7985, 102.3898), "KUALA PILAH": (2.7381, 102.2518),
+    "TAMPIN": (2.4700, 102.2300), "GEMAS": (2.5778, 102.5981),
+    "LUKUT": (2.6013, 101.8701),
     # Melaka
     "MELAKA": (2.1896, 102.2501), "MALACCA": (2.1896, 102.2501),
     "ALOR GAJAH": (2.3833, 102.2000), "JASIN": (2.3094, 102.4369),
     # Kedah
     "ALOR SETAR": (6.1248, 100.3673), "SUNGAI PETANI": (5.6472, 100.4888),
     "KULIM": (5.3647, 100.5619), "BALING": (5.6725, 100.9231),
+    "KEDAH": (6.1248, 100.3673),
     # Penang
     "GEORGE TOWN": (5.4141, 100.3288), "PENANG": (5.4141, 100.3288),
+    "PENANG ISLAND": (5.4141, 100.3288), "PENANG MAINLAND": (5.3993, 100.3639),
     "BUTTERWORTH": (5.3993, 100.3639), "BUKIT MERTAJAM": (5.3636, 100.4611),
     # Sabah
     "KOTA KINABALU": (5.9804, 116.0735), "KK": (5.9804, 116.0735),
     "SANDAKAN": (5.8402, 118.1179), "TAWAU": (4.2333, 117.8833),
+    "SABAH": (5.9804, 116.0735),
     # Sarawak
     "KUCHING": (1.5533, 110.3592), "MIRI": (4.3995, 113.9914),
     "SIBU": (2.3010, 111.8254), "BINTULU": (3.1727, 113.0447),
-    "LIMBANG": (4.7500, 115.0167),
+    "LIMBANG": (4.7500, 115.0167), "SARAWAK": (1.5533, 110.3592),
+    # State-level names that appear as waypoints in region-only route strings
+    "KELANTAN": (6.1254, 102.2380),
 }
 
 def _geocode(place: str) -> tuple | None:
@@ -398,7 +434,7 @@ def _extract_waypoints(route: str) -> frozenset:
     parts = re.split(r'\s*-\s*', normalised)
 
     _dir_re  = re.compile(r'^(N|S|E|W|NE|NW|SE|SW|WN|ES|EN|WS|C|P)\s*\d*$', re.IGNORECASE)
-    _code_re = re.compile(r'^[A-Z]{2}\d', re.IGNORECASE)
+    _code_re = re.compile(r'^[A-Z]{2,3}\d', re.IGNORECASE)  # catches KV11A, PH04, SBH01, KDH01
 
     waypoints = []
     for i, raw in enumerate(parts):
@@ -409,7 +445,7 @@ def _extract_waypoints(route: str) -> frozenset:
             # Also capture any place names embedded after the route code in the
             # first token: "KV24A Dengkil/Cyberjaya" → ["DENGKIL","CYBERJAYA"],
             # "NS01 Nilai" (from "NS01 Nilai-Mantin" split) → ["NILAI"].
-            _post = re.sub(r'^[A-Z]{2}\d+[A-Z]?', '', tok, flags=re.IGNORECASE).strip()
+            _post = re.sub(r'^[A-Z]{2,3}\d+[A-Z]?', '', tok, flags=re.IGNORECASE).strip()
             for _sub in re.split(r'[/,]+', _post):
                 _sub = re.sub(r'\s+\d+\s*$', '', _sub.strip()).strip()
                 if _sub and not _sub.isdigit() and len(_sub) > 1 and not _dir_re.match(_sub):
