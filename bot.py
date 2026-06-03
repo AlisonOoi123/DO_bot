@@ -1752,12 +1752,44 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
         sorted_groups.sort(key=_group_sort_key)
 
-        # Session-level capacity tracker so groups can share a lorry when combined
-        # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
-        _session_loads: dict[str, float] = {}   # plate → tons assigned this session
-        _session_routes: dict[str, str]  = {}   # plate → representative route
+        # Session-level capacity trackers so groups can share a lorry.
+        # _session_loads  — cumulative weight (kept for sharing/swap logic)
+        # _daily_loads    — per-date weight; used for capacity exclusion so a
+        #                   lorry that handles Mon/Wed/Fri trips isn't wrongly
+        #                   marked "full" when its cumulative total exceeds the
+        #                   single-trip cap (e.g. VJN9910 doing 3 × 5T = 15T
+        #                   but only ever 5T on any one day).
+        _session_loads: dict[str, float] = {}              # plate → cumulative tons
+        _daily_loads:   dict[str, dict[str, float]] = {}   # plate → {date → tons}
+        _session_routes: dict[str, str]  = {}              # plate → representative route
         _lorry_cap_map = {row["LORRY"]: float(row["TON"])
                           for _, row in engine.eligible_lorries.iterrows()}
+
+        def _daily_overflow_group(lorry: str, grp) -> bool:
+            """True if assigning grp to lorry would exceed its capacity on ANY date."""
+            cap = float(_lorry_cap_map.get(lorry, 0.0))
+            if cap <= 0:
+                return True
+            dl = _daily_loads.get(lorry, {})
+            by_date: dict[str, float] = {}
+            for _it in grp:
+                _d = str(_it.get("DATE", ""))
+                by_date[_d] = by_date.get(_d, 0.0) + _it["WEIGHT"]
+            return any(dl.get(_d, 0.0) + _w > cap + 0.001 for _d, _w in by_date.items())
+
+        def _daily_min_slack(lorry: str, grp) -> float:
+            """Minimum remaining daily capacity across the dates covered by grp."""
+            cap = float(_lorry_cap_map.get(lorry, 0.0))
+            dl  = _daily_loads.get(lorry, {})
+            dates = {str(_it.get("DATE", "")) for _it in grp}
+            return min((cap - dl.get(_d, 0.0) for _d in dates), default=cap)
+
+        def _update_daily_loads(pl: str, items) -> None:
+            """Record weight per date for plate pl from the given items."""
+            dl = _daily_loads.setdefault(pl, {})
+            for _it in items:
+                _d = str(_it.get("DATE", ""))
+                dl[_d] = dl.get(_d, 0.0) + _it["WEIGHT"]
 
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
@@ -1839,12 +1871,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
             sess["unavailable"].update(broken_map.keys())
             # Also exclude lorries already full or incompatible with this route
             _session_full = {p for p in _session_loads
-                             if _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) < total_w}
+                             if _daily_overflow_group(p, group_items)}
             _session_incompatible = {
                 p for p in _session_loads
                 if _session_routes.get(p)
                 and not _routes_on_same_way(route, _session_routes.get(p, ""))
-                and _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) >= total_w
+                and not _daily_overflow_group(p, group_items)
             }
             excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
 
@@ -1853,10 +1885,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # session has enough remaining capacity.  Prefer same-corridor lorries
             # (same direction); fall back only if no compatible match exists.
             _share_pool = [
-                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                (_daily_min_slack(p, group_items), p)
                 for p in _session_loads
                 if p in _lorry_cap_map
-                and float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= total_w
+                and not _daily_overflow_group(p, group_items)
                 and p not in excluded
             ]
             if _share_pool:
@@ -1869,6 +1901,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     for it in group_items:
                         it["LORRY"] = _shared
                     _session_loads[_shared] = float(_session_loads.get(_shared, 0)) + total_w
+                    _update_daily_loads(_shared, group_items)
                     for it in _all_group:
                         sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
                     return
@@ -2034,8 +2067,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # (e.g. BQU3875 filled to 20T getting a second 18T run).
                     _excl_session_full = {
                         p for p in _session_loads
-                        if float(_lorry_cap_map.get(p, 0))
-                           - float(_session_loads.get(p, 0)) < remain
+                        if _daily_overflow_group(p, group_items)
                     }
                     excl = sess["unavailable"] | get_assigned_today() | _excl_session_full
                     # Tightest-fit pass: find smallest lorry that handles remain
@@ -2053,7 +2085,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                              unavailable=excl, top_n=20)
                         if not sug:
                             break
-                        _min_meaningful = max(remain * 0.45, 0.5)
+                        _min_meaningful = max(remain * 0.30, 0.5)
                         _hist_capable = [s for s in sug
                                          if s["TON_CAPACITY"] >= _min_meaningful]
                         if _hist_capable:
@@ -2091,8 +2123,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             # stranded even when arithmetic says they should fit).
                             _excl_retry_sf = {
                                 p for p in _session_loads
-                                if float(_lorry_cap_map.get(p, 0))
-                                   - float(_session_loads.get(p, 0)) < it["WEIGHT"]
+                                if _daily_overflow_group(p, [it])
                             }
                             excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf
                             extra_sug  = engine.suggest(
@@ -2122,8 +2153,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # If even the largest lorry can't handle the weight → NO_LORRY.
                     _excl_lr_sf = {
                         p for p in _session_loads
-                        if float(_lorry_cap_map.get(p, 0))
-                           - float(_session_loads.get(p, 0)) < total_w
+                        if _daily_overflow_group(p, group_items)
                     }
                     excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf
                     last_resort = engine.suggest_largest_available(
@@ -2152,6 +2182,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _pl = _it.get("LORRY")
                 if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", None}:
                     _session_loads[_pl] = float(_session_loads.get(_pl, 0)) + _it["WEIGHT"]
+                    _update_daily_loads(_pl, [_it])
                     if _pl not in _session_routes:
                         _session_routes[_pl] = route
 
@@ -2166,11 +2197,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if it.get("LORRY") != "NO_LORRY":
                 continue
             w = it["WEIGHT"]
-            # Build candidates: lorries with remaining session capacity ≥ w
+            # Build candidates: lorries that can accept this item on its date
             _cands = [
-                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                (_daily_min_slack(p, [it]), p)
                 for p in _lorry_cap_map
-                if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
+                if not _daily_overflow_group(p, [it])
                 and p not in _excl_consol
             ]
             if not _cands:
@@ -2183,6 +2214,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _pick = (_compat or sorted(_cands))[0][1]
             it["LORRY"] = _pick
             _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
+            _update_daily_loads(_pick, [it])
             if _pick not in _session_routes:
                 _session_routes[_pick] = it["ROUTE"]
             sess["assigned"][it["DO NUMBER"]] = _pick

@@ -147,6 +147,7 @@ _MY_COORDS: dict[str, tuple] = {
     # Pahang
     "BENTONG": (3.5151, 101.9175), "KARAK": (3.5323, 101.9922),
     "RAUB": (3.7893, 101.8582), "BENTA": (3.9167, 101.9333),
+    "LIPIS": (4.1909, 102.0449), "KUALA LIPIS": (4.1909, 102.0449),
     "JERANTUT": (3.9333, 102.3667), "LANCHANG": (3.6167, 102.0833),
     "TEMERLOH": (3.4500, 102.4167), "KUANTAN": (3.8319, 103.3322),
     "MENTAKAB": (3.5000, 102.3500), "MARAN": (3.9833, 102.7667),
@@ -418,7 +419,11 @@ def _extract_waypoints(route: str) -> frozenset:
             continue             # skip direction suffix (N 4, WN 1, SE 3, …)
         tok = re.sub(r'\s+\d+\s*$', '', tok).strip()   # strip trailing numbers
         if tok and not tok.isdigit() and len(tok) > 1:
-            waypoints.append(tok)
+            # Split on '&' so "BENTA & LIPIS" → ["BENTA", "LIPIS"] for lookup
+            for _sub_tok in re.split(r'\s*&\s*', tok):
+                _sub_tok = _sub_tok.strip()
+                if _sub_tok and not _sub_tok.isdigit() and len(_sub_tok) > 1:
+                    waypoints.append(_sub_tok)
     return frozenset(waypoints)
 
 
