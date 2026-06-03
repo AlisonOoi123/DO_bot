@@ -1851,6 +1851,28 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
         _lorry_cap_map = {row["LORRY"]: float(row["TON"])
                           for _, row in engine.eligible_lorries.iterrows()}
 
+        # ── Pre-populate _daily_loads from already-assigned rows ─────────────
+        # Rows in the upload that already have a LICENSE plate (pre-assigned by
+        # the user or from a previous run) consume that lorry's daily capacity.
+        # Without this, the bot sees BQU3875 as "free" on June 2 even though it
+        # already has 16T of Kuantan DOs on that date, and assigns Seremban/KV
+        # routes to it via the sharing/consolidation logic.
+        _SENTINEL_PLATES = {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", "NAN", "NONE", "N/A", "-"}
+        for _pa_item in items:
+            _pa_pl = str(raw.at[_pa_item["ROW_IDX"], "LICENSE"]).strip().upper() \
+                     if "LICENSE" in raw.columns else ""
+            if _pa_pl in _SENTINEL_PLATES:
+                continue
+            # Record in daily loads so this lorry looks "used" on this date
+            _pa_date = _pa_item.get("DATE", "")
+            _pa_wt   = _pa_item["WEIGHT"]
+            if _pa_pl and _pa_date:
+                _dl = _daily_loads.setdefault(_pa_pl, {})
+                _dl[_pa_date] = _dl.get(_pa_date, 0.0) + _pa_wt
+                _session_loads[_pa_pl] = float(_session_loads.get(_pa_pl, 0)) + _pa_wt
+                if _pa_pl not in _session_routes and _pa_item.get("ROUTE"):
+                    _session_routes[_pa_pl] = _pa_item["ROUTE"]
+
         def _daily_overflow_group(lorry: str, grp) -> bool:
             """True if assigning grp to lorry would exceed its capacity on ANY date."""
             cap = float(_lorry_cap_map.get(lorry, 0.0))
@@ -2292,12 +2314,17 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             ]
             if not _cands:
                 continue
-            # Prefer same-corridor lorries with tightest remaining fit
+            # Prefer same-corridor lorries with tightest remaining fit.
+            # If no corridor-compatible lorry has capacity, leave as NO_LORRY
+            # rather than forcing the item onto a geographically wrong lorry
+            # (e.g. Seremban DO onto a Kuantan lorry).
             _compat = sorted(
                 [(r, p) for r, p in _cands
                  if _routes_on_same_way(it["ROUTE"], _session_routes.get(p, ""))]
             )
-            _pick = (_compat or sorted(_cands))[0][1]
+            if not _compat:
+                continue  # no compatible lorry — leave for manual review
+            _pick = _compat[0][1]
             it["LORRY"] = _pick
             _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
             _update_daily_loads(_pick, [it])
