@@ -1742,26 +1742,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
             return "9999-12-31"
 
         def _group_sort_key(g):
-            """Primary: ISO week-of-year of earliest delivery date.
-            Secondary: total weight (descending) within the same week.
-
-            Using a week bucket instead of exact date ensures the heaviest
-            route bundles (e.g. Kuantan 77T on May 26) claim the right large
-            lorry before a lighter same-week bundle (Pahang interior 23T on
-            May 25) grabs it first.  Different-week groups still sort by
-            ascending week so older-dated DOs are dispatched before newer ones.
-            """
-            dates    = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
+            """Primary: earliest delivery date in group (ascending).
+            Secondary: total weight (descending) so heavy groups within the same
+            date claim the best-fit lorries before lighter ones."""
+            dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
             earliest = min(dates) if dates else "9999-12-31"
-            try:
-                _d = date.fromisoformat(earliest)
-                week_bucket = _d.isocalendar()[:2]   # (year, iso_week)
-            except Exception:
-                week_bucket = (9999, 99)
-            return (week_bucket, -sum(it["WEIGHT"] for it in g))
+            return (earliest, -sum(it["WEIGHT"] for it in g))
 
-        # Week-bucket first, then heaviest — within the same dispatch week the
-        # largest bundles claim their best-fit lorry before lighter corridors do.
+        # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
         sorted_groups.sort(key=_group_sort_key)
 
         # Session-level capacity tracker so groups can share a lorry when combined
@@ -2055,13 +2043,23 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                          unavailable=excl, top_n=20,
                                          customer_name=customer)
                     if not sug:
-                        # No lorry can carry full remain — grab largest available
-                        # for a partial load, then continue with what's left
+                        # No single lorry covers full remain — pick the
+                        # historically best-matched lorry that still has
+                        # meaningful capacity (≥45% of remain).  This lets
+                        # route-familiar lorries (e.g. BPE9788 for PH interior)
+                        # fill up before a large-but-wrong-corridor lorry
+                        # (e.g. VJN9910) grabs the slot by raw tonnage alone.
                         sug = engine.suggest(route=route, total_ton=0.001,
                                              unavailable=excl, top_n=20)
                         if not sug:
                             break
-                        sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
+                        _min_meaningful = max(remain * 0.45, 0.5)
+                        _hist_capable = [s for s in sug
+                                         if s["TON_CAPACITY"] >= _min_meaningful]
+                        if _hist_capable:
+                            sug = _hist_capable  # history order preserved from suggest()
+                        else:
+                            sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
                     lorry   = sug[0]["LORRY"]
                     cap     = sug[0]["TON_CAPACITY"]
                     portion = min(cap, remain)
