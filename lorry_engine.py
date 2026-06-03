@@ -718,14 +718,32 @@ class LorryEngine:
         return out
 
     def _load_history(self, path):
-        import os, glob
+        import os, glob, zipfile, io
         global _HISTORY_CENTROIDS
+
+        def _read_excel_from_path(p: str):
+            """Return a DataFrame from a plain Excel file or an .xls inside a .zip."""
+            if str(p).lower().endswith(".zip"):
+                with zipfile.ZipFile(p) as zf:
+                    # Pick the first .xls/.xlsx member found in the archive
+                    members = [m for m in zf.namelist()
+                               if m.lower().endswith((".xls", ".xlsx"))
+                               and not m.startswith("__MACOSX")]
+                    if not members:
+                        raise ValueError(f"No Excel file found inside {p}")
+                    member = members[0]
+                    eng = "xlrd" if member.lower().endswith(".xls") else "openpyxl"
+                    with zf.open(member) as fh:
+                        return pd.read_excel(io.BytesIO(fh.read()), engine=eng)
+            else:
+                eng = "xlrd" if str(p).lower().endswith(".xls") else "openpyxl"
+                return pd.read_excel(p, engine=eng)
+
         paths = [path] if os.path.isfile(path) else (glob.glob(path + "*") or [path])
         frames = []
         for p in paths:
             try:
-                eng = "xlrd" if str(p).lower().endswith(".xls") else "openpyxl"
-                df  = pd.read_excel(p, engine=eng)
+                df = _read_excel_from_path(p)
                 df.columns = [str(c).strip().upper() for c in df.columns]
                 # Some exports have a metadata row before the real header row.
                 # Detect this: if "ROUTE" is missing but appears in the first data row.

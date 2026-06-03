@@ -25,7 +25,8 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 MASTER_PATH    = os.path.join(_DATA_DIR, "master lorry.xlsx")
 PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY_DAILY_PLANNING.xlsx")   # latest capacity + route ownership
 # History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
-HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
+HISTORY_PATH_ZIP = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.zip")               # compressed .xls (preferred — smallest)
+HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # uncompressed .xls with LONGITUD column
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
@@ -77,9 +78,10 @@ def _extract_route_prefix(route: str) -> str:
 
 def _resolve_history_path() -> str:
     """Return the best available history file.
-    Prefers the .xls version (has LONGITUD GPS column) over .xlsx fallbacks.
+    Prefers the .zip (compressed .xls) to keep repo size small;
+    falls back to uncompressed .xls, then .xlsx variants.
     """
-    for p in [HISTORY_PATH_XLS, HISTORY_PATH, HISTORY_PATH_ALT, HISTORY_PATH_OLD]:
+    for p in [HISTORY_PATH_ZIP, HISTORY_PATH_XLS, HISTORY_PATH, HISTORY_PATH_ALT, HISTORY_PATH_OLD]:
         if os.path.exists(p):
             return p
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
