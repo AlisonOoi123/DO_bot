@@ -1092,10 +1092,12 @@ def handle_message(phone: str, text: str = None,
             return handle_message(phone, text=f"release {candidate}")
 
     # ── Global: ZSDOROUTEWRH history upload (accepted in any session state) ──
-    # Detected by the LONGITUD column, which is unique to that file.
-    # The file has a metadata row before the real headers, so LONGITUD may
-    # appear in the first data row rather than in the column names themselves —
-    # check both positions.
+    # Detected by the LONGITUD column, which is present in both the master
+    # history file AND in daily DO batches (same format).  To avoid treating a
+    # small DO batch (~500 rows) as the 35k-row master, require a minimum row
+    # count.  The file has a metadata row before the real headers so LONGITUD
+    # may appear in the first data row rather than in column names — check both.
+    _HISTORY_MIN_ROWS = 5000  # DO batches are <1000 rows; master is 35k+
     if file_bytes:
         try:
             _peek = _read_upload_df(file_bytes, file_mime)
@@ -1103,7 +1105,8 @@ def handle_message(phone: str, text: str = None,
             _peek_cols = {str(c).strip().upper() for c in _peek.columns}
             _first_row = (set(_peek.iloc[0].astype(str).str.strip().str.upper())
                           if len(_peek) > 0 else set())
-            if "LONGITUD" in _peek_cols or "LONGITUD" in _first_row:
+            _has_longitud = "LONGITUD" in _peek_cols or "LONGITUD" in _first_row
+            if _has_longitud and len(_peek) >= _HISTORY_MIN_ROWS:
                 return _save_history_as_zip(file_bytes, file_mime)
         except Exception:
             pass  # not Excel — let the state handler deal with it
