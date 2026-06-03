@@ -2191,7 +2191,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                         p for p in _session_loads
                         if _daily_overflow_group(p, group_items)
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _session_incompatible
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -2247,7 +2247,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                                 p for p in _session_loads
                                 if _daily_overflow_group(p, [it])
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _session_incompatible
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -2277,7 +2277,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                         p for p in _session_loads
                         if _daily_overflow_group(p, group_items)
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _session_incompatible
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -2537,7 +2537,15 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             # are never split.  Multi-route lorries use the hard cap exactly.
             _pl_routes = {it.get("ROUTE", "").strip().upper() for it in _pl_items
                           if it.get("ROUTE")}
-            _eff_cap = _cap * (1.05 if len(_pl_routes) == 1 else 1.0)
+            _all_kv_routes = bool(_pl_routes) and all(
+                _DOUBLE_TRIP_RE.match(str(r)) for r in _pl_routes
+            )
+            if _all_kv_routes:
+                _eff_cap = _cap * 2          # KV lorries: morning + afternoon trip
+            elif len(_pl_routes) == 1:
+                _eff_cap = _cap * 1.05       # single-route: 5 % tolerance
+            else:
+                _eff_cap = _cap              # mixed routes: hard cap
             if _total <= _eff_cap:
                 continue
             # Sort by distance from depot — nearest first
@@ -3822,24 +3830,43 @@ def _export_result_inner(sess) -> list[str]:
                            for i in _lorry_rows[pl])
             return 0
 
+        # Date-sort helper for the export GPS ordering
+        def _date_sort_key_exp(s):
+            try:
+                return pd.to_datetime(str(s), format="mixed", dayfirst=True,
+                                      errors="coerce").strftime("%Y-%m-%d")
+            except Exception:
+                return "9999-12-31"
+
         _sorted_idxs: list = []
         for _pl in sorted(_lorry_rows.keys(), key=_lorry_wt, reverse=True):
-            _with_ll, _without_ll = [], []
+            # Group by date first so deliveries on the same date are consecutive.
+            # Within each date apply greedy nearest-neighbour GPS ordering from depot.
+            # This keeps multi-date lorries (e.g. KV double-trip lorries) tidy and
+            # prevents a far-date GPS stop from pulling the pointer away from
+            # today's cluster.
+            _date_buckets_exp: dict[str, list] = {}
             for _i in _lorry_rows[_pl]:
-                _ll = _parse_ll(out_df.at[_i, "LONGITUD"])
-                if _ll:
-                    _with_ll.append((_i, _ll))
-                else:
-                    _without_ll.append(_i)
-            # Greedy nearest-neighbour from depot
-            _cur = _DEP
-            _unvis = list(_with_ll)
-            while _unvis:
-                _near = min(_unvis, key=lambda x: _hav(_cur[0], _cur[1], x[1][0], x[1][1]))
-                _sorted_idxs.append(_near[0])
-                _cur = _near[1]
-                _unvis.remove(_near)
-            _sorted_idxs.extend(_without_ll)
+                _d = _date_sort_key_exp(out_df.at[_i, "DATE"]) if "DATE" in out_df.columns else "9999-12-31"
+                _date_buckets_exp.setdefault(_d, []).append(_i)
+
+            for _dk in sorted(_date_buckets_exp.keys()):
+                _with_ll, _without_ll = [], []
+                for _i in _date_buckets_exp[_dk]:
+                    _ll = _parse_ll(out_df.at[_i, "LONGITUD"])
+                    if _ll:
+                        _with_ll.append((_i, _ll))
+                    else:
+                        _without_ll.append(_i)
+                # Greedy nearest-neighbour from depot within this date
+                _cur = _DEP
+                _unvis = list(_with_ll)
+                while _unvis:
+                    _near = min(_unvis, key=lambda x: _hav(_cur[0], _cur[1], x[1][0], x[1][1]))
+                    _sorted_idxs.append(_near[0])
+                    _cur = _near[1]
+                    _unvis.remove(_near)
+                _sorted_idxs.extend(_without_ll)
 
         _sorted_idxs.extend(_blank_rows)
         out_df = out_df.loc[_sorted_idxs].reset_index(drop=True)
