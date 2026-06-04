@@ -1698,6 +1698,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             bucket_key = it["ROUTE"].strip().upper()
             if it.get("van_only"):
                 bucket_key += "::VAN"
+            elif it.get("small_lorry"):
+                bucket_key += "::SMALL"
             route_buckets[bucket_key].append(it)
 
         # Step 2 — cluster same-way buckets into corridor super-groups
@@ -1745,6 +1747,14 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 _merged_van = any(it.get("van_only") for it in merged_items)
                 _cand_van   = any(it.get("van_only") for it in cand_bucket)
                 if _merged_van != _cand_van:
+                    continue
+
+                # Small-lorry buckets must NEVER merge with non-small buckets.
+                # Mixing them forces the entire merged group to use lorries < 9T,
+                # making it impossible to assign the combined weight to any lorry.
+                _merged_small = any(it.get("small_lorry") for it in merged_items)
+                _cand_small   = any(it.get("small_lorry") for it in cand_bucket)
+                if _merged_small != _cand_small:
                     continue
 
                 if (
@@ -1847,6 +1857,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 # VAN-only groups must not merge with non-VAN groups (Step 4)
                 if any(it.get("van_only") for it in merged) != \
                    any(it.get("van_only") for it in cand_sg):
+                    continue
+
+                # Small-lorry groups must not merge with non-small groups (Step 4)
+                if any(it.get("small_lorry") for it in merged) != \
+                   any(it.get("small_lorry") for it in cand_sg):
                     continue
 
                 combined_w = sum(it["WEIGHT"] for it in merged) + \
