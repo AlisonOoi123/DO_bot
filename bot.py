@@ -68,6 +68,27 @@ _LONG_DIST_KEYWORDS = frozenset({
 # REMARKS "VAN" restricts assignment to only these vehicles.
 _VAN_MAX_TON = 2.0
 
+# Per-lorry strict route reservations.  A lorry listed here may ONLY be
+# assigned to groups whose combined route text contains at least one of the
+# listed keywords.  Any group without a matching keyword will have this lorry
+# excluded from its candidate list (including consolidation, swap, merge and
+# rebalance passes).
+# BQY7823: reserved exclusively for Rawang deliveries.
+_LORRY_STRICT_ROUTE: dict[str, frozenset] = {
+    "BQY7823": frozenset({"RAWANG"}),
+}
+
+
+def _strict_route_excl(group_rt_text: str) -> set[str]:
+    """Return plates excluded by _LORRY_STRICT_ROUTE: lorries whose required
+    route keyword is absent from *group_rt_text*."""
+    excl: set[str] = set()
+    upper = group_rt_text.upper()
+    for plate, kws in _LORRY_STRICT_ROUTE.items():
+        if not any(kw in upper for kw in kws):
+            excl.add(plate.upper())
+    return excl
+
 _SMALL_LORRY_RE = re.compile(
     r'lorry?\s*besar\s*tak\s*boleh|'
     r'lori\s*besar\s*tak\s*boleh|'
@@ -2256,6 +2277,10 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 }
             excluded = excluded | _type_excl
 
+            # Per-lorry strict route reservation (e.g. BQY7823 → Rawang only).
+            _grp_rt_text = " ".join(it.get("ROUTE", "") for it in group_items)
+            excluded = excluded | _strict_route_excl(_grp_rt_text)
+
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
             # session has enough remaining capacity.  Prefer same-corridor lorries
@@ -2604,6 +2629,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) >= _LARGE_LORRY_MIN_TON
                 }
+            _consol_excl |= _strict_route_excl(it.get("ROUTE", ""))
             _cands = [
                 (_daily_min_slack(p, [it]), p)
                 for p in _lorry_cap_map
@@ -2681,6 +2707,14 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     # near-area routes they must stay on a small lorry.
                     if _cap_a >= _LARGE_LORRY_MIN_TON and not _long_dist_group(_pit[_pb]):
                         continue
+                    # Strict-route reservation: after the swap, A carries B's items
+                    # and B carries A's items.  Ensure each lorry's restriction is met.
+                    _b_rt = " ".join(x.get("ROUTE","") for x in _pit[_pb])
+                    _a_rt = " ".join(x.get("ROUTE","") for x in _pit[_pa])
+                    if _pa in _strict_route_excl(_b_rt):  # A cannot carry B's items
+                        continue
+                    if _pb in _strict_route_excl(_a_rt):  # B cannot carry A's items
+                        continue
                     _delta = _load_a - _load_b  # negative = waste reduction
                     if _delta < _best_delta:
                         _best_delta = _delta
@@ -2736,6 +2770,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                         continue
                     # Don't merge near-distance items onto a large lorry (≥ 11T).
                     if _cap_b >= _LARGE_LORRY_MIN_TON and not _long_dist_group(_pit[_pa]):
+                        continue
+                    # Strict-route reservation: destination lorry _pb must be
+                    # allowed to carry source lorry _pa's items.
+                    _pa_rt_text = " ".join(x.get("ROUTE","") for x in _pit[_pa])
+                    if _pb.upper() in _strict_route_excl(_pa_rt_text):
                         continue
                     # Same-route items may fill up to 5 % over rated capacity
                     # so they are never split across lorries unnecessarily.
@@ -2816,6 +2855,10 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                             continue
                         # Don't move near-distance items onto a large lorry (≥ 11T).
                         if _cap_dst >= _LARGE_LORRY_MIN_TON and not _long_dist_group([_it]):
+                            continue
+                        # Strict-route reservation: _dst lorry must be allowed
+                        # to carry this item.
+                        if _dst.upper() in _strict_route_excl(_it.get("ROUTE", "")):
                             continue
                         _gain = _it["WEIGHT"] / _cap_dst
                         if _gain > _best_gain:
