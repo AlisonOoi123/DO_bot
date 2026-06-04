@@ -2107,8 +2107,10 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 single_util = total_w / single_cap if single_cap > 0 else 0
 
                 # Rule 8: tightest-fit lorry would still be <10% loaded → leave blank.
-                # Don't waste a large lorry on a tiny DO; let it be manually reviewed.
-                if single_util < _MIN_UTIL:
+                # Exception: van_only items are inherently light deliveries; skip
+                # the utilisation threshold so the van always gets assigned.
+                _is_van_group = any(it.get("van_only") for it in group_items)
+                if single_util < _MIN_UTIL and not _is_van_group:
                     for it in group_items:
                         it["LORRY"] = "NO_LORRY"
                 else:
@@ -2347,7 +2349,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     if last_resort:
                         lr_cap  = last_resort[0]["TON_CAPACITY"]
                         lr_util = total_w / lr_cap if lr_cap > 0 else 0
-                        if lr_util < _MIN_UTIL:
+                        if lr_util < _MIN_UTIL and not _is_van_group:
                             # Even the smallest available lorry would be <10% loaded
                             for it in group_items:
                                 it["LORRY"] = "NO_LORRY"
