@@ -39,6 +39,27 @@ _DOUBLE_TRIP_RE = re.compile(r'^KV\d', re.IGNORECASE)
 # Maximum tonnage considered "small lorry" for DOs that require restricted access.
 _SMALL_LORRY_MAX_TON = 9.0
 
+# Lorries at or above this tonnage are "large" and must only be assigned to
+# long-distance destinations (Pahang, Negeri Sembilan, Perak, etc.).
+# Urban/near-area routes (KL Valley, KL City) must use lorries strictly < 11T.
+_LARGE_LORRY_MIN_TON = 11.0
+
+# Route clusters that are far enough from depot to warrant a large (≥ 11T) lorry.
+# KL_VALLEY and KL_CITY are urban — large lorries are restricted there.
+_LONG_DIST_CLUSTERS = frozenset({
+    "PAHANG", "NEGERI_SEMBILAN", "PERAK", "JOHOR", "KEDAH",
+    "PENANG", "TERENGGANU", "KELANTAN", "MELAKA", "SABAH", "SARAWAK",
+})
+
+# Route-string keywords that indicate long-distance even for a KL-cluster route
+# (e.g. "KV20A - RAWANG" is a KL_VALLEY route but the destination is far enough
+# that a large lorry is permitted: Rawang, Tanjung Malim, Kemaman, Kampar, PD).
+_LONG_DIST_KEYWORDS = frozenset({
+    "RAWANG", "TANJUNG MALIM", "TANJUNGMALIM", "T.MALIM",
+    "KEMAMAN", "KAMAMAN", "KAMPAR",
+    "PORT DICKSON", "PORTDICKSON",
+})
+
 # Van-type lorries (e.g. VEA2818, VKN8836) — smallest vehicle, ~1T payload.
 # REMARKS "VAN" restricts assignment to only these vehicles.
 _VAN_MAX_TON = 2.0
@@ -2039,6 +2060,20 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 _d = str(_it.get("DATE", ""))
                 dl[_d] = dl.get(_d, 0.0) + _it["WEIGHT"]
 
+        def _long_dist_group(grp) -> bool:
+            """True when any route in grp warrants a large (≥ 11T) lorry.
+            Long-distance: outstation clusters (PH, NS, PK …) OR route string
+            contains a far-suburb keyword (Rawang, Tanjung Malim, Kemaman …).
+            """
+            for _gi in grp:
+                _ri = _extract_route_intelligence(_gi.get("ROUTE", ""))
+                if _ri.get("cluster") in _LONG_DIST_CLUSTERS:
+                    return True
+                _rt_up = _gi.get("ROUTE", "").upper()
+                if any(kw in _rt_up for kw in _LONG_DIST_KEYWORDS):
+                    return True
+            return False
+
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
             All items in the group share the same route (one route = one lorry).
@@ -2149,6 +2184,15 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     str(r["LORRY"]).strip().upper()
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) >= _SMALL_LORRY_MAX_TON
+                }
+            # Long-distance rule: lorries >= 11T are reserved for outstation routes
+            # (Pahang, Seremban, Perak, etc.).  Near-area routes (KL Valley / City)
+            # must use lorries strictly under 11T.
+            if not _long_dist_group(group_items):
+                _type_excl |= {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= _LARGE_LORRY_MIN_TON
                 }
             excluded = excluded | _type_excl
 
@@ -2488,6 +2532,12 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) >= _SMALL_LORRY_MAX_TON
                 }
+            if not _long_dist_group([it]):
+                _consol_excl |= {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= _LARGE_LORRY_MIN_TON
+                }
             _cands = [
                 (_daily_min_slack(p, [it]), p)
                 for p in _lorry_cap_map
@@ -2555,6 +2605,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     # (e.g. KV19A at 92% on BMN3682 should stay there).
                     if _load_a / _cap_b < 0.70:
                         continue
+                    # Don't swap near-distance items onto a large lorry (≥ 11T).
+                    # A is large; after swap A gets B's items. If B's items are
+                    # near-area routes they must stay on a small lorry.
+                    if _cap_a >= _LARGE_LORRY_MIN_TON and not _long_dist_group(_pit[_pb]):
+                        continue
                     _delta = _load_a - _load_b  # negative = waste reduction
                     if _delta < _best_delta:
                         _best_delta = _delta
@@ -2603,6 +2658,9 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     if _route_a and _routes_b:
                         if not any(_routes_on_same_way(_route_a, _rb) for _rb in _routes_b):
                             continue
+                    # Don't merge near-distance items onto a large lorry (≥ 11T).
+                    if _cap_b >= _LARGE_LORRY_MIN_TON and not _long_dist_group(_pit[_pa]):
+                        continue
                     # Same-route items may fill up to 5 % over rated capacity
                     # so they are never split across lorries unnecessarily.
                     _same_rt = bool(_route_a and _route_a in _routes_b)
@@ -2675,6 +2733,9 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                         if _routes_dst and _route_it:
                             if not any(_routes_on_same_way(_route_it, _rd) for _rd in _routes_dst):
                                 continue
+                        # Don't move near-distance items onto a large lorry (≥ 11T).
+                        if _cap_dst >= _LARGE_LORRY_MIN_TON and not _long_dist_group([_it]):
+                            continue
                         _gain = _it["WEIGHT"] / _cap_dst
                         if _gain > _best_gain:
                             _best_gain = _gain
