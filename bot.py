@@ -1544,20 +1544,38 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
         sess["is_new_format"] = IS_NEW_FORMAT
 
         # ── Pre-filled detection ─────────────────────────────────────────────
-        # If the uploaded Excel already has LICENSE plates in it, the user is
-        # importing a completed assignment sheet (not asking us to auto-assign).
-        # Read those plates, register them as assigned today, and show a summary.
-        SENTINELS_STR = {"", "nan", "none", "n/a", "-"}
-        prefilled_rows = raw[
-            raw["LICENSE"].astype(str).str.strip().str.lower()
-            .isin(SENTINELS_STR) == False
-        ].copy()
+        # Two cases:
+        #   A) ALL rows already have plates → completed import; register + summarise.
+        #   B) SOME rows have plates, SOME are empty → partial file (e.g. re-upload
+        #      after a previous run with VAN rows still unassigned).  Register the
+        #      pre-filled plates so those lorries count as capacity-used today, then
+        #      fall through to auto-assign the remaining blank rows.  Item-building
+        #      below will preserve existing plates in pre-filled rows.
+        SENTINELS_STR = {"", "nan", "none", "n/a", "-",
+                         "no_lorry", "split", "skipped", "other_user"}
+        _lic_lower = raw["LICENSE"].astype(str).str.strip().str.lower()
+        prefilled_rows = raw[_lic_lower.isin(SENTINELS_STR) == False].copy()
+        _empty_lic_count = int(_lic_lower.isin(SENTINELS_STR).sum())
 
         if not prefilled_rows.empty:
-            result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows)
-            if result is not None:
-                return result
-            # result is None → all plates were sentinels, fall through to auto-assign
+            if _empty_lic_count == 0:
+                # Case A: fully pre-filled — register, summarise, and stop.
+                result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows)
+                if result is not None:
+                    return result
+            else:
+                # Case B: partial file — register plates so capacity tracking works,
+                # but continue to auto-assign the unassigned rows.
+                _pf_sentinel_up = {"", "NAN", "NONE", "N/A", "-",
+                                   "NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER"}
+                _pf_plates = [
+                    p.strip().upper()
+                    for _lic in prefilled_rows["LICENSE"].astype(str).tolist()
+                    for p in _lic.split(",")
+                    if p.strip().upper() not in _pf_sentinel_up
+                ]
+                if _pf_plates:
+                    record_assignments_today(_pf_plates)
 
         # ── Build item list: one item per Excel row ─────────────────────────
         # Each row is an independent item that needs its own lorry.
@@ -1570,6 +1588,9 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
         # blank LICENSE in the exported file.
         _user_prefixes = _load_user_route_prefixes(sess.get("user_id", ""))
 
+        _PREFILL_SENTINELS = {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER",
+                              "", "NAN", "NONE", "N/A", "-"}
+
         items = []
         _other_user_count = 0
         for idx, row in raw.iterrows():
@@ -1581,6 +1602,13 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     _is_mine = False
                     _other_user_count += 1
 
+            # Preserve an existing plate from a previous assignment run so this row
+            # is not re-assigned.  Route-bucket building (Step 1) skips these items.
+            _prefill_pl = str(row.get("LICENSE", "")).strip().upper() \
+                          if "LICENSE" in raw.columns else ""
+            if _prefill_pl in _PREFILL_SENTINELS:
+                _prefill_pl = ""
+
             items.append({
                 "ROW_IDX":       idx,
                 "DO NUMBER":     str(row["DO NUMBER"]).strip(),
@@ -1590,7 +1618,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
                 "DATE":          str(row.get("DATE", "")).strip(),
-                "LORRY":         None if _is_mine else "OTHER_USER",
+                "LORRY":         _prefill_pl or (None if _is_mine else "OTHER_USER"),
                 "SPLIT_LORRIES": None,
                 "small_lorry":   _requires_small_lorry(row.get("REMARKS", "")),
                 "van_only":      _requires_van_only(row.get("REMARKS", "")),
@@ -1655,7 +1683,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
         # group, making the non-VAN items (which may total 14 T) unassignable.
         route_buckets: dict[str, list] = defaultdict(list)
         for it in items:
-            if it.get("LORRY") == "OTHER_USER":
+            if it.get("LORRY") is not None:
+                # Already assigned (pre-filled plate or OTHER_USER) — skip
                 continue
             bucket_key = it["ROUTE"].strip().upper()
             if it.get("van_only"):
