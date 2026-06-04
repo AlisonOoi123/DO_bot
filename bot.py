@@ -1551,10 +1551,16 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
         #      pre-filled plates so those lorries count as capacity-used today, then
         #      fall through to auto-assign the remaining blank rows.  Item-building
         #      below will preserve existing plates in pre-filled rows.
+        #
+        # NOTE: pd.Series.astype(str).str operations leave pd.NA/NaN as NaN rather
+        # than converting to the string 'nan', so isin({'nan'}) misses those cells.
+        # Use apply()+pd.isna() to reliably normalise every cell to a plain string.
         SENTINELS_STR = {"", "nan", "none", "n/a", "-",
                          "no_lorry", "split", "skipped", "other_user"}
-        _lic_lower = raw["LICENSE"].astype(str).str.strip().str.lower()
-        prefilled_rows = raw[_lic_lower.isin(SENTINELS_STR) == False].copy()
+        _lic_lower = raw["LICENSE"].apply(
+            lambda v: "" if pd.isna(v) else str(v).strip().lower()
+        )
+        prefilled_rows = raw[~_lic_lower.isin(SENTINELS_STR)].copy()
         _empty_lic_count = int(_lic_lower.isin(SENTINELS_STR).sum())
 
         if not prefilled_rows.empty:
@@ -1570,7 +1576,9 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                                    "NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER"}
                 _pf_plates = [
                     p.strip().upper()
-                    for _lic in prefilled_rows["LICENSE"].astype(str).tolist()
+                    for _lic in prefilled_rows["LICENSE"].apply(
+                        lambda v: "" if pd.isna(v) else str(v)
+                    ).tolist()
                     for p in _lic.split(",")
                     if p.strip().upper() not in _pf_sentinel_up
                 ]
@@ -1604,8 +1612,9 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
 
             # Preserve an existing plate from a previous assignment run so this row
             # is not re-assigned.  Route-bucket building (Step 1) skips these items.
-            _prefill_pl = str(row.get("LICENSE", "")).strip().upper() \
-                          if "LICENSE" in raw.columns else ""
+            # Use pd.isna() so StringDtype pd.NA cells are treated as empty.
+            _raw_lic = row.get("LICENSE", "") if "LICENSE" in raw.columns else ""
+            _prefill_pl = "" if pd.isna(_raw_lic) else str(_raw_lic).strip().upper()
             if _prefill_pl in _PREFILL_SENTINELS:
                 _prefill_pl = ""
 
