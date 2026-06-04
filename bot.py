@@ -3871,17 +3871,60 @@ def _export_result_inner(sess) -> list[str]:
         _sorted_idxs.extend(_blank_rows)
         out_df = out_df.loc[_sorted_idxs].reset_index(drop=True)
 
-    # ── TRIP column for KV (Selangor/KL) double-trip routes ──────────────────
-    # KV lorries (KV01A–KV25A) cover short urban routes and can complete a
-    # morning trip (TRIP=1) and afternoon trip (TRIP=2) in the same day.
-    # After GPS reordering: fill Trip 1 to single-lorry capacity, then Trip 2.
-    # Non-KV rows and unassigned rows get an empty TRIP value.
+    # ── TIME SLOT + TRIP columns for KV (Selangor/KL) double-trip routes ───────
+    # TIME SLOT: parsed from REMARKS — "MORNING" | "AFTERNOON" | "" (flexible).
+    #   Examples: "9.00 - 11.00" → MORNING, "14.00 - 17.00" → AFTERNOON,
+    #             no time → flexible (GPS + weight-fill decides the trip).
+    # TRIP: 1 (morning) | 2 (afternoon) | "" (non-KV rows).
+    #   Time-constrained rows fill their fixed slot first; flexible rows pack
+    #   the remaining capacity of Trip 1 then spill into Trip 2.
+    # Only inserted when at least one KV row exists.  Manifest unchanged.
     if "LICENSE" in out_df.columns and "ROUTE" in out_df.columns:
+        import re as _re2
+
+        def _remarks_time_slot(v) -> int | None:
+            """Return 1 (morning), 2 (afternoon), or None (no constraint)."""
+            s = str(v).strip()
+            if not s or s.lower() in ("nan", "none", "-", ""):
+                return None
+            u = s.upper()
+            # Explicit keywords (also handle Malay pagi/petang)
+            if any(k in u for k in ("MORNING", "PAGI")):
+                return 1
+            if any(k in u for k in ("AFTERNOON", "PETANG")):
+                return 2
+            # "7AM", "7 AM", "14PM", "4 PM" — digit directly attached to AM/PM
+            m = _re2.search(r'(\d{1,2})\s*(AM|PM)\b', u)
+            if m:
+                h, suf = int(m.group(1)), m.group(2)
+                if suf == "AM":
+                    return 1
+                # PM: 12PM = noon (treat as afternoon), others are afternoon
+                return 2
+            # "9.00 - 11.00" or "08:30 - 17:00" — HH.MM / HH:MM separator
+            m = _re2.search(r'\b(\d{1,2})[.:](\d{2})', u)
+            if m:
+                return 1 if int(m.group(1)) < 12 else 2
+            return None
+
         _engine_out = sess.get("engine")
         _cap_map_out: dict[str, float] = {}
         if _engine_out is not None:
             for _, _er in _engine_out.eligible_lorries.iterrows():
                 _cap_map_out[str(_er["LORRY"]).strip().upper()] = float(_er["TON"])
+
+        # Build per-row time preference from REMARKS (before rebuilding lorry map)
+        _rem_col = "REMARKS" if "REMARKS" in out_df.columns else None
+        _row_slot: dict[int, int | None] = {}   # row_idx → 1, 2, or None
+        _slot_col_vals = [""] * len(out_df)
+        for _ri in range(len(out_df)):
+            _rv = out_df.at[_ri, _rem_col] if _rem_col else None
+            _pref = _remarks_time_slot(_rv)
+            _row_slot[_ri] = _pref
+            if _pref == 1:
+                _slot_col_vals[_ri] = "MORNING"
+            elif _pref == 2:
+                _slot_col_vals[_ri] = "AFTERNOON"
 
         # Rebuild lorry→row-index mapping after reset_index
         _lrows_out: dict[str, list] = {}
@@ -3906,23 +3949,43 @@ def _export_result_inner(sess) -> list[str]:
             for _i in _kv_idxs:
                 _d2 = str(out_df.at[_i, "DATE"]).strip()
                 _dg2.setdefault(_d2, []).append(_i)
+
             for _d2, _di2 in _dg2.items():
-                _run2 = 0.0
-                _trip_num = 1
-                for _i in _di2:
-                    _gw2 = pd.to_numeric(out_df.at[_i, "GROSS WEIGHT"], errors="coerce")
-                    _wt2 = float(_gw2) / 1000.0 if not pd.isna(_gw2) else 0.0
-                    if _trip_num == 1 and _run2 + _wt2 > _cap2 + 0.001:
-                        _trip_num = 2
-                        _run2 = 0.0
-                    _trip_col_vals[_i] = str(_trip_num)
-                    _kv_trip_map[_i] = _trip_num
-                    _run2 += _wt2
+                # Split by time constraint (GPS order preserved within each group)
+                _m_fix  = [i for i in _di2 if _row_slot.get(i) == 1]   # must-morning
+                _a_fix  = [i for i in _di2 if _row_slot.get(i) == 2]   # must-afternoon
+                _flex   = [i for i in _di2 if _row_slot.get(i) is None] # flexible
+
+                def _gw_t(idx):
+                    g = pd.to_numeric(out_df.at[idx, "GROSS WEIGHT"], errors="coerce")
+                    return float(g) / 1000.0 if not pd.isna(g) else 0.0
+
+                # Trip 1: morning-fixed first (always honoured), then flexible fill
+                _t1, _t2 = list(_m_fix), list(_a_fix)
+                _run1 = sum(_gw_t(i) for i in _t1)
+                for _i in _flex:
+                    if _run1 + _gw_t(_i) <= _cap2 + 0.001:
+                        _t1.append(_i)
+                        _run1 += _gw_t(_i)
+                    else:
+                        _t2.append(_i)   # spill flexible overflow to trip 2
+
+                for _i in _t1:
+                    _trip_col_vals[_i] = "1"
+                    _kv_trip_map[_i] = 1
+                for _i in _t2:
+                    _trip_col_vals[_i] = "2"
+                    _kv_trip_map[_i] = 2
 
         if any(_trip_col_vals):
             _lic_loc = out_df.columns.get_loc("LICENSE")
             out_df.insert(_lic_loc, "TRIP", _trip_col_vals)
+            out_df.insert(_lic_loc, "TIME SLOT", _slot_col_vals)
             sess["_kv_trip_map"] = _kv_trip_map   # pass to trip manifest
+        elif any(_slot_col_vals):
+            # Non-KV file with REMARKS times: still show TIME SLOT for visibility
+            _lic_loc = out_df.columns.get_loc("LICENSE")
+            out_df.insert(_lic_loc, "TIME SLOT", _slot_col_vals)
 
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
