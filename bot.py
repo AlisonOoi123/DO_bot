@@ -1906,13 +1906,14 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
 
         def _daily_overflow_group(lorry: str, grp) -> bool:
             """True if assigning grp to lorry would exceed its capacity on ANY date.
-            KV (Selangor/KL) routes allow 2 trips/day → effective cap = 2×."""
+            KV (Selangor/KL) routes allow 2 trips/day for lorries < 9T only."""
             cap = float(_lorry_cap_map.get(lorry, 0.0))
             if cap <= 0:
                 return True
             _grp_kv   = any(_DOUBLE_TRIP_RE.match(str(_it.get("ROUTE", ""))) for _it in grp)
             _lorry_kv = bool(_DOUBLE_TRIP_RE.match(str(_session_routes.get(lorry, ""))))
-            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) else cap
+            _is_small = cap < _SMALL_LORRY_MAX_TON
+            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) and _is_small else cap
             dl = _daily_loads.get(lorry, {})
             by_date: dict[str, float] = {}
             for _it in grp:
@@ -1925,7 +1926,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             cap = float(_lorry_cap_map.get(lorry, 0.0))
             _grp_kv   = any(_DOUBLE_TRIP_RE.match(str(_it.get("ROUTE", ""))) for _it in grp)
             _lorry_kv = bool(_DOUBLE_TRIP_RE.match(str(_session_routes.get(lorry, ""))))
-            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) else cap
+            _is_small = cap < _SMALL_LORRY_MAX_TON
+            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) and _is_small else cap
             dl    = _daily_loads.get(lorry, {})
             dates = {str(_it.get("DATE", "")) for _it in grp}
             return min((_eff_cap - dl.get(_d, 0.0) for _d in dates), default=_eff_cap)
@@ -2581,8 +2583,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             _all_kv_routes = bool(_pl_routes) and all(
                 _DOUBLE_TRIP_RE.match(str(r)) for r in _pl_routes
             )
-            if _all_kv_routes:
-                _eff_cap = _cap * 2          # KV lorries: morning + afternoon trip
+            if _all_kv_routes and _cap < _SMALL_LORRY_MAX_TON:
+                _eff_cap = _cap * 2          # small KV lorries only: 2 trips/day
             elif len(_pl_routes) == 1:
                 _eff_cap = _cap * 1.05       # single-route: 5 % tolerance
             else:
@@ -3979,6 +3981,9 @@ def _export_result_inner(sess) -> list[str]:
         for _pl2, _idxs2 in _lrows_out.items():
             _cap2 = _cap_map_out.get(_pl2, 0.0)
             if _cap2 <= 0:
+                continue
+            # Only small lorries (< 9T) can do 2 trips per day on KV routes.
+            if _cap2 >= _SMALL_LORRY_MAX_TON:
                 continue
             # Only process rows that belong to a KV route
             _kv_idxs = [_i for _i in _idxs2
