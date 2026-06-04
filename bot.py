@@ -62,6 +62,7 @@ _LONG_DIST_KEYWORDS = frozenset({
     "RAWANG", "TANJUNG MALIM", "TANJUNGMALIM", "T.MALIM",
     "KEMAMAN", "KAMAMAN", "KAMPAR",
     "PORT DICKSON", "PORTDICKSON",
+    "SEREMBAN", "KUALA PILAH", "KUALAPILAH",
 })
 
 # Van-type lorries (e.g. VEA2818, VKN8836) — smallest vehicle, ~1T payload.
@@ -2056,7 +2057,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
         _SORT_PRI1_CLUSTERS  = {"PERAK"}
         _SORT_PRI1_KEYWORDS  = {"RAWANG", "TANJUNG MALIM", "TANJUNGMALIM", "T.MALIM",
                                  "PORT DICKSON", "PORTDICKSON",
-                                 "KEMAMAN", "KAMAMAN", "KAMPAR"}
+                                 "KEMAMAN", "KAMAMAN", "KAMPAR",
+                                 "SEREMBAN", "KUALA PILAH", "KUALAPILAH"}
 
         def _group_sort_key(g):
             """Sort key: (date, corridor_priority, -weight).
@@ -2138,8 +2140,12 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 return True
             _grp_kv   = any(_DOUBLE_TRIP_RE.match(str(_it.get("ROUTE", ""))) for _it in grp)
             _lorry_kv = bool(_DOUBLE_TRIP_RE.match(str(_session_routes.get(lorry, ""))))
-            _is_small = cap < _SMALL_LORRY_MAX_TON
-            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) and _is_small else cap
+            # Allow double-trip capacity for any lorry below the large-lorry threshold
+            # (i.e. lorries ≤10.8T like BQX9983, BMN3682, and smaller) when serving
+            # KL/Selangor (KV) routes.  Large lorries (≥11T) make cross-state runs
+            # that occupy the full day and are never double-tripped.
+            _is_kl_size = cap < _LARGE_LORRY_MIN_TON
+            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) and _is_kl_size else cap
             dl = _daily_loads.get(lorry, {})
             by_date: dict[str, float] = {}
             for _it in grp:
@@ -2152,8 +2158,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             cap = float(_lorry_cap_map.get(lorry, 0.0))
             _grp_kv   = any(_DOUBLE_TRIP_RE.match(str(_it.get("ROUTE", ""))) for _it in grp)
             _lorry_kv = bool(_DOUBLE_TRIP_RE.match(str(_session_routes.get(lorry, ""))))
-            _is_small = cap < _SMALL_LORRY_MAX_TON
-            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) and _is_small else cap
+            _is_kl_size = cap < _LARGE_LORRY_MIN_TON
+            _eff_cap  = cap * 2 if (_grp_kv or _lorry_kv) and _is_kl_size else cap
             dl    = _daily_loads.get(lorry, {})
             dates = {str(_it.get("DATE", "")) for _it in grp}
             return min((_eff_cap - dl.get(_d, 0.0) for _d in dates), default=_eff_cap)
