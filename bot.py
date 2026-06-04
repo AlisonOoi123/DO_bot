@@ -75,6 +75,11 @@ _VAN_MAX_TON = 2.0
 # rebalance passes).
 # BQY7823: reserved exclusively for Rawang deliveries.
 _LORRY_STRICT_ROUTE: dict[str, frozenset] = {
+    # BQU3875 (21T) is the largest lorry — reserved for Pahang routes only.
+    # All Pahang route codes start with "PH" (PH09-Kuantan, PH06-Temerloh,
+    # PH03-Bentong, etc.).  Urban and near-distance routes must not use it.
+    "BQU3875": frozenset({"PH"}),
+    # BQY7823 (14.54T) is reserved exclusively for Rawang deliveries.
     "BQY7823": frozenset({"RAWANG"}),
 }
 
@@ -1746,6 +1751,20 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             MIN_UTIL_TO_ASSIGN  as _MIN_UTIL,
         )
 
+        def _long_dist_group(grp) -> bool:
+            """True when any route in grp warrants a large (≥ 11T) lorry.
+            Long-distance: outstation clusters (PH, NS, PK …) OR route string
+            contains a far-suburb keyword (Rawang, Tanjung Malim, Kemaman …).
+            """
+            for _gi in grp:
+                _ri = _extract_route_intelligence(_gi.get("ROUTE", ""))
+                if _ri.get("cluster") in _LONG_DIST_CLUSTERS:
+                    return True
+                _rt_up = _gi.get("ROUTE", "").upper()
+                if any(kw in _rt_up for kw in _LONG_DIST_KEYWORDS):
+                    return True
+            return False
+
         # Step 1 — exact-route buckets (skip other-user rows — they stay blank)
         # VAN-only items are bucketed under a separate key ("<ROUTE>::VAN") so
         # they form their own group.  Mixing them with regular items would cause
@@ -1824,6 +1843,16 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 _merged_small = any(it.get("small_lorry") for it in merged_items)
                 _cand_small   = any(it.get("small_lorry") for it in cand_bucket)
                 if _merged_small != _cand_small:
+                    continue
+
+                # Long-distance routes (RAWANG, T.MALIM, Pahang, etc.) must
+                # NEVER merge with near-area routes in Step 2.  Without this,
+                # a RAWANG bucket (KV02A) can absorb KV04A/KV06A and the
+                # combined group looks long-distance, which lets large lorries
+                # (≥ 11T, e.g. BQU3875) be assigned to urban deliveries.
+                _merged_ld = _long_dist_group(merged_items)
+                _cand_ld   = _long_dist_group(list(cand_bucket))
+                if _merged_ld != _cand_ld:
                     continue
 
                 if (
@@ -2135,20 +2164,6 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             for _it in items:
                 _d = str(_it.get("DATE", ""))
                 dl[_d] = dl.get(_d, 0.0) + _it["WEIGHT"]
-
-        def _long_dist_group(grp) -> bool:
-            """True when any route in grp warrants a large (≥ 11T) lorry.
-            Long-distance: outstation clusters (PH, NS, PK …) OR route string
-            contains a far-suburb keyword (Rawang, Tanjung Malim, Kemaman …).
-            """
-            for _gi in grp:
-                _ri = _extract_route_intelligence(_gi.get("ROUTE", ""))
-                if _ri.get("cluster") in _LONG_DIST_CLUSTERS:
-                    return True
-                _rt_up = _gi.get("ROUTE", "").upper()
-                if any(kw in _rt_up for kw in _LONG_DIST_KEYWORDS):
-                    return True
-            return False
 
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
