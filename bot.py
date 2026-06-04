@@ -1649,11 +1649,18 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
         )
 
         # Step 1 — exact-route buckets (skip other-user rows — they stay blank)
+        # VAN-only items are bucketed under a separate key ("<ROUTE>::VAN") so
+        # they form their own group.  Mixing them with regular items would cause
+        # _type_excl to exclude every lorry > van threshold from the combined
+        # group, making the non-VAN items (which may total 14 T) unassignable.
         route_buckets: dict[str, list] = defaultdict(list)
         for it in items:
             if it.get("LORRY") == "OTHER_USER":
                 continue
-            route_buckets[it["ROUTE"].strip().upper()].append(it)
+            bucket_key = it["ROUTE"].strip().upper()
+            if it.get("van_only"):
+                bucket_key += "::VAN"
+            route_buckets[bucket_key].append(it)
 
         # Step 2 — cluster same-way buckets into corridor super-groups
         # Each super-group is a list of route-bucket lists.
@@ -1682,9 +1689,21 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                              sum(it["WEIGHT"] for it in cand_bucket)
                 n_distinct = len({it["ROUTE"] for it in merged_items}) + 1
 
+                # Long-distance routes (Kuantan, Pahang, Seremban, etc.) must
+                # each get their own dedicated lorry.  If the two route centroids
+                # are more than 80 km apart the destinations are different enough
+                # that a single driver cannot serve both in one trip.
+                _ci = _route_centroid(base_route)
+                _cj = _route_centroid(cand_route)
+                _spread = (
+                    _haversine_km(_ci[0], _ci[1], _cj[0], _cj[1])
+                    if _ci and _cj else 0.0
+                )
+
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
+                    and _spread <= 80.0
                     and _routes_on_same_way(base_route, cand_route)
                 ):
                     merged_items += list(cand_bucket)
