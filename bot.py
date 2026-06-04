@@ -39,6 +39,10 @@ _DOUBLE_TRIP_RE = re.compile(r'^KV\d', re.IGNORECASE)
 # Maximum tonnage considered "small lorry" for DOs that require restricted access.
 _SMALL_LORRY_MAX_TON = 9.0
 
+# Van-type lorries (e.g. VEA2818, VKN8836) — smallest vehicle, ~1T payload.
+# REMARKS "VAN" restricts assignment to only these vehicles.
+_VAN_MAX_TON = 2.0
+
 _SMALL_LORRY_RE = re.compile(
     r'lorry?\s*besar\s*tak\s*boleh|'
     r'lori\s*besar\s*tak\s*boleh|'
@@ -57,6 +61,15 @@ def _requires_small_lorry(remarks) -> bool:
     if not s or s.lower() in ("nan", "none", "-", ""):
         return False
     return bool(_SMALL_LORRY_RE.search(s))
+
+_VAN_ONLY_RE = re.compile(r'\bVAN\b', re.IGNORECASE)
+
+def _requires_van_only(remarks) -> bool:
+    """Return True when REMARKS say 'VAN' — only van-type lorries (≤ 2T) can be used."""
+    s = str(remarks).strip()
+    if not s or s.lower() in ("nan", "none", "-", ""):
+        return False
+    return bool(_VAN_ONLY_RE.search(s))
 
 
 def _load_user_route_prefixes(user: str) -> set | None:
@@ -1580,6 +1593,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 "LORRY":         None if _is_mine else "OTHER_USER",
                 "SPLIT_LORRIES": None,
                 "small_lorry":   _requires_small_lorry(row.get("REMARKS", "")),
+                "van_only":      _requires_van_only(row.get("REMARKS", "")),
             })
 
         sess["items"]      = items          # row-level item list
@@ -2028,15 +2042,20 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             }
             excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
 
-            # Small-lorry constraint: if any DO in the group requires restricted
-            # site access, exclude all lorries ≥ 9T.
-            if any(it.get("small_lorry") for it in group_items):
-                _large_lorries = {
+            # Vehicle-type constraint from REMARKS.
+            # van_only > small_lorry; both restrict the candidate pool.
+            if any(it.get("van_only") for it in group_items):
+                excluded = excluded | {
+                    str(row["LORRY"]).strip().upper()
+                    for _, row in engine.eligible_lorries.iterrows()
+                    if float(row["TON"]) > _VAN_MAX_TON
+                }
+            elif any(it.get("small_lorry") for it in group_items):
+                excluded = excluded | {
                     str(row["LORRY"]).strip().upper()
                     for _, row in engine.eligible_lorries.iterrows()
                     if float(row["TON"]) >= _SMALL_LORRY_MAX_TON
                 }
-                excluded = excluded | _large_lorries
 
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
@@ -2357,7 +2376,13 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             w = it["WEIGHT"]
             # Build candidates: lorries that can accept this item on its date
             _consol_excl = set(_excl_consol)
-            if it.get("small_lorry"):
+            if it.get("van_only"):
+                _consol_excl |= {
+                    str(row["LORRY"]).strip().upper()
+                    for _, row in engine.eligible_lorries.iterrows()
+                    if float(row["TON"]) > _VAN_MAX_TON
+                }
+            elif it.get("small_lorry"):
                 _consol_excl |= {
                     str(row["LORRY"]).strip().upper()
                     for _, row in engine.eligible_lorries.iterrows()
@@ -3925,26 +3950,83 @@ def _export_result_inner(sess) -> list[str]:
     if "LICENSE" in out_df.columns and "ROUTE" in out_df.columns:
         import re as _re2
 
-        def _remarks_time_slot(v) -> int | None:
-            """Return 1 (morning), 2 (afternoon), or None (no constraint)."""
+        # Day-name → weekday (0=Mon … 6=Sun). Longest names first to avoid
+        # "MON" swallowing "MONDAY" in alternation.
+        _SLOT_DAY_MAP = [
+            ("MONDAY", 0), ("TUESDAY", 1), ("WEDNESDAY", 2), ("THURSDAY", 3),
+            ("FRIDAY", 4), ("SATURDAY", 5), ("SUNDAY", 6),
+            ("ISNIN", 0), ("SELASA", 1), ("RABU", 2), ("KHAMIS", 3),
+            ("JUMAAT", 4), ("SABTU", 5), ("AHAD", 6),
+            ("TUES", 1), ("THURS", 3), ("THUR", 3),
+            ("MON", 0), ("WED", 2), ("THU", 3), ("FRI", 4), ("SAT", 5), ("SUN", 6),
+            ("TUE", 1),
+        ]
+
+        def _remarks_time_slot(v, delivery_date=None) -> int | None:
+            """Return 1 (morning), 2 (afternoon), or None (no constraint).
+            delivery_date: item DATE value — used to check day-specific clauses.
+            Strategy:
+              1. Explicit MORNING/PAGI or AFTERNOON/PETANG keyword.
+              2. Segment the remark by <> () & ; delimiters, then within each
+                 segment look for a matching day name + BEFORE/AFTER.
+              3. General BEFORE/UNTIL → morning; AFTER → afternoon (only when
+                 no day names are present, to avoid mis-firing on a clause
+                 meant for a different day).
+              4. Fall back to first AM/PM or HH:MM found in text.
+            """
             s = str(v).strip()
             if not s or s.lower() in ("nan", "none", "-", ""):
                 return None
             u = s.upper()
-            # Explicit keywords (also handle Malay pagi/petang)
+
             if any(k in u for k in ("MORNING", "PAGI")):
                 return 1
             if any(k in u for k in ("AFTERNOON", "PETANG")):
                 return 2
-            # "7AM", "7 AM", "14PM", "4 PM" — digit directly attached to AM/PM
+
+            # Delivery weekday from DATE field
+            _wd = None
+            if delivery_date:
+                try:
+                    _dt = pd.to_datetime(str(delivery_date), dayfirst=True, errors="coerce")
+                    if not pd.isna(_dt):
+                        _wd = _dt.weekday()
+                except Exception:
+                    pass
+
+            # Split into segments so "FRI AFTER 2.30PM" inside parentheses
+            # doesn't bleed into an adjacent "SAT" clause and vice-versa.
+            _segs = _re2.split(r'[<>()\[\]&;]+', u)
+
+            if _wd is not None:
+                for _seg in _segs:
+                    _seg = _seg.strip()
+                    for _dname, _dnum in _SLOT_DAY_MAP:
+                        if _wd != _dnum:
+                            continue
+                        if not _re2.search(r'\b' + _dname + r'\b', _seg):
+                            continue
+                        if _re2.search(r'\bBEFORE\b|\bUNTIL\b', _seg):
+                            return 1
+                        if _re2.search(r'\bAFTER\b', _seg):
+                            return 2
+
+            # General BEFORE/AFTER — only when no day names appear anywhere,
+            # so we don't mis-fire on a clause for a different day.
+            _has_day = any(
+                _re2.search(r'\b' + dn + r'\b', u)
+                for dn, _ in _SLOT_DAY_MAP
+            )
+            if not _has_day:
+                if _re2.search(r'\bBEFORE\b|\bUNTIL\b', u):
+                    return 1
+                if _re2.search(r'\bAFTER\b', u):
+                    return 2
+
+            # Fall back to first AM/PM or HH:MM time found
             m = _re2.search(r'(\d{1,2})\s*(AM|PM)\b', u)
             if m:
-                h, suf = int(m.group(1)), m.group(2)
-                if suf == "AM":
-                    return 1
-                # PM: 12PM = noon (treat as afternoon), others are afternoon
-                return 2
-            # "9.00 - 11.00" or "08:30 - 17:00" — HH.MM / HH:MM separator
+                return 1 if m.group(2) == "AM" else 2
             m = _re2.search(r'\b(\d{1,2})[.:](\d{2})', u)
             if m:
                 return 1 if int(m.group(1)) < 12 else 2
@@ -3962,7 +4044,8 @@ def _export_result_inner(sess) -> list[str]:
         _slot_col_vals = [""] * len(out_df)
         for _ri in range(len(out_df)):
             _rv = out_df.at[_ri, _rem_col] if _rem_col else None
-            _pref = _remarks_time_slot(_rv)
+            _rd = out_df.at[_ri, "DATE"] if "DATE" in out_df.columns else None
+            _pref = _remarks_time_slot(_rv, delivery_date=_rd)
             _row_slot[_ri] = _pref
             if _pref == 1:
                 _slot_col_vals[_ri] = "MORNING"
