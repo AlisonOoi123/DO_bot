@@ -36,6 +36,29 @@ ROUTE_CODES_PATH = os.path.join(_DATA_DIR, "route_codes.xlsx")                  
 # that can complete two full lorry loads per day (morning trip + afternoon trip).
 _DOUBLE_TRIP_RE = re.compile(r'^KV\d', re.IGNORECASE)
 
+# Maximum tonnage considered "small lorry" for DOs that require restricted access.
+_SMALL_LORRY_MAX_TON = 9.0
+
+_SMALL_LORRY_RE = re.compile(
+    r'lorry?\s*besar\s*tak\s*boleh|'
+    r'lori\s*besar\s*tak\s*boleh|'
+    r'tak\s*boleh\s*masuk\s*lor[ry]?\s*besar|'
+    r'tidak\s*boleh\s*masuk\s*lor[ry]?\s*besar|'
+    r'small\s*lor[ry]|'
+    r'small\s*truck|'
+    r'kecil\s*(sahaja|only)|'
+    r'lor[ry]?\s*kecil\s*(sahaja|only)',
+    re.IGNORECASE,
+)
+
+def _requires_small_lorry(remarks) -> bool:
+    """Return True when REMARKS indicate only a lorry < 9T can enter the site."""
+    s = str(remarks).strip()
+    if not s or s.lower() in ("nan", "none", "-", ""):
+        return False
+    return bool(_SMALL_LORRY_RE.search(s))
+
+
 def _load_user_route_prefixes(user: str) -> set | None:
     """Return the set of route-code prefixes (e.g. 'KV19A', 'PH09') assigned to
     *user* (case-insensitive).
@@ -1556,6 +1579,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 "DATE":          str(row.get("DATE", "")).strip(),
                 "LORRY":         None if _is_mine else "OTHER_USER",
                 "SPLIT_LORRIES": None,
+                "small_lorry":   _requires_small_lorry(row.get("REMARKS", "")),
             })
 
         sess["items"]      = items          # row-level item list
@@ -2002,6 +2026,16 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             }
             excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
 
+            # Small-lorry constraint: if any DO in the group requires restricted
+            # site access, exclude all lorries ≥ 9T.
+            if any(it.get("small_lorry") for it in group_items):
+                _large_lorries = {
+                    str(row["LORRY"]).strip().upper()
+                    for _, row in engine.eligible_lorries.iterrows()
+                    if float(row["TON"]) >= _SMALL_LORRY_MAX_TON
+                }
+                excluded = excluded | _large_lorries
+
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
             # session has enough remaining capacity.  Prefer same-corridor lorries
@@ -2320,11 +2354,18 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 continue
             w = it["WEIGHT"]
             # Build candidates: lorries that can accept this item on its date
+            _consol_excl = set(_excl_consol)
+            if it.get("small_lorry"):
+                _consol_excl |= {
+                    str(row["LORRY"]).strip().upper()
+                    for _, row in engine.eligible_lorries.iterrows()
+                    if float(row["TON"]) >= _SMALL_LORRY_MAX_TON
+                }
             _cands = [
                 (_daily_min_slack(p, [it]), p)
                 for p in _lorry_cap_map
                 if not _daily_overflow_group(p, [it])
-                and p not in _excl_consol
+                and p not in _consol_excl
             ]
             if not _cands:
                 continue
@@ -3980,12 +4021,7 @@ def _export_result_inner(sess) -> list[str]:
         if any(_trip_col_vals):
             _lic_loc = out_df.columns.get_loc("LICENSE")
             out_df.insert(_lic_loc, "TRIP", _trip_col_vals)
-            out_df.insert(_lic_loc, "TIME SLOT", _slot_col_vals)
             sess["_kv_trip_map"] = _kv_trip_map   # pass to trip manifest
-        elif any(_slot_col_vals):
-            # Non-KV file with REMARKS times: still show TIME SLOT for visibility
-            _lic_loc = out_df.columns.get_loc("LICENSE")
-            out_df.insert(_lic_loc, "TIME SLOT", _slot_col_vals)
 
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
