@@ -1963,31 +1963,54 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 pass
             return "9999-12-31"
 
-        # PH interior codes: PH01–PH07 (west Pahang corridor — Raub/Benta/Lipis/Jerantut).
-        # PH08+ (Kuantan/east coast) are NOT interior.
-        _PH_INTERIOR = {"PH01", "PH02", "PH03", "PH04", "PH05", "PH06", "PH07"}
+        # ── Group sort priorities (lorry-claim order within the same date) ─────
+        # Priority 0 — Pahang (Kuantan + interior) and Seremban/Negeri Sembilan:
+        #   farthest destinations; must grab large lorries (≥ 11T) before anyone else.
+        # Priority 1 — Rawang, Tanjung Malim, Port Dickson, Perak corridor:
+        #   medium-far destinations; get the remaining large lorries.
+        # Priority 2 — everything else (KV/KL urban routes etc.):
+        #   large lorries already blocked for these by _LARGE_LORRY_MIN_TON rule.
+        _SORT_PRI0_CLUSTERS  = {"PAHANG", "NEGERI_SEMBILAN"}
+        _SORT_PRI1_CLUSTERS  = {"PERAK"}
+        _SORT_PRI1_KEYWORDS  = {"RAWANG", "TANJUNG MALIM", "TANJUNGMALIM", "T.MALIM",
+                                 "PORT DICKSON", "PORTDICKSON",
+                                 "KEMAMAN", "KAMAMAN", "KAMPAR"}
 
         def _group_sort_key(g):
             """Sort key: (date, corridor_priority, -weight).
 
-            Corridor priority within the same date:
-              0 — PH interior (PH01–PH07): processed first so BPE9788 is claimed
-                  before Kuantan's heavier DOs can pre-empt it.
-              1 — everything else (including Kuantan / KV / JH).
+            Within the same date, large-lorry destinations are processed first
+            so they can claim big lorries before smaller urban routes compete.
 
-            This preserves date-urgency while guaranteeing the interior Pahang
-            corridor always has a lorry when Kuantan DOs fall on the same date.
+              0 — Pahang cluster (Kuantan, Bentong, Raub …) and
+                  Negeri Sembilan cluster (Seremban, Port Dickson)
+              1 — Perak cluster (Tanjung Malim, Ipoh …) and any route string
+                  containing Rawang / Tanjung Malim / Port Dickson / Kemaman
+              2 — all other routes (KV, KL urban, Johor, etc.)
+
+            Within each tier, heaviest group is processed first so it claims
+            the tightest-fitting large lorry.
             """
             dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
             earliest = min(dates) if dates else "9999-12-31"
-            _is_ph_interior = any(
-                str(it.get("CODE", "")).strip().upper()[:4] in _PH_INTERIOR
+
+            _clusters = {
+                _extract_route_intelligence(it.get("ROUTE", ""))["cluster"]
                 for it in g
-            )
-            _corridor_prio = 0 if _is_ph_interior else 1
+            }
+            _rt_text = " ".join(it.get("ROUTE", "").upper() for it in g)
+
+            if _clusters & _SORT_PRI0_CLUSTERS:
+                _corridor_prio = 0
+            elif (_clusters & _SORT_PRI1_CLUSTERS) or \
+                 any(kw in _rt_text for kw in _SORT_PRI1_KEYWORDS):
+                _corridor_prio = 1
+            else:
+                _corridor_prio = 2
+
             return (earliest, _corridor_prio, -sum(it["WEIGHT"] for it in g))
 
-        # Date-first → PH interior before Kuantan → heaviest within tier
+        # Date-first → Pahang+Seremban → Rawang/TM/PD+Perak → urban/other
         sorted_groups.sort(key=_group_sort_key)
 
         # Session-level capacity trackers so groups can share a lorry.
