@@ -2042,20 +2042,29 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             }
             excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
 
-            # Vehicle-type constraint from REMARKS.
-            # van_only > small_lorry; both restrict the candidate pool.
+            # Vehicle-type constraint from REMARKS — computed once and reused
+            # in every fallback excl set so no path bypasses the restriction.
+            # van_only: restrict to the smallest lorry tier (dynamic threshold =
+            #   min capacity in pool × 1.5, so the van tier is always captured
+            #   regardless of whether tonnage is stored as payload or gross weight).
+            # small_lorry: exclude lorries ≥ 9T.
+            _type_excl: set[str] = set()
             if any(it.get("van_only") for it in group_items):
-                excluded = excluded | {
-                    str(row["LORRY"]).strip().upper()
-                    for _, row in engine.eligible_lorries.iterrows()
-                    if float(row["TON"]) > _VAN_MAX_TON
+                _all_caps_v = [float(r["TON"]) for _, r in engine.eligible_lorries.iterrows()]
+                _min_cap_v  = min(_all_caps_v) if _all_caps_v else 0.0
+                _van_thr    = (_min_cap_v * 1.5) if _min_cap_v > 0 else _VAN_MAX_TON
+                _type_excl = {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) > _van_thr
                 }
             elif any(it.get("small_lorry") for it in group_items):
-                excluded = excluded | {
-                    str(row["LORRY"]).strip().upper()
-                    for _, row in engine.eligible_lorries.iterrows()
-                    if float(row["TON"]) >= _SMALL_LORRY_MAX_TON
+                _type_excl = {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= _SMALL_LORRY_MAX_TON
                 }
+            excluded = excluded | _type_excl
 
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
@@ -2246,7 +2255,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                         p for p in _session_loads
                         if _daily_overflow_group(p, group_items)
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _session_incompatible
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _session_incompatible | _type_excl
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -2302,7 +2311,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                                 p for p in _session_loads
                                 if _daily_overflow_group(p, [it])
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _session_incompatible
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _session_incompatible | _type_excl
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -2332,7 +2341,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                         p for p in _session_loads
                         if _daily_overflow_group(p, group_items)
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _session_incompatible
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _session_incompatible | _type_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -2377,16 +2386,19 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             # Build candidates: lorries that can accept this item on its date
             _consol_excl = set(_excl_consol)
             if it.get("van_only"):
+                _all_caps_cv = [float(r["TON"]) for _, r in engine.eligible_lorries.iterrows()]
+                _min_cap_cv  = min(_all_caps_cv) if _all_caps_cv else 0.0
+                _van_thr_c   = (_min_cap_cv * 1.5) if _min_cap_cv > 0 else _VAN_MAX_TON
                 _consol_excl |= {
-                    str(row["LORRY"]).strip().upper()
-                    for _, row in engine.eligible_lorries.iterrows()
-                    if float(row["TON"]) > _VAN_MAX_TON
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) > _van_thr_c
                 }
             elif it.get("small_lorry"):
                 _consol_excl |= {
-                    str(row["LORRY"]).strip().upper()
-                    for _, row in engine.eligible_lorries.iterrows()
-                    if float(row["TON"]) >= _SMALL_LORRY_MAX_TON
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= _SMALL_LORRY_MAX_TON
                 }
             _cands = [
                 (_daily_min_slack(p, [it]), p)
