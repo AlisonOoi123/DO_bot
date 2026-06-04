@@ -1729,6 +1729,15 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     if _ci and _cj else 0.0
                 )
 
+                # VAN-type buckets must NEVER merge with non-VAN buckets.
+                # Both use the same route string (e.g. "KV10A...") so
+                # _routes_on_same_way would otherwise merge them back together,
+                # undoing the ::VAN bucket isolation done in Step 1.
+                _merged_van = any(it.get("van_only") for it in merged_items)
+                _cand_van   = any(it.get("van_only") for it in cand_bucket)
+                if _merged_van != _cand_van:
+                    continue
+
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
@@ -1824,6 +1833,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 # that look like same direction but use different road corridors)
                 _LOCAL_CLUSTERS = {"KL_VALLEY", "KL_CITY"}
                 if (base_clusters & _LOCAL_CLUSTERS) or cand_cluster in _LOCAL_CLUSTERS:
+                    continue
+
+                # VAN-only groups must not merge with non-VAN groups (Step 4)
+                if any(it.get("van_only") for it in merged) != \
+                   any(it.get("van_only") for it in cand_sg):
                     continue
 
                 combined_w = sum(it["WEIGHT"] for it in merged) + \
