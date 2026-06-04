@@ -39,6 +39,10 @@ _DOUBLE_TRIP_RE = re.compile(r'^KV\d', re.IGNORECASE)
 # Maximum tonnage considered "small lorry" for DOs that require restricted access.
 _SMALL_LORRY_MAX_TON = 9.0
 
+# Sites that say "BELOW 5 TON / LORRY KECIL SAJA" need a lorry strictly < 5T
+# (the 4.2T category: BQX7228, W3618U, W3826C, WLD8738).
+_TINY_LORRY_MAX_TON = 5.0
+
 # Lorries at or above this tonnage are "large" and must only be assigned to
 # long-distance destinations (Pahang, Negeri Sembilan, Perak, etc.).
 # Urban/near-area routes (KL Valley, KL City) must use lorries strictly < 11T.
@@ -71,8 +75,8 @@ _SMALL_LORRY_RE = re.compile(
     r'tidak\s*boleh\s*masuk\s*lor[ry]?\s*besar|'
     r'small\s*lor[ry]|'
     r'small\s*truck|'
-    r'kecil\s*(sahaja|only)|'
-    r'lor[ry]?\s*kecil\s*(sahaja|only)',
+    r'kecil\s*(sahaja|only|saja|shj\b)|'
+    r'lor[ry]i?\s*kecil',    # "lorry kecil" / "lori kecil" in any trailing context
     re.IGNORECASE,
 )
 
@@ -82,6 +86,20 @@ def _requires_small_lorry(remarks) -> bool:
     if not s or s.lower() in ("nan", "none", "-", ""):
         return False
     return bool(_SMALL_LORRY_RE.search(s))
+
+# Sites explicitly saying "BELOW 5 TON / BELOW OR 5 TON" need lorries < 5T.
+_TINY_LORRY_RE = re.compile(
+    r'below\s*(?:or\s*)?\d+\s*ton|'
+    r'\d+\s*ton\s*(?:lor[ry]|lori)',
+    re.IGNORECASE,
+)
+
+def _requires_tiny_lorry(remarks) -> bool:
+    """Return True when REMARKS restrict delivery to lorries < 5T."""
+    s = str(remarks).strip()
+    if not s or s.lower() in ("nan", "none", "-", ""):
+        return False
+    return bool(_TINY_LORRY_RE.search(s))
 
 _VAN_ONLY_RE = re.compile(r'\bVAN\b', re.IGNORECASE)
 
@@ -1650,6 +1668,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 "DATE":          str(row.get("DATE", "")).strip(),
                 "LORRY":         _prefill_pl or (None if _is_mine else "OTHER_USER"),
                 "SPLIT_LORRIES": None,
+                "tiny_lorry":    _requires_tiny_lorry(row.get("REMARKS", "")),
                 "small_lorry":   _requires_small_lorry(row.get("REMARKS", "")),
                 "van_only":      _requires_van_only(row.get("REMARKS", "")),
             })
@@ -1719,6 +1738,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             bucket_key = it["ROUTE"].strip().upper()
             if it.get("van_only"):
                 bucket_key += "::VAN"
+            elif it.get("tiny_lorry"):
+                bucket_key += "::TINY"
             elif it.get("small_lorry"):
                 bucket_key += "::SMALL"
             route_buckets[bucket_key].append(it)
@@ -1768,6 +1789,12 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 _merged_van = any(it.get("van_only") for it in merged_items)
                 _cand_van   = any(it.get("van_only") for it in cand_bucket)
                 if _merged_van != _cand_van:
+                    continue
+
+                # Tiny-lorry (< 5T) buckets must NEVER merge with other buckets.
+                _merged_tiny = any(it.get("tiny_lorry") for it in merged_items)
+                _cand_tiny   = any(it.get("tiny_lorry") for it in cand_bucket)
+                if _merged_tiny != _cand_tiny:
                     continue
 
                 # Small-lorry buckets must NEVER merge with non-small buckets.
@@ -1878,6 +1905,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 # VAN-only groups must not merge with non-VAN groups (Step 4)
                 if any(it.get("van_only") for it in merged) != \
                    any(it.get("van_only") for it in cand_sg):
+                    continue
+
+                # Tiny-lorry groups must not merge with non-tiny groups (Step 4)
+                if any(it.get("tiny_lorry") for it in merged) != \
+                   any(it.get("tiny_lorry") for it in cand_sg):
                     continue
 
                 # Small-lorry groups must not merge with non-small groups (Step 4)
@@ -2188,9 +2220,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
 
             # Vehicle-type constraint from REMARKS — computed once and reused
             # in every fallback excl set so no path bypasses the restriction.
-            # van_only: restrict to the smallest lorry tier (dynamic threshold =
-            #   min capacity in pool × 1.5, so the van tier is always captured
-            #   regardless of whether tonnage is stored as payload or gross weight).
+            # van_only:   restrict to the smallest lorry tier (≤ ~2T, VAN only).
+            # tiny_lorry: exclude lorries ≥ 5T ("BELOW 5 TON LORRY" sites).
             # small_lorry: exclude lorries ≥ 9T.
             _type_excl: set[str] = set()
             if any(it.get("van_only") for it in group_items):
@@ -2201,6 +2232,12 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     str(r["LORRY"]).strip().upper()
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) > _van_thr
+                }
+            elif any(it.get("tiny_lorry") for it in group_items):
+                _type_excl = {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= _TINY_LORRY_MAX_TON
                 }
             elif any(it.get("small_lorry") for it in group_items):
                 _type_excl = {
@@ -2549,6 +2586,12 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) > _van_thr_c
                 }
+            elif it.get("tiny_lorry"):
+                _consol_excl |= {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= _TINY_LORRY_MAX_TON
+                }
             elif it.get("small_lorry"):
                 _consol_excl |= {
                     str(r["LORRY"]).strip().upper()
@@ -2628,6 +2671,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     # (e.g. KV19A at 92% on BMN3682 should stay there).
                     if _load_a / _cap_b < 0.70:
                         continue
+                    # Don't violate vehicle-type constraints via swap.
+                    if any(x.get("tiny_lorry")  for x in _pit[_pb]) and _cap_a >= _TINY_LORRY_MAX_TON:
+                        continue
+                    if any(x.get("small_lorry") for x in _pit[_pb]) and _cap_a >= _SMALL_LORRY_MAX_TON:
+                        continue
                     # Don't swap near-distance items onto a large lorry (≥ 11T).
                     # A is large; after swap A gets B's items. If B's items are
                     # near-area routes they must stay on a small lorry.
@@ -2681,6 +2729,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     if _route_a and _routes_b:
                         if not any(_routes_on_same_way(_route_a, _rb) for _rb in _routes_b):
                             continue
+                    # Don't violate vehicle-type constraints via merge.
+                    if any(x.get("tiny_lorry")  for x in _pit[_pa]) and _cap_b >= _TINY_LORRY_MAX_TON:
+                        continue
+                    if any(x.get("small_lorry") for x in _pit[_pa]) and _cap_b >= _SMALL_LORRY_MAX_TON:
+                        continue
                     # Don't merge near-distance items onto a large lorry (≥ 11T).
                     if _cap_b >= _LARGE_LORRY_MIN_TON and not _long_dist_group(_pit[_pa]):
                         continue
@@ -2756,6 +2809,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                         if _routes_dst and _route_it:
                             if not any(_routes_on_same_way(_route_it, _rd) for _rd in _routes_dst):
                                 continue
+                        # Don't violate vehicle-type constraints via rebalance.
+                        if _it.get("tiny_lorry")  and _cap_dst >= _TINY_LORRY_MAX_TON:
+                            continue
+                        if _it.get("small_lorry") and _cap_dst >= _SMALL_LORRY_MAX_TON:
+                            continue
                         # Don't move near-distance items onto a large lorry (≥ 11T).
                         if _cap_dst >= _LARGE_LORRY_MIN_TON and not _long_dist_group([_it]):
                             continue
