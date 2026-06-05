@@ -95,6 +95,33 @@ def _classify_dest_group(route: str) -> str:
 # large/medium lorries before KL groups get a chance to take them.
 _DEST_SORT_PRI = {"LARGE_LONG": 0, "MEDIUM_LONG": 1, "KL_SELANGOR": 2}
 
+# ── Strict lorry-route reservations ──────────────────────────────────────────
+# Some lorries are physically configured or contractually bound to specific
+# route directions.  These rules are enforced both ways:
+#   (a) the restricted lorry is excluded from ALL other routes, and
+#   (b) the target route prefers this lorry first.
+# Key: lorry plate.  Value: set of route-code PREFIXES (first 2-5 chars) it
+# is allowed to serve.  Any route whose prefix is NOT in the set is blocked.
+_LORRY_STRICT_ROUTE: dict[str, set] = {
+    "BQU3875": {"PH"},           # 21T — Pahang routes only
+    "BQY7823": {"KV01A", "KV02A"},  # 14.5T — Rawang / T.Malim outstation direction only
+}
+
+def _strict_route_excl(route_text: str) -> set:
+    """Return plates that must NOT serve this route due to strict reservations.
+    route_text: space-joined ROUTE strings for the group.
+    """
+    r = route_text.strip().upper()
+    excl: set[str] = set()
+    for plate, allowed_pfxs in _LORRY_STRICT_ROUTE.items():
+        route_allowed = any(
+            r.startswith(pfx) or re.search(r'\b' + re.escape(pfx), r)
+            for pfx in allowed_pfxs
+        )
+        if not route_allowed:
+            excl.add(plate)
+    return excl
+
 def _resolve_history_path() -> str:
     """Return the best available history file.
     Prefers the .xls version (has LONGITUD GPS column) over .xlsx fallbacks.
@@ -1904,6 +1931,23 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if float(r["TON"]) >= 11.0
                 }
 
+            # ── Strict lorry-route reservations ───────────────────────────────
+            # e.g. BQY7823 → Rawang only; BQU3875 → Pahang only.
+            _grp_rt_text = " ".join(it.get("ROUTE", "") for it in group_items)
+            excluded = excluded | _strict_route_excl(_grp_rt_text)
+
+            # ── Cross-direction incompatibility for large/medium lorries ───────
+            # Large (≥14T) and medium (≥11T) lorries do at most 1 trip per day
+            # and cannot serve a different direction in the same session.
+            # Small lorries (<11T) are allowed TRIP 2 on same-corridor routes.
+            _session_incompatible_lm = {
+                p for p in _session_loads
+                if _lorry_cap_map.get(p, 0) >= 11.0   # large or medium
+                and _session_routes.get(p)
+                and not _routes_on_same_way(route, _session_routes.get(p, ""))
+            }
+            excluded = excluded | _session_incompatible_lm
+
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
             # session has enough remaining capacity.  Prefer same-corridor lorries
@@ -3573,32 +3617,34 @@ def _export_result_inner(sess) -> list[str]:
                                            "split", "skipped", "other_user"):
                 _plate_rows.setdefault(_pl, []).append(_ri)
 
-        # Track which route-group each row belongs to (by ROUTE value)
-        # A new "group" for a plate = different ROUTE from the one preceding it
+        # Track trip number per lorry per row.
+        # Rules:
+        #   Large  (≥14T): always TRIP 1 — one trip per day, no exceptions.
+        #   Medium (11–14T): TRIP 1 only unless same-direction overflow forced it.
+        #   Small  (<11T):  may do TRIP 2 when cumulative weight exceeds capacity.
         _trip_vals = {}
         for _pl, _ridxs in _plate_rows.items():
-            _cap = float(_lorry_cap_map_out.get(_pl, 0) if False else 0)  # placeholder
-            _prev_route = None
-            _trip_num   = 1
-            _cum_w      = 0.0
-            _cap_val    = 0.0
-            # Get capacity from out_df engine cap map via session if available
+            _cap_val = 0.0
             _eng = sess.get("engine")
             if _eng is not None:
                 for _, _er in _eng.eligible_lorries.iterrows():
                     if str(_er["LORRY"]).strip().upper() == _pl:
                         _cap_val = float(_er["TON"])
                         break
+            _trip_num = 1
+            _cum_w    = 0.0
             for _ri in _ridxs:
-                _rt = str(out_df.at[_ri, "ROUTE"]).strip().upper()
                 _wt_raw = pd.to_numeric(
                     out_df.at[_ri, "WEIGHT(T)"] if "WEIGHT(T)" in out_df.columns
                     else out_df.at[_ri, "GROSS WEIGHT"],
                     errors="coerce"
                 )
-                _wt = float(_wt_raw) / 1000.0 if "GROSS WEIGHT" in out_df.columns and "WEIGHT(T)" not in out_df.columns else float(_wt_raw or 0)
-                # When cumulative weight exceeds capacity, this is a new trip
-                if _cap_val > 0 and _cum_w + _wt > _cap_val * 1.02:
+                _wt = (float(_wt_raw) / 1000.0
+                       if "GROSS WEIGHT" in out_df.columns and "WEIGHT(T)" not in out_df.columns
+                       else float(_wt_raw or 0))
+                # Only small lorries (<11T) can do TRIP 2.
+                # Large (≥14T) and medium (11–14T) are always TRIP 1.
+                if _cap_val < 11.0 and _cap_val > 0 and _cum_w + _wt > _cap_val * 1.02:
                     _trip_num = 2
                     _cum_w    = _wt
                 else:
