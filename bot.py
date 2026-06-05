@@ -1648,8 +1648,11 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                     for p in _lic.split(",")
                     if p.strip().upper() not in _pf_sentinel_up
                 ]
+                # Do NOT mark pre-filled plates as "assigned today" — they must
+                # remain eligible for the blank rows (as TRIP 2 if capacity allows).
+                # Capacity is tracked via _session_loads instead.
                 if _pf_plates:
-                    record_assignments_today(_pf_plates)
+                    pass  # intentionally not calling record_assignments_today
 
         # ── Build item list: one item per Excel row ─────────────────────────
         # Each row is an independent item that needs its own lorry.
@@ -2258,7 +2261,7 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
                 and not _routes_on_same_way(route, _session_routes.get(p, ""))
                 and not _daily_overflow_group(p, group_items)
             }
-            excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
+            excluded = sess["unavailable"] | _session_full
 
             # Vehicle-type constraint from REMARKS — computed once and reused
             # in every fallback excl set so no path bypasses the restriction.
@@ -2914,8 +2917,8 @@ def _handle_excel_upload(phone, sess, file_bytes, file_mime=""):
             _all_kv_routes = bool(_pl_routes) and all(
                 _DOUBLE_TRIP_RE.match(str(r)) for r in _pl_routes
             )
-            if _all_kv_routes and _cap < _SMALL_LORRY_MAX_TON:
-                _eff_cap = _cap * 2          # small KV lorries only: 2 trips/day
+            if _all_kv_routes and _cap < _LARGE_LORRY_MIN_TON:
+                _eff_cap = _cap * 2          # KL-eligible lorries only: 2 trips/day
             elif len(_pl_routes) == 1:
                 _eff_cap = _cap * 1.05       # single-route: 5 % tolerance
             else:
@@ -4371,8 +4374,8 @@ def _export_result_inner(sess) -> list[str]:
             _cap2 = _cap_map_out.get(_pl2, 0.0)
             if _cap2 <= 0:
                 continue
-            # Only small lorries (< 9T) can do 2 trips per day on KV routes.
-            if _cap2 >= _SMALL_LORRY_MAX_TON:
+            # Only KL-eligible lorries (< 11T) can do 2 trips per day on KV routes.
+            if _cap2 >= _LARGE_LORRY_MIN_TON:
                 continue
             # Only process rows that belong to a KV route
             _kv_idxs = [_i for _i in _idxs2
