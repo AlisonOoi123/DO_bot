@@ -781,8 +781,8 @@ class LorryEngine:
         )
         ULTRA_LONG_HAUL_KM       = 200.0
         LONG_HAUL_KM             = 100.0
-        _ULTRA_LONG_HAUL_MIN_TON = 10.0  # 10T+ for cross-state runs (>200 km)
-        _LONG_HAUL_MIN_TON       = 8.0   # 8T+ for regional runs (100–200 km)
+        _ULTRA_LONG_HAUL_MIN_TON = 14.0  # ≥14T (large) for cross-state runs (>200 km, e.g. Kuantan/Pahang)
+        _LONG_HAUL_MIN_TON       = 11.0  # ≥11T (medium+) for regional runs (100–200 km, e.g. Seremban/T.Malim)
 
         if _route_dist_km >= ULTRA_LONG_HAUL_KM:
             _lh_big = merged[merged["TON"] >= _ULTRA_LONG_HAUL_MIN_TON]

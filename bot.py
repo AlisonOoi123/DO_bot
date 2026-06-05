@@ -1415,19 +1415,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
         sess["is_new_format"] = IS_NEW_FORMAT
 
         # ── Pre-filled detection ─────────────────────────────────────────────
-        # If the uploaded Excel already has LICENSE plates in it, the user is
-        # importing a completed assignment sheet (not asking us to auto-assign).
-        # Read those plates, register them as assigned today, and show a summary.
+        # If the uploaded Excel already has LICENSE plates in it:
+        #   Case A (fully prefilled): register plates as assigned today, show summary, stop.
+        #   Case B (partial — some rows blank): track capacity in session but do NOT
+        #     register plates as "assigned today" so they remain eligible for TRIP 2
+        #     on the blank rows. Continue to auto-assign the blank rows.
         SENTINELS_STR = {"", "nan", "none", "n/a", "-"}
-        prefilled_rows = raw[
-            raw["LICENSE"].astype(str).str.strip().str.lower()
-            .isin(SENTINELS_STR) == False
-        ].copy()
+        _lic_lower = raw["LICENSE"].astype(str).str.strip().str.lower()
+        prefilled_rows = raw[_lic_lower.isin(SENTINELS_STR) == False].copy()
+        _blank_rows = raw[_lic_lower.isin(SENTINELS_STR)].copy()
 
         if not prefilled_rows.empty:
-            result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows)
-            if result is not None:
-                return result
+            if _blank_rows.empty:
+                # Case A: fully prefilled — register, summarise, and stop.
+                result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows)
+                if result is not None:
+                    return result
+            else:
+                # Case B: partial file — skip record_assignments_today so those
+                # lorries stay available for the blank rows (as TRIP 2 if needed).
+                # Just note how many were pre-filled so the bot can mention it.
+                sess["_prefilled_count"] = len(prefilled_rows)
             # result is None → all plates were sentinels, fall through to auto-assign
 
         # ── Build item list: one item per Excel row ─────────────────────────
@@ -1830,7 +1838,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 and not _routes_on_same_way(route, _session_routes.get(p, ""))
                 and _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) >= total_w
             }
-            excluded = sess["unavailable"] | get_assigned_today() | _session_full | _session_incompatible
+            excluded = sess["unavailable"] | _session_full
 
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
