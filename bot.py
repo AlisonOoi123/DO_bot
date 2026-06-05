@@ -59,6 +59,42 @@ def _extract_route_prefix(route: str) -> str:
     m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
     return m.group(1).upper() if m else ""
 
+# ── Destination state classification ─────────────────────────────────────────
+# Maps route-code prefix (2-char cluster) to destination group.
+# Groups drive minimum lorry size:
+#   LARGE_LONG  (≥14T) — Pahang, Kuantan, Terengganu, Kelantan, Johor, Perak, etc.
+#   MEDIUM_LONG (≥11T) — Rawang, Tanjung Malim, Kemaman, Port Dickson, Seremban/NS
+#   KL_SELANGOR (<11T) — All KV routes (Klang Valley urban)
+_DEST_LARGE_LONG_CLUSTERS  = {"PH", "TR", "KB", "JH", "PK", "KD", "PN", "MC", "SB", "SR"}
+_DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
+# KV routes that go outstation (Rawang / Tanjung Malim direction):
+_DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
+
+# Minimum lorry tonnage per destination group
+_DEST_MIN_TON = {
+    "LARGE_LONG":  14.0,
+    "MEDIUM_LONG": 11.0,
+    "KL_SELANGOR":  0.0,   # no lower bound; upper bound enforced separately
+}
+
+def _classify_dest_group(route: str) -> str:
+    """Return 'LARGE_LONG', 'MEDIUM_LONG', or 'KL_SELANGOR' for a route code."""
+    r = route.strip().upper()
+    # KV routes that head outstation (Rawang / T.Malim corridor)
+    pfx5 = r[:5]
+    if pfx5 in _DEST_MEDIUM_LONG_KV_CODES:
+        return "MEDIUM_LONG"
+    cluster = r[:2]
+    if cluster in _DEST_LARGE_LONG_CLUSTERS:
+        return "LARGE_LONG"
+    if cluster in _DEST_MEDIUM_LONG_CLUSTERS:
+        return "MEDIUM_LONG"
+    return "KL_SELANGOR"
+
+# Priority order: long-distance groups must be assigned FIRST so they claim
+# large/medium lorries before KL groups get a chance to take them.
+_DEST_SORT_PRI = {"LARGE_LONG": 0, "MEDIUM_LONG": 1, "KL_SELANGOR": 2}
+
 def _resolve_history_path() -> str:
     """Return the best available history file.
     Prefers the .xls version (has LONGITUD GPS column) over .xlsx fallbacks.
@@ -1734,14 +1770,21 @@ def _handle_excel_upload(phone, sess, file_bytes):
             return "9999-12-31"
 
         def _group_sort_key(g):
-            """Primary: earliest delivery date in group (ascending).
-            Secondary: total weight (descending) so heavy groups within the same
-            date claim the best-fit lorries before lighter ones."""
+            """Sort order:
+            0. Destination priority — LARGE_LONG(0) > MEDIUM_LONG(1) > KL_SELANGOR(2)
+               so long-distance groups claim large/medium lorries first.
+            1. Earliest delivery date (ascending).
+            2. Total weight (descending) so heavier groups within same tier/date
+               claim best-fit lorries before lighter ones.
+            """
+            dest_pri = _DEST_SORT_PRI.get(
+                _classify_dest_group(g[0]["ROUTE"]), 2
+            )
             dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
             earliest = min(dates) if dates else "9999-12-31"
-            return (earliest, -sum(it["WEIGHT"] for it in g))
+            return (dest_pri, earliest, -sum(it["WEIGHT"] for it in g))
 
-        # Date-first, then heaviest — ensures urgent DOs get lorries before later ones
+        # Destination-priority-first, then date, then heaviest
         sorted_groups.sort(key=_group_sort_key)
 
         # Session-level capacity tracker so groups can share a lorry when combined
@@ -1840,6 +1883,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
             }
             excluded = sess["unavailable"] | _session_full
 
+            # ── Destination-based lorry size enforcement ───────────────────────
+            # LARGE_LONG  (Pahang/Kuantan/Terengganu/…): must use ≥14T lorry
+            # MEDIUM_LONG (Seremban/NS/Rawang/T.Malim/…): must use ≥11T lorry
+            # KL_SELANGOR (KV routes): must use <11T lorry (no large/medium)
+            _dest_grp   = _classify_dest_group(route)
+            _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
+            # Exclude undersized lorries for long-distance destinations
+            if _dest_min_t > 0:
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) < _dest_min_t
+                }
+            # Exclude oversized lorries (≥11T) for KL/Selangor urban routes
+            if _dest_grp == "KL_SELANGOR":
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= 11.0
+                }
+
             # ── Within-session lorry sharing ──────────────────────────────────
             # Before consuming a new lorry, check if a lorry already used this
             # session has enough remaining capacity.  Prefer same-corridor lorries
@@ -1850,6 +1914,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if p in _lorry_cap_map
                 and float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= total_w
                 and p not in excluded
+                and float(_lorry_cap_map.get(p, 0)) >= _dest_min_t
             ]
             if _share_pool:
                 _compat = sorted(
@@ -2878,7 +2943,24 @@ def _build_summary(sess) -> str:
         cap     = cap_map.get(plate)
 
         if cap and cap > 0:
-            util_pct = round(total_w / cap * 100, 1)
+            # Lorry size class label
+            if cap >= 14.0:
+                _size_tag = "LARGE"
+            elif cap >= 11.0:
+                _size_tag = "MEDIUM"
+            elif cap >= 2.0:
+                _size_tag = "SMALL"
+            else:
+                _size_tag = "VAN"
+
+            # Detect if this lorry does 2 trips (total weight > cap)
+            _trip_info = ""
+            if total_w > cap * 1.02:
+                _t1w = round(cap, 1)
+                _t2w = round(total_w - cap, 3)
+                _trip_info = f"  🌅T1:{_t1w}T 🌆T2:{_t2w}T"
+
+            util_pct = round(min(total_w, cap) / cap * 100, 1)
             if util_pct > 100:
                 util_tag = f"🔴 {util_pct}% OVER"
             elif util_pct >= 75:
@@ -2887,12 +2969,13 @@ def _build_summary(sess) -> str:
                 util_tag = f"🟡 {util_pct}%"
             else:
                 util_tag = f"⚠️ {util_pct}%"
-            cap_str = f"{cap}T"
+            cap_str = f"{cap}T/{_size_tag}"
         else:
-            util_tag = ""
-            cap_str  = "?"
+            util_tag  = ""
+            cap_str   = "?"
+            _trip_info = ""
 
-        lines.append(f"🚛 *{plate}* ({cap_str})  {util_tag}  _{total_w}T_")
+        lines.append(f"🚛 *{plate}* ({cap_str})  {util_tag}  _{total_w}T_{_trip_info}")
 
         # One line per DO under this lorry: DO# first, then route→dest, customer, weight, date
         for it in sorted(its, key=lambda x: _dsort(x.get("DATE", ""))):
@@ -2901,7 +2984,10 @@ def _build_summary(sess) -> str:
             w    = round(it["WEIGHT"], 3)
             cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
             dt_tag = f" [{dt}]" if dt else ""
-            lines.append(f"  {dn_short}  {rcode}  {cust}  {w}T{dt_tag}")
+            _dest_lbl = {
+                "LARGE_LONG": "🟥", "MEDIUM_LONG": "🟧", "KL_SELANGOR": "🟩"
+            }.get(_classify_dest_group(it.get("ROUTE", "")), "")
+            lines.append(f"  {dn_short}  {_dest_lbl}{rcode}  {cust}  {w}T{dt_tag}")
 
         lines.append("")   # blank line between lorries
 
@@ -3402,6 +3488,17 @@ def _export_result_inner(sess) -> list[str]:
     # Drop internal helper columns added during processing (not in original spec)
     _INTERNAL_COLS = {"WEIGHT(T)"}
 
+    # Add DEST_STATE column showing classified destination per row
+    if "ROUTE" in new_df.columns:
+        _dest_state_map = {
+            "LARGE_LONG":  "OUTSTATION-LARGE",
+            "MEDIUM_LONG": "OUTSTATION-MEDIUM",
+            "KL_SELANGOR": "KL/SELANGOR",
+        }
+        new_df["DEST_STATE"] = new_df["ROUTE"].apply(
+            lambda r: _dest_state_map.get(_classify_dest_group(str(r)), "")
+        )
+
     if is_new_fmt:
         # Reorder columns: required spec first, then any extras from the upload
         ordered = [c for c in NEW_FMT_COLS if c in new_df.columns]
@@ -3462,6 +3559,61 @@ def _export_result_inner(sess) -> list[str]:
         out_df = new_rows.copy()
         if "DATE" in out_df.columns:
             out_df["DATE"] = out_df["DATE"].astype(str)
+
+    # ── TRIP column: mark morning (1) vs afternoon (2) for lorries used twice ──
+    # A lorry that appears on two different route groups in the same session did
+    # two trips.  The first group it served = Trip 1 (morning); second = Trip 2.
+    if "LICENSE" in out_df.columns and "ROUTE" in out_df.columns:
+        _KV_RE = re.compile(r'^KV\d', re.IGNORECASE)
+        # Build plate → ordered list of row indices (preserving output order)
+        _plate_rows: dict[str, list] = {}
+        for _ri, _r in out_df.iterrows():
+            _pl = str(_r.get("LICENSE", "")).strip().upper()
+            if _pl and _pl.lower() not in ("nan", "none", "", "no_lorry",
+                                           "split", "skipped", "other_user"):
+                _plate_rows.setdefault(_pl, []).append(_ri)
+
+        # Track which route-group each row belongs to (by ROUTE value)
+        # A new "group" for a plate = different ROUTE from the one preceding it
+        _trip_vals = {}
+        for _pl, _ridxs in _plate_rows.items():
+            _cap = float(_lorry_cap_map_out.get(_pl, 0) if False else 0)  # placeholder
+            _prev_route = None
+            _trip_num   = 1
+            _cum_w      = 0.0
+            _cap_val    = 0.0
+            # Get capacity from out_df engine cap map via session if available
+            _eng = sess.get("engine")
+            if _eng is not None:
+                for _, _er in _eng.eligible_lorries.iterrows():
+                    if str(_er["LORRY"]).strip().upper() == _pl:
+                        _cap_val = float(_er["TON"])
+                        break
+            for _ri in _ridxs:
+                _rt = str(out_df.at[_ri, "ROUTE"]).strip().upper()
+                _wt_raw = pd.to_numeric(
+                    out_df.at[_ri, "WEIGHT(T)"] if "WEIGHT(T)" in out_df.columns
+                    else out_df.at[_ri, "GROSS WEIGHT"],
+                    errors="coerce"
+                )
+                _wt = float(_wt_raw) / 1000.0 if "GROSS WEIGHT" in out_df.columns and "WEIGHT(T)" not in out_df.columns else float(_wt_raw or 0)
+                # When cumulative weight exceeds capacity, this is a new trip
+                if _cap_val > 0 and _cum_w + _wt > _cap_val * 1.02:
+                    _trip_num = 2
+                    _cum_w    = _wt
+                else:
+                    _cum_w += _wt
+                _trip_vals[_ri] = _trip_num
+
+        if _trip_vals:
+            _trip_col = [
+                str(_trip_vals[i]) if i in _trip_vals else ""
+                for i in range(len(out_df))
+            ]
+            # Only insert TRIP column if any lorry does 2 trips
+            if any(v == 2 for v in _trip_vals.values()):
+                _lic_loc = out_df.columns.get_loc("LICENSE")
+                out_df.insert(_lic_loc, "TRIP", _trip_col)
 
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
