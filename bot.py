@@ -22,31 +22,30 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
-MASTER_PATH    = os.path.join(_DATA_DIR, "master lorry.xlsx")
+PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY_DAILY_PLANNING.xlsx")         # lorry naik + route codes
+MASTER_PATH    = PLANNING_PATH   # alias kept for backwards compat inside engine calls
 # History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
 HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
-ROUTE_CODES_PATH = os.path.join(_DATA_DIR, "route_codes.xlsx")                  # user→route mapping
 
 def _load_user_route_prefixes(user: str) -> set | None:
-    """Return the set of route-code prefixes (e.g. 'KV19A', 'PH09') assigned to
-    *user* (case-insensitive).  Returns None if the mapping file doesn't exist,
-    meaning no filtering is applied and all routes are processed.
+    """Return the set of route-code prefixes assigned to *user* by reading
+    the '{USER} ROUTE' sheet from LORRY_DAILY_PLANNING.xlsx.
+    The sheet's third column (Unnamed: 2) holds the full route string.
+    Returns None if the file/sheet doesn't exist (no filtering applied).
     """
-    if not os.path.exists(ROUTE_CODES_PATH):
+    if not os.path.exists(PLANNING_PATH):
         return None
     try:
-        df = pd.read_excel(ROUTE_CODES_PATH)
-        df.columns = [c.strip().upper() for c in df.columns]
-        name_col  = next((c for c in df.columns if "NAME" in c), None)
-        route_col = next((c for c in df.columns if "ROUTE" in c), None)
-        if name_col is None or route_col is None:
-            return None
-        user_rows = df[df[name_col].str.strip().str.upper() == user.upper()]
-        prefixes = set()
-        for route in user_rows[route_col].dropna().astype(str):
+        u = user.strip().upper()
+        sheet_name = f"{u} ROUTE"   # e.g. "ABI ROUTE" or "VIVIAN ROUTE"
+        df = pd.read_excel(PLANNING_PATH, sheet_name=sheet_name, header=None)
+        # Route strings are in the 3rd column (index 2); skip header rows
+        route_col = df.iloc[:, 2].dropna().astype(str)
+        prefixes: set[str] = set()
+        for route in route_col:
             m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
             if m:
                 prefixes.add(m.group(1).upper())
@@ -1274,13 +1273,18 @@ def handle_message(phone: str, text: str = None,
 # ── State handlers ────────────────────────────────────────────────────────────
 
 def _get_valid_users() -> list[str]:
-    """Read all non-SPARE users dynamically from master lorry file."""
+    """Read valid users from LORRY_DAILY_PLANNING.xlsx MUATAN sheet.
+    Users are section headers (rows where col 0 has a non-lorry string like ABI/VIVIAN).
+    """
     try:
-        df = pd.read_excel(MASTER_PATH)
-        df.columns = [c.strip().upper() for c in df.columns]
-        users = [u for u in df["USER"].str.strip().str.upper().unique()
-                 if u != "SPARE"]
-        return sorted(users)
+        df = pd.read_excel(PLANNING_PATH, sheet_name="MUATAN", header=None)
+        users = []
+        for val in df.iloc[:, 0].dropna().astype(str):
+            v = val.strip().upper()
+            # Section headers are short non-numeric strings that aren't "LORRY"
+            if v and v != "LORRY" and not re.match(r'^[A-Z]{1,3}\d', v):
+                users.append(v)
+        return sorted(set(users)) if users else ["ABI", "VIVIAN"]
     except Exception:
         return ["ABI", "VIVIAN", "SELAYANG", "BIG"]  # fallback
 

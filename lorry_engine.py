@@ -498,12 +498,56 @@ class LorryEngine:
         self._build_daily_stop_counts()
 
     def _load_master(self, path):
-        df = pd.read_excel(path)
-        df.columns = [c.strip().upper() for c in df.columns]
-        df["USER"] = df["USER"].str.strip().str.upper()
-        df = df.drop_duplicates(subset=["LORRY"], keep="first")
-        self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
+        """Load lorry capacities from LORRY_DAILY_PLANNING.xlsx MUATAN sheet.
+
+        Sheet layout (no header row):
+          Col 0: LORRY plate (or section label ABI / VIVIAN / SPARE / …)
+          Col 1: BDM (tare weight, kg)
+          Col 2: BTM (body+tare, kg)
+          Col 3: MUATAN (net rated capacity, kg)
+          Col 4: LORRY NAIK (5%) — effective max load in kg
+
+        Section labels identify which USER owns the following lorry rows.
+        LORRY NAIK (5%) is used as TON (converted kg → tonnes).
+        """
+        try:
+            raw = pd.read_excel(path, sheet_name="MUATAN", header=None)
+        except Exception:
+            # Fallback: try reading as plain master lorry format
+            raw = pd.read_excel(path)
+            raw.columns = [c.strip().upper() for c in raw.columns]
+            raw["USER"] = raw["USER"].str.strip().str.upper()
+            raw = raw.drop_duplicates(subset=["LORRY"], keep="first")
+            self.eligible_lorries = raw[raw["USER"].isin({self.owner_user, "SPARE"})].copy()
+            self.all_lorries = raw.copy()
+            return
+
+        rows = []
+        current_user = "SPARE"
+        for _, r in raw.iterrows():
+            val0 = str(r.iloc[0]).strip() if pd.notna(r.iloc[0]) else ""
+            if not val0 or val0.upper() == "LORRY":
+                continue
+            # Section header: short label without digits (ABI, VIVIAN, SPARE, …)
+            if re.match(r'^[A-Za-z]+$', val0) and len(val0) <= 10:
+                current_user = val0.upper()
+                continue
+            # Lorry row — col 4 is LORRY NAIK (kg)
+            naik_kg = r.iloc[4] if pd.notna(r.iloc[4]) else r.iloc[3]
+            try:
+                naik_ton = float(naik_kg) / 1000.0
+            except (ValueError, TypeError):
+                continue
+            rows.append({
+                "LORRY":  val0.upper(),
+                "TON":    naik_ton,
+                "USER":   current_user,
+                "Status": "Available",
+            })
+
+        df = pd.DataFrame(rows).drop_duplicates(subset=["LORRY"], keep="first")
         self.all_lorries = df.copy()
+        self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
 
     @staticmethod
     def _parse_longitud_centroids(df: pd.DataFrame) -> dict:
