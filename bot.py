@@ -74,13 +74,25 @@ _DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
 _DEST_MIN_TON = {
     "LARGE_LONG":  14.0,
     "MEDIUM_LONG": 11.0,
-    "KL_SELANGOR":  0.0,   # no lower bound; upper bound enforced separately
+    "KL":           0.0,   # Kuala Lumpur urban — <11T, no lower bound
+    "SELANGOR":     0.0,   # Selangor — <11T, no lower bound
+    "KL_SELANGOR":  0.0,   # fallback urban — <11T
 }
+# Groups that use urban (<11T) lorries only
+_DEST_URBAN_GROUPS = {"KL", "SELANGOR", "KL_SELANGOR"}
 
-def _classify_dest_group(route: str) -> str:
-    """Return 'LARGE_LONG', 'MEDIUM_LONG', or 'KL_SELANGOR' for a route code."""
+def _classify_dest_group(route: str, state: str = "") -> str:
+    """Return destination group for a route + optional explicit state.
+
+    Groups:
+      LARGE_LONG  — Pahang, Kuantan, Terengganu, Kelantan, Johor, Perak, …  (≥14T)
+      MEDIUM_LONG — NS/Seremban, Rawang/T.Malim via KV01A/KV02A            (≥11T)
+      KL          — Kuala Lumpur urban (STATE=KUALA LUMPUR or postcode 50-60k) (<11T)
+      SELANGOR    — Selangor (STATE=SELANGOR or postcode 40-48k)            (<11T)
+      KL_SELANGOR — fallback when state cannot be determined                 (<11T)
+    """
     r = route.strip().upper()
-    # KV routes that head outstation (Rawang / T.Malim corridor)
+    # KV routes heading outstation (Rawang / T.Malim direction)
     pfx5 = r[:5]
     if pfx5 in _DEST_MEDIUM_LONG_KV_CODES:
         return "MEDIUM_LONG"
@@ -88,12 +100,25 @@ def _classify_dest_group(route: str) -> str:
     if cluster in _DEST_LARGE_LONG_CLUSTERS:
         return "LARGE_LONG"
     if cluster in _DEST_MEDIUM_LONG_CLUSTERS:
+        # NS cluster — Seremban/Negeri Sembilan direction
         return "MEDIUM_LONG"
-    return "KL_SELANGOR"
+    # KV or other KL/Selangor routes — refine using actual state
+    st = state.strip().upper()
+    if st == "KUALA LUMPUR":
+        return "KL"
+    if st == "SELANGOR":
+        return "SELANGOR"
+    return "KL_SELANGOR"   # unknown — treat as generic urban
 
 # Priority order: long-distance groups must be assigned FIRST so they claim
 # large/medium lorries before KL groups get a chance to take them.
-_DEST_SORT_PRI = {"LARGE_LONG": 0, "MEDIUM_LONG": 1, "KL_SELANGOR": 2}
+_DEST_SORT_PRI = {
+    "LARGE_LONG":  0,
+    "MEDIUM_LONG": 1,
+    "SELANGOR":    2,
+    "KL":          2,
+    "KL_SELANGOR": 2,
+}
 
 # ── Strict lorry-route reservations ──────────────────────────────────────────
 # Some lorries are physically configured or contractually bound to specific
@@ -131,6 +156,65 @@ def _resolve_history_path() -> str:
             return p
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
 DAILY_LOG_PATH = os.path.join(_DATA_DIR, "daily_assignments.json")
+
+# ── Postcode → Malaysian State lookup ────────────────────────────────────────
+# Covers the postcode ranges used by each state.  Used as a fallback when the
+# uploaded DO file does not have a STATE column.
+_POSTCODE_STATE_RANGES = [
+    # (lo, hi, state_name)  — ranges are inclusive
+    (50000, 60999, "KUALA LUMPUR"),
+    (40000, 42999, "SELANGOR"),
+    (43000, 43999, "SELANGOR"),    # Kajang / Hulu Langat
+    (44000, 44999, "SELANGOR"),
+    (45000, 45999, "SELANGOR"),    # Rawang / Ulu Selangor
+    (47000, 47999, "SELANGOR"),
+    (48000, 48999, "SELANGOR"),    # Kuala Selangor
+    (63000, 63999, "SELANGOR"),
+    (64000, 64999, "SELANGOR"),
+    (68000, 68999, "SELANGOR"),    # Ampang / Ulu Langat
+    (70000, 73999, "NEGERI SEMBILAN"),
+    (25000, 28999, "PAHANG"),
+    (39000, 39999, "PAHANG"),
+    (18000, 18999, "TERENGGANU"),
+    (20000, 24999, "TERENGGANU"),
+    (15000, 17999, "KELANTAN"),
+    (80000, 83999, "JOHOR"),
+    (84000, 86999, "JOHOR"),
+    (30000, 34999, "PERAK"),
+    (35000, 36999, "PERAK"),
+    (5000,  9999,  "KEDAH"),
+    (10000, 14999, "PENANG"),
+    (75000, 78999, "MELAKA"),
+    (88000, 91300, "SABAH"),
+    (93000, 98999, "SARAWAK"),
+]
+
+def _postcode_to_state(postcode) -> str:
+    """Return Malaysian state name from postcode, or '' if unknown."""
+    try:
+        pc = int(str(postcode).strip().split()[0])
+    except (ValueError, TypeError):
+        return ""
+    for lo, hi, state in _POSTCODE_STATE_RANGES:
+        if lo <= pc <= hi:
+            return state
+    return ""
+
+def _state_from_row(row) -> str:
+    """Derive destination state from a DataFrame row.
+    Priority: STATE column > POSCODE > LONGITUD geocoding (future).
+    """
+    # 1. Explicit STATE column
+    raw_state = str(row.get("STATE", "")).strip().upper()
+    if raw_state and raw_state not in ("NAN", "NONE", "", "-"):
+        return raw_state
+    # 2. POSCODE column
+    pc_val = row.get("POSCODE", "") or row.get("POSTCODE", "")
+    if pc_val:
+        st = _postcode_to_state(pc_val)
+        if st:
+            return st.upper()
+    return ""
 
 # ── Shared UI constants ───────────────────────────────────────────────────────
 _HI_BTN = {"_type": "buttons", "body": "Tap below to start a new session.",
@@ -1532,6 +1616,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
                 "DATE":          str(row.get("DATE", "")).strip(),
+                "STATE":         _state_from_row(row),   # destination state from file
+                "CITY":          str(row.get("CITY", "")).strip(),
                 "LORRY":         None if _is_mine else "OTHER_USER",
                 "SPLIT_LORRIES": None,
             })
@@ -1588,12 +1674,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             MIN_UTIL_TO_ASSIGN  as _MIN_UTIL,
         )
 
-        # Step 1 — exact-route buckets (skip other-user rows — they stay blank)
+        # Step 1 — bucket by (ROUTE, STATE) so KV11A-KL and KV11A-SELANGOR
+        # are treated as separate groups.  Items without a known state fall into
+        # a generic bucket keyed by route only.
         route_buckets: dict[str, list] = defaultdict(list)
         for it in items:
             if it.get("LORRY") == "OTHER_USER":
                 continue
-            route_buckets[it["ROUTE"].strip().upper()].append(it)
+            _rt_key = it["ROUTE"].strip().upper()
+            _st_key = it.get("STATE", "")
+            # Only split urban routes by state; outstation routes share one bucket
+            if _st_key and _classify_dest_group(_rt_key, _st_key) in _DEST_URBAN_GROUPS:
+                _rt_key = f"{_rt_key}||{_st_key}"
+            route_buckets[_rt_key].append(it)
 
         # Step 2 — cluster same-way buckets into corridor super-groups
         # Each super-group is a list of route-bucket lists.
@@ -1805,7 +1898,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                claim best-fit lorries before lighter ones.
             """
             dest_pri = _DEST_SORT_PRI.get(
-                _classify_dest_group(g[0]["ROUTE"]), 2
+                _classify_dest_group(g[0]["ROUTE"], g[0].get("STATE", "")), 2
             )
             dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
             earliest = min(dates) if dates else "9999-12-31"
@@ -1913,8 +2006,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # ── Destination-based lorry size enforcement ───────────────────────
             # LARGE_LONG  (Pahang/Kuantan/Terengganu/…): must use ≥14T lorry
             # MEDIUM_LONG (Seremban/NS/Rawang/T.Malim/…): must use ≥11T lorry
-            # KL_SELANGOR (KV routes): must use <11T lorry (no large/medium)
-            _dest_grp   = _classify_dest_group(route)
+            # KL / SELANGOR / KL_SELANGOR: must use <11T lorry (no large/medium)
+            _item_state = group_items[0].get("STATE", "")
+            _dest_grp   = _classify_dest_group(route, _item_state)
             _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
             # Exclude undersized lorries for long-distance destinations
             if _dest_min_t > 0:
@@ -1924,7 +2018,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if float(r["TON"]) < _dest_min_t
                 }
             # Exclude oversized lorries (≥11T) for KL/Selangor urban routes
-            if _dest_grp == "KL_SELANGOR":
+            if _dest_grp in _DEST_URBAN_GROUPS:
                 excluded = excluded | {
                     str(r["LORRY"]).strip().upper()
                     for _, r in engine.eligible_lorries.iterrows()
@@ -3029,8 +3123,9 @@ def _build_summary(sess) -> str:
             cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
             dt_tag = f" [{dt}]" if dt else ""
             _dest_lbl = {
-                "LARGE_LONG": "🟥", "MEDIUM_LONG": "🟧", "KL_SELANGOR": "🟩"
-            }.get(_classify_dest_group(it.get("ROUTE", "")), "")
+                "LARGE_LONG": "🟥", "MEDIUM_LONG": "🟧",
+                "SELANGOR": "🟦", "KL": "🟩", "KL_SELANGOR": "🟩",
+            }.get(_classify_dest_group(it.get("ROUTE", ""), it.get("STATE", "")), "")
             lines.append(f"  {dn_short}  {_dest_lbl}{rcode}  {cust}  {w}T{dt_tag}")
 
         lines.append("")   # blank line between lorries
@@ -3533,15 +3628,20 @@ def _export_result_inner(sess) -> list[str]:
     _INTERNAL_COLS = {"WEIGHT(T)"}
 
     # Add DEST_STATE column showing classified destination per row
+    # Uses actual STATE column from uploaded file when available; falls back to route prefix.
     if "ROUTE" in new_df.columns:
         _dest_state_map = {
             "LARGE_LONG":  "OUTSTATION-LARGE",
             "MEDIUM_LONG": "OUTSTATION-MEDIUM",
+            "KL":          "KUALA LUMPUR",
+            "SELANGOR":    "SELANGOR",
             "KL_SELANGOR": "KL/SELANGOR",
         }
-        new_df["DEST_STATE"] = new_df["ROUTE"].apply(
-            lambda r: _dest_state_map.get(_classify_dest_group(str(r)), "")
-        )
+        def _row_dest_state(row):
+            st = _state_from_row(row)
+            grp = _classify_dest_group(str(row.get("ROUTE", "")), st)
+            return _dest_state_map.get(grp, st or "")
+        new_df["DEST_STATE"] = new_df.apply(_row_dest_state, axis=1)
 
     if is_new_fmt:
         # Reorder columns: required spec first, then any extras from the upload
