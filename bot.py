@@ -2064,8 +2064,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
             # ── Strict lorry-route reservations ───────────────────────────────
             # e.g. BQY7823 → Rawang only; BQU3875 → Pahang only.
-            _grp_rt_text = " ".join(it.get("ROUTE", "") for it in group_items)
-            excluded = excluded | _strict_route_excl(_grp_rt_text)
+            # Check each unique route code individually — a joined text would
+            # falsely pass if the group happened to contain an allowed route code
+            # alongside a disallowed one (e.g. "KV02A PH09 ..." lets BQY7823 slip).
+            _unique_routes = {it.get("ROUTE", "") for it in group_items}
+            _strict_excl: set[str] = set()
+            for _ur in _unique_routes:
+                _strict_excl |= _strict_route_excl(_ur)
+            excluded = excluded | _strict_excl
 
             # ── Cross-direction incompatibility for large lorries ─────────────
             # Large (≥14T) lorries do exactly 1 outstation trip and cannot switch
