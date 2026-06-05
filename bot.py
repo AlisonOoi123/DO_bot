@@ -2025,6 +2025,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return cap * 2  # morning + afternoon trips
                 return cap
 
+            # ── Destination group — must be defined BEFORE _session_full ─────────
+            # LARGE_LONG  (Pahang/Kuantan/Terengganu/…): must use ≥14T lorry
+            # MEDIUM_LONG (Seremban/NS/Rawang/T.Malim/…): must use ≥11T lorry
+            # KL / SELANGOR / KL_SELANGOR: must use <11T lorry (no large/medium)
+            _item_state = group_items[0].get("STATE", "")
+            _dest_grp   = _classify_dest_group(route, _item_state)
+
             # Also exclude lorries already full or incompatible with this route
             _session_full = {
                 p for p in _session_loads
@@ -2039,11 +2046,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
             excluded = sess["unavailable"] | _session_full
 
             # ── Destination-based lorry size enforcement ───────────────────────
-            # LARGE_LONG  (Pahang/Kuantan/Terengganu/…): must use ≥14T lorry
-            # MEDIUM_LONG (Seremban/NS/Rawang/T.Malim/…): must use ≥11T lorry
-            # KL / SELANGOR / KL_SELANGOR: must use <11T lorry (no large/medium)
-            _item_state = group_items[0].get("STATE", "")
-            _dest_grp   = _classify_dest_group(route, _item_state)
             _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
             # Exclude undersized lorries for long-distance destinations
             if _dest_min_t > 0:
