@@ -70,10 +70,15 @@ _DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
 # KV routes that go outstation (Rawang / Tanjung Malim direction):
 _DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
 
-# Minimum lorry tonnage per destination group
+# Minimum lorry tonnage per destination group.
+# These are soft floors — lorries at or above this tonnage are eligible.
+# The engine further PREFERS the largest lorries for long-haul routes
+# (via _ULTRA_LONG_HAUL_MIN_TON preference in lorry_engine.py), so ≥14T
+# lorries will be chosen first for Kuantan/Pahang; BPE9788 (13.3T) only
+# gets used as fallback when all ≥14T lorries are full or excluded.
 _DEST_MIN_TON = {
-    "LARGE_LONG":  14.0,
-    "MEDIUM_LONG": 11.0,
+    "LARGE_LONG":  11.0,   # ≥11T; engine prefers ≥14T for >200km routes
+    "MEDIUM_LONG": 10.5,   # ≥10.5T; covers BQX9983 (10.8T) for NS/Seremban
     "KL":           0.0,   # Kuala Lumpur urban — <11T, no lower bound
     "SELANGOR":     0.0,   # Selangor — <11T, no lower bound
     "KL_SELANGOR":  0.0,   # fallback urban — <11T
@@ -1674,18 +1679,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
             MIN_UTIL_TO_ASSIGN  as _MIN_UTIL,
         )
 
-        # Step 1 — bucket by (ROUTE, STATE) so KV11A-KL and KV11A-SELANGOR
-        # are treated as separate groups.  Items without a known state fall into
-        # a generic bucket keyed by route only.
+        # Step 1 — bucket by (ROUTE, STATE, CITY) for urban routes so items
+        # in the same route code but different states or distant cities don't
+        # share a lorry unnecessarily.
+        # e.g. KV11A-KL-KUALA LUMPUR vs KV11A-SELANGOR-AMPANG are separate.
+        # Outstation routes (LARGE_LONG / MEDIUM_LONG) are NOT split by city —
+        # a single lorry handles all stops on a Kuantan or Seremban run.
         route_buckets: dict[str, list] = defaultdict(list)
         for it in items:
             if it.get("LORRY") == "OTHER_USER":
                 continue
             _rt_key = it["ROUTE"].strip().upper()
             _st_key = it.get("STATE", "")
-            # Only split urban routes by state; outstation routes share one bucket
-            if _st_key and _classify_dest_group(_rt_key, _st_key) in _DEST_URBAN_GROUPS:
-                _rt_key = f"{_rt_key}||{_st_key}"
+            _ct_key = it.get("CITY", "").strip().upper()
+            dest_grp = _classify_dest_group(_rt_key, _st_key)
+            if dest_grp in _DEST_URBAN_GROUPS:
+                # Split urban routes by STATE then CITY for accuracy
+                _sub_key = _st_key
+                if _ct_key and _ct_key not in ("NAN", "NONE", ""):
+                    _sub_key = f"{_st_key}|{_ct_key}"
+                if _sub_key:
+                    _rt_key = f"{_rt_key}||{_sub_key}"
             route_buckets[_rt_key].append(it)
 
         # Step 2 — cluster same-way buckets into corridor super-groups
@@ -3091,9 +3105,10 @@ def _build_summary(sess) -> str:
             else:
                 _size_tag = "VAN"
 
-            # Detect if this lorry does 2 trips (total weight > cap)
+            # Only small lorries (<11T) can do 2 trips.
+            # Large/medium lorries always do 1 trip per day.
             _trip_info = ""
-            if total_w > cap * 1.02:
+            if cap < 11.0 and total_w > cap * 1.02:
                 _t1w = round(cap, 1)
                 _t2w = round(total_w - cap, 3)
                 _trip_info = f"  🌅T1:{_t1w}T 🌆T2:{_t2w}T"
