@@ -2006,9 +2006,30 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
+
+            # ── Effective-capacity helper (accounts for 2-trip local runs) ─────
+            # LARGE lorries (≥14T): hard cap — outstation runs take the full day.
+            # MEDIUM lorries (11–14T) on LOCAL routes: 2 trips (morning + afternoon).
+            # SMALL lorries (<11T) on LOCAL routes: 2 trips.
+            # Any lorry on OUTSTATION routes: hard cap (1 trip).
+            def _eff_cap_for(plate: str, grp_dest: str) -> float:
+                cap = float(_lorry_cap_map.get(plate, 0.0))
+                if cap >= 14.0:
+                    return cap   # large lorries never double-trip
+                lorry_dest = _classify_dest_group(
+                    _session_routes.get(plate, ""))
+                # Allow double capacity only when BOTH lorry's existing route
+                # AND the new group are LOCAL (KV/KL/Selangor).
+                if (lorry_dest in _DEST_URBAN_GROUPS
+                        and grp_dest in _DEST_URBAN_GROUPS):
+                    return cap * 2  # morning + afternoon trips
+                return cap
+
             # Also exclude lorries already full or incompatible with this route
-            _session_full = {p for p in _session_loads
-                             if _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) < total_w}
+            _session_full = {
+                p for p in _session_loads
+                if _eff_cap_for(p, _dest_grp) - _session_loads.get(p, 0.0) < total_w
+            }
             _session_incompatible = {
                 p for p in _session_loads
                 if _session_routes.get(p)
@@ -2044,27 +2065,35 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _grp_rt_text = " ".join(it.get("ROUTE", "") for it in group_items)
             excluded = excluded | _strict_route_excl(_grp_rt_text)
 
-            # ── Cross-direction incompatibility for large/medium lorries ───────
-            # Large (≥14T) and medium (≥11T) lorries do at most 1 trip per day
-            # and cannot serve a different direction in the same session.
-            # Small lorries (<11T) are allowed TRIP 2 on same-corridor routes.
+            # ── Cross-direction incompatibility for large lorries ─────────────
+            # Large (≥14T) lorries do exactly 1 outstation trip and cannot switch
+            # direction mid-session.  Medium lorries (11–14T) serving LOCAL routes
+            # may do a 2nd trip so they are NOT blocked cross-direction for LOCAL.
             _session_incompatible_lm = {
                 p for p in _session_loads
-                if _lorry_cap_map.get(p, 0) >= 11.0   # large or medium
+                if _lorry_cap_map.get(p, 0) >= 14.0   # large lorries only
+                and _session_routes.get(p)
+                and not _routes_on_same_way(route, _session_routes.get(p, ""))
+            }
+            # Also block medium lorries that already served OUTSTATION from
+            # switching to a different outstation direction.
+            _session_incompatible_lm |= {
+                p for p in _session_loads
+                if 11.0 <= _lorry_cap_map.get(p, 0) < 14.0   # medium
+                and _classify_dest_group(
+                    _session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
+                and _dest_grp not in _DEST_URBAN_GROUPS
                 and _session_routes.get(p)
                 and not _routes_on_same_way(route, _session_routes.get(p, ""))
             }
             excluded = excluded | _session_incompatible_lm
 
             # ── Within-session lorry sharing ──────────────────────────────────
-            # Before consuming a new lorry, check if a lorry already used this
-            # session has enough remaining capacity.  Prefer same-corridor lorries
-            # (same direction); fall back only if no compatible match exists.
             _share_pool = [
-                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                (_eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)), p)
                 for p in _session_loads
                 if p in _lorry_cap_map
-                and float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= total_w
+                and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                 and p not in excluded
                 and float(_lorry_cap_map.get(p, 0)) >= _dest_min_t
             ]
@@ -3105,13 +3134,17 @@ def _build_summary(sess) -> str:
             else:
                 _size_tag = "VAN"
 
-            # Only small lorries (<11T) can do 2 trips.
-            # Large/medium lorries always do 1 trip per day.
+            # Trip display: LARGE (≥14T) never splits; MEDIUM/SMALL on LOCAL routes may split.
             _trip_info = ""
-            if cap < 11.0 and total_w > cap * 1.02:
+            _all_local_its = all(
+                _classify_dest_group(i.get("ROUTE", "")) in _DEST_URBAN_GROUPS
+                for i in its
+            )
+            if cap < 14.0 and _all_local_its and total_w > cap * 1.02:
                 _t1w = round(cap, 1)
                 _t2w = round(total_w - cap, 3)
-                _trip_info = f"  🌅T1:{_t1w}T 🌆T2:{_t2w}T"
+                _trip_info = (f"  🌅Morning(T1):{_t1w}T"
+                              f"  🌆Afternoon(T2):{_t2w}T")
 
             util_pct = round(min(total_w, cap) / cap * 100, 1)
             if util_pct > 100:
@@ -3733,10 +3766,13 @@ def _export_result_inner(sess) -> list[str]:
                 _plate_rows.setdefault(_pl, []).append(_ri)
 
         # Track trip number per lorry per row.
-        # Rules:
-        #   Large  (≥14T): always TRIP 1 — one trip per day, no exceptions.
-        #   Medium (11–14T): TRIP 1 only unless same-direction overflow forced it.
-        #   Small  (<11T):  may do TRIP 2 when cumulative weight exceeds capacity.
+        # Trip rules (based on lorry size AND route type):
+        #   LARGE  (≥14T): always TRIP 1 — one outstation run per day.
+        #   MEDIUM (11–14T) on OUTSTATION routes: TRIP 1 only.
+        #   MEDIUM (11–14T) on LOCAL (KV/KL/Selangor) routes: TRIP 1 morning,
+        #     TRIP 2 afternoon when cumulative weight exceeds capacity.
+        #     Morning: 8:00–11:59am  |  Afternoon: 1:00–5:30pm
+        #   SMALL  (<11T) on LOCAL routes: TRIP 1 / TRIP 2 by capacity.
         _trip_vals = {}
         for _pl, _ridxs in _plate_rows.items():
             _cap_val = 0.0
@@ -3746,6 +3782,14 @@ def _export_result_inner(sess) -> list[str]:
                     if str(_er["LORRY"]).strip().upper() == _pl:
                         _cap_val = float(_er["TON"])
                         break
+
+            # Determine if ALL rows for this lorry are on LOCAL routes
+            _lorry_routes = [str(out_df.at[_ri, "ROUTE"]).strip() for _ri in _ridxs]
+            _lorry_all_local = all(
+                _classify_dest_group(r) in _DEST_URBAN_GROUPS
+                for r in _lorry_routes
+            )
+
             _trip_num = 1
             _cum_w    = 0.0
             for _ri in _ridxs:
@@ -3757,9 +3801,16 @@ def _export_result_inner(sess) -> list[str]:
                 _wt = (float(_wt_raw) / 1000.0
                        if "GROSS WEIGHT" in out_df.columns and "WEIGHT(T)" not in out_df.columns
                        else float(_wt_raw or 0))
-                # Only small lorries (<11T) can do TRIP 2.
-                # Large (≥14T) and medium (11–14T) are always TRIP 1.
-                if _cap_val < 11.0 and _cap_val > 0 and _cum_w + _wt > _cap_val * 1.02:
+
+                # LARGE lorries (≥14T): always TRIP 1 regardless of route
+                # MEDIUM/SMALL on LOCAL routes: allow TRIP 2 when capacity overflows
+                _can_trip2 = (
+                    _cap_val > 0
+                    and _cap_val < 14.0       # not a large lorry
+                    and _lorry_all_local      # only local (KV) routes
+                    and _cum_w + _wt > _cap_val * 1.02
+                )
+                if _can_trip2:
                     _trip_num = 2
                     _cum_w    = _wt
                 else:
