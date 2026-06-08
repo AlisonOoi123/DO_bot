@@ -14,7 +14,8 @@ __pycache__/
 data/daily_assignments.json
 daily_assignments.json
 
-# Large data files — store on server or object storage
+# Large data files — commit the .zip; ignore the raw .xls/.xlsx
+data/ZSDOROUTEWRH.xls
 data/ZSDOROUTEWRH.xlsx
 data/ZSDOROUTEWRH-bot.xlsx
 
