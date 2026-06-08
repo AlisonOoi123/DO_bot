@@ -2318,7 +2318,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     p for p in _preferred
                     if p in _lorry_cap_map
                     and p not in _hard_excl
-                    and _session_loads.get(p, 0) < _lorry_cap_map.get(p, 0) * 0.98
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w * 0.85
                 ]
                 if _pref_avail:
