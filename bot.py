@@ -2911,10 +2911,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _best_gain = _gain
                         _best_src, _best_dst = _pa, _pb
             if _best_src:
-                # Validate: destination lorry must be allowed for all source routes
+                # Validate: destination lorry must be allowed for all source routes,
+                # and must be a preferred lorry for any route that has preferences.
                 _src_routes = {it["ROUTE"] for it in _pit[_best_src] if it.get("ROUTE")}
                 _merge_route_ok = not any(
                     _best_dst in _strict_route_excl(r) for r in _src_routes
+                ) and not any(
+                    _preferred_lorries_for_route(r)
+                    and _best_dst not in _preferred_lorries_for_route(r)
+                    for r in _src_routes
                 )
                 if _merge_route_ok:
                     for _it in _pit[_best_src]:
@@ -2973,6 +2978,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             if (_load_src - _it["WEIGHT"]) / _cap_src < _REBAL_THRESHOLD:
                                 continue
                         _route_it = _it.get("ROUTE", "")
+                        # Strict route guard: don't move item to a lorry that
+                        # is not allowed to serve the item's route
+                        if _route_it and _dst in _strict_route_excl(_route_it):
+                            continue
+                        # Preferred lorry guard: if the route has designated
+                        # lorries, only move to one of them (or to lorries with
+                        # no restriction when no preferred lorry is available)
+                        _it_pref = _preferred_lorries_for_route(_route_it)
+                        if _it_pref and _dst not in _it_pref:
+                            continue
                         if _routes_dst and _route_it:
                             if not any(_routes_on_same_way(_route_it, _rd) for _rd in _routes_dst):
                                 continue
