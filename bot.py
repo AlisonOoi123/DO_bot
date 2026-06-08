@@ -1850,6 +1850,55 @@ def _handle_excel_upload(phone, sess, file_bytes):
         max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
             if not engine.eligible_lorries.empty else 99.0
 
+        # Build live GPS centroids from uploaded file LONGITUD column.
+        # These are more accurate than historical centroids because they
+        # reflect the actual delivery points in this specific DO batch.
+        _live_centroids: dict[str, tuple] = {}
+        for _rt_key_raw, _bucket in route_buckets.items():
+            _lats, _lons = [], []
+            for _it in _bucket:
+                _row_idx = _it.get("ROW_IDX")
+                if _row_idx is None:
+                    continue
+                try:
+                    _lng_raw = str(raw.loc[_row_idx, "LONGITUD"]).strip()
+                    if _lng_raw and _lng_raw.lower() not in ("nan", "none", ""):
+                        _lng_raw = _lng_raw.replace(",", " ")
+                        _parts = _lng_raw.split()
+                        if len(_parts) >= 2:
+                            _lat, _lon = float(_parts[0]), float(_parts[1])
+                            if -90 <= _lat <= 90 and 50 <= _lon <= 180:
+                                _lats.append(_lat)
+                                _lons.append(_lon)
+                except Exception:
+                    pass
+            if _lats:
+                _base_rt = _rt_key_raw.split("||")[0]   # strip state/city suffix
+                _live_centroids[_base_rt] = (
+                    sum(_lats) / len(_lats),
+                    sum(_lons) / len(_lons),
+                )
+
+        def _best_centroid(route_str: str) -> tuple | None:
+            """Return live GPS centroid if available, else historical."""
+            key = route_str.strip().upper().split("||")[0]
+            live = _live_centroids.get(key)
+            if live:
+                return live
+            return _route_centroid(route_str)
+
+        # Build per-route STATE for outstation direction guard.
+        # Two outstation routes with different states are only merged if they
+        # point in the same geographic direction (strict 55° bearing threshold).
+        _route_state: dict[str, str] = {}
+        for _rt_key_raw, _bucket in route_buckets.items():
+            _base_rt = _rt_key_raw.split("||")[0]
+            for _it in _bucket:
+                _st = _it.get("STATE", "").strip().upper()
+                if _st and _st not in ("NAN", "NONE", ""):
+                    _route_state[_base_rt] = _st
+                    break
+
         bucket_list = list(route_buckets.values())   # list of [item, …]
         in_group    = [False] * len(bucket_list)
         super_groups: list[list] = []                # each entry = flat item list
@@ -1924,14 +1973,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # both use the KL→East highway and their centroids are ≈160 km apart.
         # East Malaysia (Sabah/Sarawak) is ≈1 000 km from KL → always rejected.
         def _group_centroid(items):
-            """Average lat/lng centroid of all routes in a group."""
+            """Average lat/lng centroid using live GPS first, historical fallback."""
             seen, lats, lons = set(), [], []
             for it in items:
                 r = it["ROUTE"]
                 if r in seen:
                     continue
                 seen.add(r)
-                c = _route_centroid(r)
+                c = _best_centroid(r)   # live GPS preferred over historical
                 if c:
                     lats.append(c[0]); lons.append(c[1])
             if not lats:
@@ -1978,8 +2027,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if n_routes > _MAX_STOPS:
                     continue
 
-                # Geographic check: candidate centroid vs merged group centroid
-                cand_cent = _route_centroid(cand_route)
+                # Geographic check: use live GPS centroid (from uploaded LONGITUD)
+                # when available, falling back to historical centroid.
+                cand_cent = _best_centroid(cand_route)
                 if merged_cent is None or cand_cent is None:
                     continue
                 dist_km = _haversine_km(merged_cent[0], merged_cent[1],
@@ -1987,11 +2037,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if dist_km > 180.0:
                     continue
 
-                # Bearing check — ALL PAIRS: candidate must be directionally
-                # compatible with every existing regional route in the group.
-                # Using the rolling centroid alone can drift as groups merge,
-                # allowing e.g. K.Selangor (304°) + Terengganu (34°) = 90°
-                # to slip through after KV03A+PK02 centroid shifts to 316°.
+                # Bearing check — ALL PAIRS with 55° strict threshold.
+                # 80° was too permissive: Seremban (SE 128°) vs Pahang (NE 56°)
+                # = 72.5° bearing diff passed incorrectly. Real GPS gives 80.8°.
+                # 55° blocks clearly different-direction routes while still
+                # allowing same-state or truly adjacent routes (e.g. PH06+PH09
+                # differ by ~25°).
+                _CROSS_BEARING_LIMIT = 55.0
                 b_cand = _bearing_deg(_DEPOT[0], _DEPOT[1],
                                       cand_cent[0], cand_cent[1])
                 depot_to_cand = _haversine_km(_DEPOT[0], _DEPOT[1],
@@ -1999,20 +2051,29 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if depot_to_cand < 50.0:   # local route — skip bearing check
                     continue
                 bearing_ok = True
-                bearing_checked = False  # must have ≥1 regional route in group to merge
+                bearing_checked = False
                 for ex_route in {it["ROUTE"] for it in merged}:
-                    ec = _route_centroid(ex_route)
+                    ec = _best_centroid(ex_route)
                     if ec is None:
                         continue
                     d_ex = _haversine_km(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
-                    if d_ex < 50.0:        # local route — skip bearing check
+                    if d_ex < 50.0:
                         continue
                     bearing_checked = True
                     b_ex = _bearing_deg(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
-                    if _bearing_diff(b_ex, b_cand) > 80.0:
+                    if _bearing_diff(b_ex, b_cand) > _CROSS_BEARING_LIMIT:
                         bearing_ok = False
                         break
-                # Reject if merged group has no regional routes — can't validate direction
+                    # State mismatch guard: outstation routes in different states
+                    # must also pass the strict bearing threshold.
+                    # e.g. NS (Negeri Sembilan) vs PH (Pahang) are different
+                    # states pointing in opposite directions — never merge them.
+                    ex_state   = _route_state.get(ex_route.strip().upper().split("||")[0], "")
+                    cand_state = _route_state.get(cand_route.strip().upper().split("||")[0], "")
+                    if (ex_state and cand_state and ex_state != cand_state
+                            and _bearing_diff(b_ex, b_cand) > 30.0):
+                        bearing_ok = False
+                        break
                 if not bearing_checked or not bearing_ok:
                     continue
 
