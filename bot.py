@@ -1781,6 +1781,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if _lic_key and _lic_key not in {"", "nan", "none", "n/a", "-"}:
                     _lorry_init = _existing_lic.upper()
 
+            # Parse GPS coordinates from LONGITUD column (format: "lat lon")
+            _gps_lat, _gps_lon = None, None
+            _loc_raw = str(row.get("LONGITUD", "")).strip()
+            if _loc_raw and _loc_raw.lower() not in ("nan", "none", ""):
+                _loc_parts = _loc_raw.replace(",", " ").split()
+                if len(_loc_parts) >= 2:
+                    try:
+                        _gps_lat = float(_loc_parts[0])
+                        _gps_lon = float(_loc_parts[1])
+                    except ValueError:
+                        pass
+
             items.append({
                 "ROW_IDX":       idx,
                 "DO NUMBER":     str(row["DO NUMBER"]).strip(),
@@ -1792,6 +1804,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "DATE":          str(row.get("DATE", "")).strip(),
                 "STATE":         _state_from_row(row),   # destination state from file
                 "CITY":          str(row.get("CITY", "")).strip(),
+                "GPS_LAT":       _gps_lat,
+                "GPS_LON":       _gps_lon,
                 "LORRY":         _lorry_init,
                 "SPLIT_LORRIES": None,
             })
@@ -1896,6 +1910,21 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             _prefill_routes[plate] = it["ROUTE"]
                         sess["assigned"][it["DO NUMBER"]] = plate
 
+        def _bearing_octant(lat: float, lon: float) -> str:
+            """Map a GPS coordinate to a coarse 8-direction sector from depot.
+            Used to sub-bucket DOs geographically so items going in very
+            different directions (e.g. north vs south) never share a lorry.
+            """
+            from lorry_engine import _bearing_deg as _bd, _DEPOT as _DP
+            dist_km = ((lat - _DP[0])**2 + (lon - _DP[1])**2) ** 0.5 * 111
+            if dist_km < 8.0:
+                return "LOCAL"   # too close to depot to have a meaningful direction
+            b = _bd(_DP[0], _DP[1], lat, lon)
+            # Divide 360° into 8 sectors, each 45° wide, named by compass point
+            dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+            idx = int((b + 22.5) / 45) % 8
+            return dirs[idx]
+
         for it in items:
             lorry = it.get("LORRY")
             if lorry in ("OTHER_USER", "NOT_TODAY"):
@@ -1907,13 +1936,39 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _st_key = it.get("STATE", "")
             _ct_key = it.get("CITY", "").strip().upper()
             dest_grp = _classify_dest_group(_rt_key, _st_key)
+
+            # Geographic sub-bucketing — applies to ALL routes.
+            # Primary key: state (identifies destination region).
+            # Secondary key:
+            #   • Urban routes  → city (tight street-level grouping)
+            #   • Outstation    → GPS bearing octant from depot (N/NE/E/…/NW)
+            #     This prevents two DOs with the same route code but pointing in
+            #     genuinely opposite directions (e.g. north vs south) from sharing
+            #     a lorry, which is the root cause of wrong mixed-direction runs.
+            _sub_key = _st_key
             if dest_grp in _DEST_URBAN_GROUPS:
-                # Split urban routes by STATE then CITY for accuracy
-                _sub_key = _st_key
+                # Urban: split by state + city
                 if _ct_key and _ct_key not in ("NAN", "NONE", ""):
                     _sub_key = f"{_st_key}|{_ct_key}"
-                if _sub_key:
-                    _rt_key = f"{_rt_key}||{_sub_key}"
+            else:
+                # Outstation: split by state + GPS bearing octant when available
+                _lat = it.get("GPS_LAT")
+                _lon = it.get("GPS_LON")
+                if _lat is not None and _lon is not None:
+                    _octant = _bearing_octant(_lat, _lon)
+                    if _octant != "LOCAL":
+                        _sub_key = f"{_st_key}|{_octant}"
+                    else:
+                        # Very close to depot — use city as fallback sub-key
+                        if _ct_key and _ct_key not in ("NAN", "NONE", ""):
+                            _sub_key = f"{_st_key}|{_ct_key}"
+                else:
+                    # No GPS — fall back to state + city
+                    if _ct_key and _ct_key not in ("NAN", "NONE", ""):
+                        _sub_key = f"{_st_key}|{_ct_key}"
+
+            if _sub_key:
+                _rt_key = f"{_rt_key}||{_sub_key}"
             route_buckets[_rt_key].append(it)
 
         # Step 2 — cluster same-way buckets into corridor super-groups
@@ -1928,37 +1983,50 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _st:
                 _route_state[_rt_key.strip().upper()] = str(_st).strip().upper()
 
-        # Build live GPS centroids from LONGITUD column in uploaded file
+        # Build live GPS centroids from per-item GPS_LAT/GPS_LON coordinates.
+        # Compute the TRUE average centroid for each bucket key (route||state|octant)
+        # so that bearing checks use actual delivery coordinates, not a single sample.
         _live_centroids: dict[str, tuple] = {}
-        if "LONGITUD" in df.columns and "ROUTE" in df.columns:
-            for _, _row in df.iterrows():
-                _rt = str(_row.get("ROUTE", "")).strip().upper()
-                _loc = str(_row.get("LONGITUD", "")).strip()
-                if not _rt or not _loc or _loc.lower() in ("nan", "none", ""):
-                    continue
-                parts = _loc.split()
-                if len(parts) >= 2:
-                    try:
-                        _lat, _lon = float(parts[0]), float(parts[1])
-                        if _rt not in _live_centroids:
-                            _live_centroids[_rt] = (_lat, _lon)
-                    except ValueError:
-                        pass
+        _cent_acc: dict[str, list] = {}   # key → list of (lat, lon)
+        for _bk, _bkt in route_buckets.items():
+            for _it in _bkt:
+                _la = _it.get("GPS_LAT")
+                _lo = _it.get("GPS_LON")
+                if _la is not None and _lo is not None:
+                    _cent_acc.setdefault(_bk, []).append((_la, _lo))
+        for _bk, _pts in _cent_acc.items():
+            _avg_lat = sum(p[0] for p in _pts) / len(_pts)
+            _avg_lon = sum(p[1] for p in _pts) / len(_pts)
+            _live_centroids[_bk] = (_avg_lat, _avg_lon)
+            # Also index by the bare route key (without ||suffix) for fallback
+            _bare = _bk.split("||")[0]
+            if _bare not in _live_centroids:
+                _live_centroids[_bare] = (_avg_lat, _avg_lon)
 
         def _best_centroid(route_str: str) -> tuple | None:
-            key = route_str.strip().upper().split("||")[0]
-            live = _live_centroids.get(key)
+            full_key = route_str.strip().upper()
+            # Try full bucket key first (route||state|octant) for per-sub-bucket accuracy
+            live = _live_centroids.get(full_key)
+            if live:
+                return live
+            # Fallback to bare route key
+            bare_key = full_key.split("||")[0]
+            live = _live_centroids.get(bare_key)
             if live:
                 return live
             return _route_centroid(route_str)
 
-        bucket_list = list(route_buckets.values())   # list of [item, …]
-        in_group    = [False] * len(bucket_list)
+        # Keep (bucket_key, items) pairs so centroid lookups use the full key
+        # (route||state|octant) for geographic accuracy.
+        bucket_pairs = list(route_buckets.items())   # [(key, [item, …]), …]
+        bucket_list  = [items for _, items in bucket_pairs]
+        in_group     = [False] * len(bucket_list)
         super_groups: list[list] = []                # each entry = flat item list
 
         for i, base_bucket in enumerate(bucket_list):
             if in_group[i]:
                 continue
+            base_bkey  = bucket_pairs[i][0]          # full bucket key incl. ||suffix
             base_route = base_bucket[0]["ROUTE"]
             merged_items = list(base_bucket)
             in_group[i]  = True
@@ -1967,6 +2035,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if in_group[j]:
                     continue
                 cand_bucket = bucket_list[j]
+                cand_bkey   = bucket_pairs[j][0]
                 cand_route  = cand_bucket[0]["ROUTE"]
 
                 # All routes already absorbed into merged_items
@@ -1983,11 +2052,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     or bool(_base_pref & _cand_pref)
                 )
 
+                # Don't merge buckets whose GPS bearing octants are incompatible.
+                # Extract the octant from the bucket key (format: route||state|OCTANT).
+                def _octant_from_bkey(bk: str) -> str:
+                    parts = bk.split("||")
+                    if len(parts) >= 2:
+                        sub = parts[1].split("|")
+                        if len(sub) >= 2:
+                            return sub[-1]
+                    return ""
+                _OPPOSITE = {"N": "S", "S": "N", "NE": "SW", "SW": "NE",
+                             "E": "W", "W": "E", "SE": "NW", "NW": "SE"}
+                _oct_base = _octant_from_bkey(base_bkey)
+                _oct_cand = _octant_from_bkey(cand_bkey)
+                _geo_ok = (
+                    not _oct_base or not _oct_cand
+                    or _oct_base == "LOCAL" or _oct_cand == "LOCAL"
+                    or _oct_cand != _OPPOSITE.get(_oct_base, "")
+                )
+
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
                     and _routes_on_same_way(base_route, cand_route)
                     and _pref_overlap
+                    and _geo_ok
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
@@ -2036,8 +2125,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # both use the KL→East highway and their centroids are ≈160 km apart.
         # East Malaysia (Sabah/Sarawak) is ≈1 000 km from KL → always rejected.
         def _group_centroid(items):
-            """Average lat/lng centroid of all routes in a group."""
-            seen, lats, lons = set(), [], []
+            """Average lat/lng centroid of all items in a group.
+            Uses per-item GPS_LAT/GPS_LON when available (live LONGITUD data),
+            falling back to history-based route centroid per distinct route."""
+            lats, lons = [], []
+            for it in items:
+                _la = it.get("GPS_LAT")
+                _lo = it.get("GPS_LON")
+                if _la is not None and _lo is not None:
+                    lats.append(_la); lons.append(_lo)
+            if lats:
+                return (sum(lats) / len(lats), sum(lons) / len(lons))
+            # Fallback: history centroids per distinct route
+            seen = set()
             for it in items:
                 r = it["ROUTE"]
                 if r in seen:
