@@ -1857,6 +1857,30 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _st:
                 _route_state[_rt_key.strip().upper()] = str(_st).strip().upper()
 
+        # Build live GPS centroids from LONGITUD column in uploaded file
+        _live_centroids: dict[str, tuple] = {}
+        if "LONGITUD" in df.columns and "ROUTE" in df.columns:
+            for _, _row in df.iterrows():
+                _rt = str(_row.get("ROUTE", "")).strip().upper()
+                _loc = str(_row.get("LONGITUD", "")).strip()
+                if not _rt or not _loc or _loc.lower() in ("nan", "none", ""):
+                    continue
+                parts = _loc.split()
+                if len(parts) >= 2:
+                    try:
+                        _lat, _lon = float(parts[0]), float(parts[1])
+                        if _rt not in _live_centroids:
+                            _live_centroids[_rt] = (_lat, _lon)
+                    except ValueError:
+                        pass
+
+        def _best_centroid(route_str: str) -> tuple | None:
+            key = route_str.strip().upper().split("||")[0]
+            live = _live_centroids.get(key)
+            if live:
+                return live
+            return _route_centroid(route_str)
+
         bucket_list = list(route_buckets.values())   # list of [item, …]
         in_group    = [False] * len(bucket_list)
         super_groups: list[list] = []                # each entry = flat item list
