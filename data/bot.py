@@ -22,10 +22,302 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
-MASTER_PATH    = os.path.join(_HERE, "master lorry.xlsx")      # read-only, stays in root
-HISTORY_PATH   = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")  # new format history
-HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy fallback
+PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY_DAILY_PLANNING.xlsx")         # lorry naik + route codes
+MASTER_PATH    = PLANNING_PATH   # alias kept for backwards compat inside engine calls
+# History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
+HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
+HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
+HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
+HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
+
+def _load_user_route_prefixes(user: str) -> set | None:
+    """Return the set of route-code prefixes assigned to *user* by reading
+    the '{USER} ROUTE' sheet from LORRY_DAILY_PLANNING.xlsx.
+    The sheet's third column (Unnamed: 2) holds the full route string.
+    Returns None if the file/sheet doesn't exist (no filtering applied).
+    """
+    if not os.path.exists(PLANNING_PATH):
+        return None
+    try:
+        u = user.strip().upper()
+        sheet_name = f"{u} ROUTE"   # e.g. "ABI ROUTE" or "VIVIAN ROUTE"
+        df = pd.read_excel(PLANNING_PATH, sheet_name=sheet_name, header=None)
+        # Route strings are in the 3rd column (index 2); skip header rows
+        route_col = df.iloc[:, 2].dropna().astype(str)
+        prefixes: set[str] = set()
+        for route in route_col:
+            m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
+            if m:
+                prefixes.add(m.group(1).upper())
+        return prefixes if prefixes else None
+    except Exception:
+        return None
+
+# Day-name aliases used in the SCHD sheet headers
+_SCHD_DAY_MAP = {
+    "MON": 0, "MONDAY": 0,
+    "TUES": 1, "TUES.": 1, "TUESDAYS": 1, "TUESDAY": 1, "TUE": 1, "TEUS": 1,
+    "WED": 2, "WEDNESDAY": 2,
+    "THUS": 3, "THURS": 3, "THURSDAY": 3, "THU": 3,
+    "FRI": 4, "FRIDAY": 4,
+    "SAT": 5, "SATURDAY": 5,
+    "SUN": 6, "SUNDAY": 6,
+}
+
+def _load_schedule(user: str) -> dict[int, set[str]]:
+    """Return {weekday_int: set_of_route_prefixes} from the SCHD sheet.
+    weekday_int follows Python's datetime.weekday(): Mon=0 … Sun=6.
+    Returns empty dict if the sheet doesn't exist (no schedule filtering).
+    """
+    if not os.path.exists(PLANNING_PATH):
+        return {}
+    try:
+        u = user.strip().upper()
+        target = f"SCHD({u.lower()})"   # e.g. SCHD(abi)
+        # Sheet names may have trailing spaces — find by stripped comparison
+        xl = pd.ExcelFile(PLANNING_PATH)
+        sheet = next((s for s in xl.sheet_names if s.strip() == target), None)
+        if sheet is None:
+            return {}
+        df = pd.read_excel(PLANNING_PATH, sheet_name=sheet, header=None)
+    except Exception:
+        return {}
+
+    schedule: dict[int, set[str]] = {}
+    # Find the header row (contains day names like MON, TUES, WED …)
+    header_row_idx = None
+    day_cols: dict[int, int] = {}   # weekday_int → column index
+    for ri in range(min(5, len(df))):
+        for ci in range(len(df.columns)):
+            val = str(df.iloc[ri, ci]).strip().upper().rstrip(".")
+            if val in _SCHD_DAY_MAP:
+                header_row_idx = ri
+                break
+        if header_row_idx is not None:
+            break
+
+    if header_row_idx is None:
+        return {}
+
+    for ci in range(len(df.columns)):
+        val = str(df.iloc[header_row_idx, ci]).strip().upper().rstrip(".")
+        if val in _SCHD_DAY_MAP:
+            day_cols[_SCHD_DAY_MAP[val]] = ci
+
+    # Rows below header contain route strings per day column
+    for ri in range(header_row_idx + 1, len(df)):
+        for wd, ci in day_cols.items():
+            cell = str(df.iloc[ri, ci]).strip()
+            if not cell or cell.lower() in ("nan", "none", ""):
+                continue
+            m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', cell)
+            if m:
+                schedule.setdefault(wd, set()).add(m.group(1).upper())
+
+    return schedule
+
+
+def _scheduled_prefixes_for_upload(user: str, upload_dt: datetime | None = None) -> set[str] | None:
+    """Return the set of route prefixes that should be assigned for this upload.
+
+    Logic:
+      • Upload before 12:00 → assign TODAY's scheduled routes
+        (these are the afternoon-trip DOs for today)
+      • Upload at/after 12:00 → assign NEXT WORKING DAY's morning routes
+    Returns None if no schedule found (skip filtering entirely).
+    """
+    schedule = _load_schedule(user)
+    if not schedule:
+        return None
+
+    now = upload_dt or datetime.now()
+    if now.hour < 12:
+        target_date = now.date()
+    else:
+        from datetime import timedelta as _timedelta
+        target_date = now.date() + _timedelta(days=1)
+        # Skip weekends
+        while target_date.weekday() >= 5:
+            target_date += _timedelta(days=1)
+
+    wd = target_date.weekday()
+    prefixes = schedule.get(wd)
+    if prefixes is None:
+        # No routes scheduled for that day — return empty set (nothing to assign)
+        return set()
+    return prefixes
+
+
+def _extract_route_prefix(route: str) -> str:
+    """Extract the leading route code token (e.g. 'KV19A', 'PH09', 'JH09')."""
+    m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
+    return m.group(1).upper() if m else ""
+
+# ── Destination state classification ─────────────────────────────────────────
+# Maps route-code prefix (2-char cluster) to destination group.
+# Groups drive minimum lorry size:
+#   LARGE_LONG  (≥14T) — Pahang, Kuantan, Terengganu, Kelantan, Johor, Perak, etc.
+#   MEDIUM_LONG (≥11T) — Rawang, Tanjung Malim, Kemaman, Port Dickson, Seremban/NS
+#   KL_SELANGOR (<11T) — All KV routes (Klang Valley urban)
+_DEST_LARGE_LONG_CLUSTERS  = {"PH", "TR", "KB", "JH", "PK", "KD", "PN", "MC", "SB", "SR"}
+_DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
+# KV routes that go outstation (Rawang / Tanjung Malim direction):
+_DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
+
+# Minimum lorry tonnage per destination group.
+# These are soft floors — lorries at or above this tonnage are eligible.
+# The engine further PREFERS the largest lorries for long-haul routes
+# (via _ULTRA_LONG_HAUL_MIN_TON preference in lorry_engine.py), so ≥14T
+# lorries will be chosen first for Kuantan/Pahang; BPE9788 (13.3T) only
+# gets used as fallback when all ≥14T lorries are full or excluded.
+_DEST_MIN_TON = {
+    "LARGE_LONG":  11.0,   # ≥11T; engine prefers ≥14T for >200km routes
+    "MEDIUM_LONG": 10.5,   # ≥10.5T; covers BQX9983 (10.8T) for NS/Seremban
+    "KL":           0.0,   # Kuala Lumpur urban — <11T, no lower bound
+    "SELANGOR":     0.0,   # Selangor — <11T, no lower bound
+    "KL_SELANGOR":  0.0,   # fallback urban — <11T
+}
+# Groups that use urban (<11T) lorries only
+_DEST_URBAN_GROUPS = {"KL", "SELANGOR", "KL_SELANGOR"}
+
+def _classify_dest_group(route: str, state: str = "") -> str:
+    """Return destination group for a route + optional explicit state.
+
+    Groups:
+      LARGE_LONG  — Pahang, Kuantan, Terengganu, Kelantan, Johor, Perak, …  (≥14T)
+      MEDIUM_LONG — NS/Seremban, Rawang/T.Malim via KV01A/KV02A            (≥11T)
+      KL          — Kuala Lumpur urban (STATE=KUALA LUMPUR or postcode 50-60k) (<11T)
+      SELANGOR    — Selangor (STATE=SELANGOR or postcode 40-48k)            (<11T)
+      KL_SELANGOR — fallback when state cannot be determined                 (<11T)
+    """
+    r = route.strip().upper()
+    # KV routes heading outstation (Rawang / T.Malim direction)
+    pfx5 = r[:5]
+    if pfx5 in _DEST_MEDIUM_LONG_KV_CODES:
+        return "MEDIUM_LONG"
+    cluster = r[:2]
+    if cluster in _DEST_LARGE_LONG_CLUSTERS:
+        return "LARGE_LONG"
+    if cluster in _DEST_MEDIUM_LONG_CLUSTERS:
+        # NS cluster — Seremban/Negeri Sembilan direction
+        return "MEDIUM_LONG"
+    # KV or other KL/Selangor routes — refine using actual state
+    st = state.strip().upper()
+    if st == "KUALA LUMPUR":
+        return "KL"
+    if st == "SELANGOR":
+        return "SELANGOR"
+    return "KL_SELANGOR"   # unknown — treat as generic urban
+
+# Priority order: long-distance groups must be assigned FIRST so they claim
+# large/medium lorries before KL groups get a chance to take them.
+_DEST_SORT_PRI = {
+    "LARGE_LONG":  0,
+    "MEDIUM_LONG": 1,
+    "SELANGOR":    2,
+    "KL":          2,
+    "KL_SELANGOR": 2,
+}
+
+# ── Strict lorry-route reservations ──────────────────────────────────────────
+# Some lorries are physically configured or contractually bound to specific
+# route directions.  These rules are enforced both ways:
+#   (a) the restricted lorry is excluded from ALL other routes, and
+#   (b) the target route prefers this lorry first.
+# Key: lorry plate.  Value: set of route-code PREFIXES (first 2-5 chars) it
+# is allowed to serve.  Any route whose prefix is NOT in the set is blocked.
+_LORRY_STRICT_ROUTE: dict[str, set] = {
+    "BQU3875": {"PH"},           # 21T — Pahang routes only
+    "BQY7823": {"KV01A", "KV02A"},  # 14.5T — Rawang / T.Malim outstation direction only
+}
+
+def _strict_route_excl(route_text: str) -> set:
+    """Return plates that must NOT serve this route due to strict reservations.
+    route_text: space-joined ROUTE strings for the group.
+    """
+    r = route_text.strip().upper()
+    excl: set[str] = set()
+    for plate, allowed_pfxs in _LORRY_STRICT_ROUTE.items():
+        route_allowed = any(
+            r.startswith(pfx) or re.search(r'\b' + re.escape(pfx), r)
+            for pfx in allowed_pfxs
+        )
+        if not route_allowed:
+            excl.add(plate)
+    return excl
+
+def _resolve_history_path() -> str:
+    """Return the best available history file.
+    Prefers the .xls version (has LONGITUD GPS column) over .xlsx fallbacks.
+    """
+    for p in [HISTORY_PATH_XLS, HISTORY_PATH, HISTORY_PATH_ALT, HISTORY_PATH_OLD]:
+        if os.path.exists(p):
+            return p
+    return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
 DAILY_LOG_PATH = os.path.join(_DATA_DIR, "daily_assignments.json")
+
+# ── Postcode → Malaysian State lookup ────────────────────────────────────────
+# Covers the postcode ranges used by each state.  Used as a fallback when the
+# uploaded DO file does not have a STATE column.
+_POSTCODE_STATE_RANGES = [
+    # (lo, hi, state_name)  — ranges are inclusive
+    (50000, 60999, "KUALA LUMPUR"),
+    (40000, 42999, "SELANGOR"),
+    (43000, 43999, "SELANGOR"),    # Kajang / Hulu Langat
+    (44000, 44999, "SELANGOR"),
+    (45000, 45999, "SELANGOR"),    # Rawang / Ulu Selangor
+    (47000, 47999, "SELANGOR"),
+    (48000, 48999, "SELANGOR"),    # Kuala Selangor
+    (63000, 63999, "SELANGOR"),
+    (64000, 64999, "SELANGOR"),
+    (68000, 68999, "SELANGOR"),    # Ampang / Ulu Langat
+    (70000, 73999, "NEGERI SEMBILAN"),
+    (25000, 28999, "PAHANG"),
+    (39000, 39999, "PAHANG"),
+    (18000, 18999, "TERENGGANU"),
+    (20000, 24999, "TERENGGANU"),
+    (15000, 17999, "KELANTAN"),
+    (80000, 83999, "JOHOR"),
+    (84000, 86999, "JOHOR"),
+    (30000, 34999, "PERAK"),
+    (35000, 36999, "PERAK"),
+    (5000,  9999,  "KEDAH"),
+    (10000, 14999, "PENANG"),
+    (75000, 78999, "MELAKA"),
+    (88000, 91300, "SABAH"),
+    (93000, 98999, "SARAWAK"),
+]
+
+def _postcode_to_state(postcode) -> str:
+    """Return Malaysian state name from postcode, or '' if unknown."""
+    try:
+        pc = int(str(postcode).strip().split()[0])
+    except (ValueError, TypeError):
+        return ""
+    for lo, hi, state in _POSTCODE_STATE_RANGES:
+        if lo <= pc <= hi:
+            return state
+    return ""
+
+def _state_from_row(row) -> str:
+    """Derive destination state from a DataFrame row.
+    Priority: STATE column > POSCODE > LONGITUD geocoding (future).
+    """
+    # 1. Explicit STATE column
+    raw_state = str(row.get("STATE", "")).strip().upper()
+    if raw_state and raw_state not in ("NAN", "NONE", "", "-"):
+        return raw_state
+    # 2. POSCODE column
+    pc_val = row.get("POSCODE", "") or row.get("POSTCODE", "")
+    if pc_val:
+        st = _postcode_to_state(pc_val)
+        if st:
+            return st.upper()
+    return ""
+
+# ── Shared UI constants ───────────────────────────────────────────────────────
+_HI_BTN = {"_type": "buttons", "body": "Tap below to start a new session.",
+            "buttons": [{"id": "hi", "title": "👋 Hi"}]}
 
 # ── Daily assignment log (persists across conversations) ─────────────────────
 
@@ -196,10 +488,6 @@ def handle_message(phone: str, text: str = None,
     text = (text or "").strip()
     cmd_lower = text.lower().strip()
 
-    # Defined here so it's available everywhere inside handle_message
-    _HI_BTN = {"_type": "buttons", "body": "Tap below to start a new session.",
-                "buttons": [{"id": "hi", "title": "👋 Hi"}]}
-
     # ── Global commands ───────────────────────────────────────────────────────
     if text.lower() in ("reset", "restart", "start over"):
         reset_session(phone)
@@ -265,73 +553,13 @@ def handle_message(phone: str, text: str = None,
         ]
 
     # ── Step 1: User tapped a DO# → show available lorry list ──────────────
+    # ── Step 1: User tapped a DO# → show lorry picker (button pages) ────────
     if text.lower().startswith("select_do "):
-        do_num = text.split(" ", 1)[1].strip().upper()
+        parts  = text.strip().split(" ")
+        do_num = parts[1].strip().upper() if len(parts) > 1 else ""
+        page   = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        return _lorry_picker_buttons(sess, do_num, page)
 
-        # Find the DO in pending_dos
-        target_do = next((d for d in sess.get("pending_dos", [])
-                          if d["DO NUMBER"] == do_num), None)
-        if not target_do:
-            return [f"❌ DO# *{do_num}* not found."]
-
-        engine: LorryEngine = sess.get("engine")
-        if not engine:
-            return [f"❌ No engine loaded. Please start a new session."]
-
-        # Exclude current lorry of this DO + all other DOs' lorries + today's log
-        current_lorry = sess["assigned"].get(do_num, "")
-        other_assigned = set()
-        for d in sess.get("pending_dos", []):
-            if d["DO NUMBER"] == do_num:
-                continue
-            for it in d.get("ITEMS", []):
-                lv = it.get("LORRY", "")
-                if lv not in ("NO_LORRY", "SPLIT", "", None):
-                    other_assigned.add(lv)
-                for b in (it.get("SPLIT_LORRIES") or []):
-                    other_assigned.add(b.get("lorry", ""))
-        excluded = (sess.get("unavailable", set()) | get_assigned_today() | other_assigned | {current_lorry})
-        excluded.discard("")
-
-        # Get all eligible lorries sorted by best fit for this DO
-        suggestions = engine.suggest(
-            route=target_do["ROUTE"],
-            total_ton=target_do["TOTAL_TON"],
-            unavailable=excluded,
-            top_n=10,
-        )
-
-        # Also include auto-pick option
-        items = [{
-            "id":          f"select_lorry {do_num} __AUTO__",
-            "title":       "🤖 Auto-pick best",
-            "description": "Let the bot choose the next best lorry",
-        }]
-
-        for s in suggestions:
-            util = round((target_do["TOTAL_TON"] / s["TON_CAPACITY"]) * 100, 1) if s["TON_CAPACITY"] > 0 else 0
-            freq_tag = f"{s['FREQ']} trips" if s["FREQ"] > 0 else "new route"
-            desc = f"{s['TON_CAPACITY']}T  |  {util}%  |  {freq_tag}"
-            items.append({
-                "id":          f"select_lorry {do_num} {s['LORRY']}",
-                "title":       s["LORRY"],
-                "description": desc,
-            })
-
-        if len(items) == 1:
-            # Only auto-pick available — no lorries fit
-            return [f"⚠️ No eligible lorry found for *{do_num}* ({target_do['TOTAL_TON']}T). "
-                    f"All lorries may be assigned or under-capacity."]
-
-        return [{
-            "_type":  "do_list",
-            "header": f"Lorries for {do_num}",
-            "body":   f"DO: {do_num}  |  {round(target_do['TOTAL_TON'], 3)}T\nTap a lorry to assign it:",
-            "button": "Pick a Lorry",
-            "items":  items,
-        }]
-
-    # ── Step 2: User tapped a lorry → assign it and show updated summary ─────
     if text.lower().startswith("select_lorry "):
         parts  = text.strip().split(" ", 2)
         if len(parts) < 3:
@@ -451,8 +679,124 @@ def handle_message(phone: str, text: str = None,
         }]
 
     # ── Show plate picker for each action ────────────────────────────────────
+    def _maint_list(action: str) -> list:
+        """
+        Build the lorry picker list for the given action.
+        For RELEASE and FIXED: prepend a 'Done — apply X' row when batch non-empty.
+        BLOCK and BROKEN: single-select, no batch needed.
+        """
+        engine2 = _get_engine_safe()
+        if not engine2:
+            return ["Please log in first. Send hi to start."]
+        taken_today2 = get_assigned_today()
+        broken_map2  = get_broken_lorries()
+        batch        = sess.get(f"_maint_batch_{action}", [])
+
+        all_items2   = []   # unselected lorries
+        selected_rows = []  # already-batched lorries (shown at top with toggle)
+
+        for _, r in engine2.eligible_lorries.iterrows():
+            p2        = str(r["LORRY"]).upper()
+            cap2      = float(r["TON"])
+            is_broken2  = p2 in broken_map2
+            is_blocked2 = p2 in taken_today2
+            if action == "BLOCK"   and is_blocked2: continue
+            if action == "RELEASE" and not is_blocked2: continue
+            if action == "FIXED"   and not is_broken2:  continue
+            if action == "BROKEN"  and is_broken2:  continue
+            if is_broken2:
+                rep2  = broken_map2[p2]
+                desc2 = f"{cap2}T | Broken->{rep2}" if rep2 != "NONE" else f"{cap2}T | Broken"
+            elif is_blocked2:
+                desc2 = f"{cap2}T | Blocked"
+            else:
+                desc2 = f"{cap2}T | Available"
+
+            if p2 in batch:
+                # Already selected — show with checkmark and allow tap-to-deselect
+                selected_rows.append({
+                    "id":          f"maint_toggle {action} {p2}",
+                    "title":       f"[X] {p2}",
+                    "description": f"Tap to deselect | {desc2}"[:72],
+                })
+            else:
+                all_items2.append({
+                    "id":          f"maint_exec {action} {p2}",
+                    "title":       p2,
+                    "description": desc2[:72],
+                })
+
+        header_map2 = {
+            "BLOCK":   "Block a Lorry",
+            "BROKEN":  "Log Breakdown",
+            "RELEASE": "Release Lorries",
+            "FIXED":   "Mark Lorries Fixed",
+        }
+
+        if not all_items2 and not batch:
+            msg_map2 = {
+                "BLOCK":   "All lorries already blocked today.",
+                "RELEASE": "No lorries currently blocked.",
+                "FIXED":   "No lorries marked as broken.",
+                "BROKEN":  "All lorries already marked as broken.",
+            }
+            return [
+                msg_map2.get(action, "No lorries to show."),
+                {"_type": "buttons", "body": "What would you like to do?",
+                 "buttons": [{"id": "lorry_maint", "title": "Back"},
+                             {"id": "hi",          "title": "Main Menu"}]},
+            ]
+
+        list_items2 = []
+
+        # For RELEASE / FIXED: show Done row + selected rows at the top,
+        # then unselected lorries below (paginated)
+        if action in ("RELEASE", "FIXED"):
+            if batch:
+                selected_str = ", ".join(batch)
+                list_items2.append({
+                    "id":          f"maint_batch_done {action}",
+                    "title":       f"Done ({len(batch)} selected)",
+                    "description": f"Confirm: {selected_str}"[:72],
+                })
+            list_items2 += selected_rows   # checked items always visible, no pagination
+
+        # Paginate unselected items
+        # Reserve rows for: Done (1) + selected rows + Next page (1)
+        reserved    = (1 if batch else 0) + len(selected_rows) + 1   # +1 for possible Next
+        PER_PAGE2   = max(1, 9 - reserved)
+        total2      = len(all_items2)
+        page2       = int(sess.get("maint_picker_page", {}).get(action, 0))
+        total_pages2 = max(1, -(-total2 // PER_PAGE2)) if total2 else 1
+        page2        = max(0, min(page2, total_pages2 - 1))
+        start2       = page2 * PER_PAGE2
+        chunk2       = all_items2[start2:start2 + PER_PAGE2]
+        list_items2 += chunk2
+
+        if total_pages2 > 1:
+            next_p = (page2 + 1) % total_pages2
+            list_items2.append({
+                "id":          f"maint_page {action} {next_p}",
+                "title":       "Next page...",
+                "description": f"Showing {start2+1}-{start2+len(chunk2)} of {total2}",
+            })
+
+        body_map2 = {
+            "BLOCK":   "Select lorry to block for today:",
+            "BROKEN":  "Select lorry to log as broken:",
+            "RELEASE": "Tap lorries to release. [X] = selected. Tap Done when ready:",
+            "FIXED":   "Tap lorries to mark as fixed. [X] = selected. Tap Done when ready:",
+        }
+
+        return [{
+            "_type":  "do_list",
+            "header": header_map2.get(action, action),
+            "body":   body_map2.get(action, "Select lorry:"),
+            "button": "Pick Lorry",
+            "items":  list_items2,
+        }]
+
     if cmd_lower in ("maint_block", "maint_broken", "maint_release", "maint_fixed"):
-        sess["lorry_picker_page"] = 0   # reset page on fresh action entry
         action_map = {
             "maint_block":   "BLOCK",
             "maint_broken":  "BROKEN",
@@ -460,87 +804,11 @@ def handle_message(phone: str, text: str = None,
             "maint_fixed":   "FIXED",
         }
         action = action_map[cmd_lower]
-        engine = _get_engine_safe()
-        if not engine:
-            return ["❌ Please log in first. Send *hi* to start."]
-
-        taken_today = get_assigned_today()
-        broken_map  = get_broken_lorries()
-        items = []
-        for _, r in engine.eligible_lorries.iterrows():
-            plate = str(r["LORRY"]).upper()
-            cap   = float(r["TON"])
-            is_broken  = plate in broken_map
-            is_blocked = plate in taken_today
-
-            # Filter: only show lorries relevant to the action
-            if action == "BLOCK"   and is_blocked: continue   # already blocked
-            if action == "RELEASE" and not is_blocked: continue  # nothing to release
-            if action == "FIXED"   and not is_broken:  continue  # not broken
-            if action == "BROKEN"  and is_broken:      continue  # already broken
-
-            if is_broken:
-                rep  = broken_map[plate]
-                desc = f"{cap}T | Broken -> {rep}" if rep != "NONE" else f"{cap}T | Broken"
-            elif is_blocked:
-                desc = f"{cap}T | Blocked today"
-            else:
-                desc = f"{cap}T | Available"
-
-            items.append({
-                "id":          f"maint_exec {action} {plate}",
-                "title":       plate,
-                "description": desc[:72],
-            })
-
-        if not items:
-            msg_map = {
-                "BLOCK":   "All lorries are already blocked today.",
-                "RELEASE": "No lorries are currently blocked today.",
-                "FIXED":   "No lorries are currently marked as broken.",
-                "BROKEN":  "All lorries are already marked as broken.",
-            }
-            return [
-                f"ℹ️ {msg_map.get(action, 'No lorries to show.')}",
-                {"_type": "buttons", "body": "What would you like to do?",
-                 "buttons": [{"id": "lorry_maint", "title": "Back"},
-                             {"id": "hi", "title": "Main Menu"}]},
-            ]
-
-        header_map = {
-            "BLOCK":   "Block a Lorry",
-            "BROKEN":  "Log Breakdown",
-            "RELEASE": "Release a Lorry",
-            "FIXED":   "Mark as Fixed",
-        }
-        body_map = {
-            "BLOCK":   "Select lorry to block for today:",
-            "BROKEN":  "Select lorry to log as broken:",
-            "RELEASE": "Select lorry to release:",
-            "FIXED":   "Select lorry to mark as fixed:",
-        }
-        # WhatsApp list messages only accept 1 section × max 10 rows on standard
-        # Business accounts. Paginate: first 9 items + a "More..." row.
-        PAGE = 9
-        page  = sess.get("lorry_picker_page", 0)
-        start = page * PAGE
-        chunk = items[start:start + PAGE]
-        has_more = (start + PAGE) < len(items)
-
-        if has_more:
-            chunk.append({
-                "id":          f"maint_page {action} {page + 1}",
-                "title":       "More lorries...",
-                "description": f"Showing {start+1}-{start+PAGE} of {len(items)}",
-            })
-
-        return [{
-            "_type":  "do_list",
-            "header": header_map.get(action, f"Lorry {action.title()}"),
-            "body":   body_map.get(action, f"Select lorry for {action}:"),
-            "button": "Pick Lorry",
-            "items":  chunk,
-        }]
+        # Clear batch when user re-enters the action from scratch
+        if action in ("RELEASE", "FIXED"):
+            sess.pop(f"_maint_batch_{action}", None)
+        sess.setdefault("maint_picker_page", {})[action] = 0
+        return _maint_list(action)
 
     # ── Page turn for lorry picker ───────────────────────────────────────────
     if cmd_lower.startswith("maint_page "):
@@ -548,41 +816,77 @@ def handle_message(phone: str, text: str = None,
         if len(parts) >= 3:
             action_p = parts[1].upper()
             page_p   = int(parts[2])
-            sess["lorry_picker_page"] = page_p
-            # Re-trigger the picker for this action at the new page
-            return handle_message(phone, text=f"maint_{action_p.lower()}")
-        return ["❌ Invalid page selection."]
+            sess.setdefault("maint_picker_page", {})[action_p] = page_p
+            return _maint_list(action_p)
+        return ["Invalid page selection."]
+
+    # ── Commit the multi-select batch ────────────────────────────────────────
+    if cmd_lower.startswith("maint_batch_done "):
+        action    = text.strip().split(" ", 1)[1].strip().upper()
+        batch_key = f"_maint_batch_{action}"
+        batch     = sess.pop(batch_key, [])
+        if not batch:
+            return ["Nothing selected. Tap lorries first, then Done."]
+        for p3 in batch:
+            if action == "RELEASE":
+                release_specific_plates([p3])
+                sess.setdefault("unavailable", set()).discard(p3)
+            elif action == "FIXED":
+                remove_broken_lorry(p3)
+                sess.setdefault("unavailable", set()).discard(p3)
+        action_label = "released" if action == "RELEASE" else "marked as fixed"
+        plates_str   = ", ".join(batch)
+        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+        follow_up = _build_summary(sess) if in_active else [{
+            "_type": "buttons", "body": "Need anything else?",
+            "buttons": [{"id": "lorry_maint", "title": "More Actions"},
+                        {"id": "hi",          "title": "Main Menu"}]
+        }]
+        noun = "lorry" if len(batch) == 1 else "lorries"
+        return [f"{len(batch)} {noun} {action_label}: {plates_str}"] + follow_up
+
+    # ── Toggle (deselect) a plate that was already queued ────────────────────
+    if cmd_lower.startswith("maint_toggle "):
+        parts = text.strip().split()
+        if len(parts) < 3:
+            return ["Invalid selection."]
+        action    = parts[1].upper()
+        plate     = parts[2].upper()
+        batch_key = f"_maint_batch_{action}"
+        batch     = sess.setdefault(batch_key, [])
+        if plate in batch:
+            batch.remove(plate)
+        return _maint_list(action)
 
     # ── Execute action after tapping a plate ─────────────────────────────────
     if cmd_lower.startswith("maint_exec "):
         parts = text.strip().split()
         if len(parts) < 3:
-            return ["❌ Invalid selection."]
+            return ["Invalid selection."]
         action = parts[1].upper()
         plate  = parts[2].upper()
 
         if action == "BLOCK":
             record_assignments_today([plate])
             sess.setdefault("unavailable", set()).add(plate)
-        elif action == "RELEASE":
-            release_specific_plates([plate])
-            sess.setdefault("unavailable", set()).discard(plate)
-        elif action == "FIXED":
-            remove_broken_lorry(plate)
-            sess.setdefault("unavailable", set()).discard(plate)
+            in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+            follow_up = _build_summary(sess) if in_active else [{
+                "_type": "buttons", "body": "Need anything else?",
+                "buttons": [{"id": "lorry_maint", "title": "More Actions"},
+                            {"id": "hi",          "title": "Main Menu"}]
+            }]
+            return [f"{plate} blocked."] + follow_up
+
         elif action == "BROKEN":
             return handle_message(phone, text=f"select_broken_lorry {plate}")
 
-        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
-        follow_up = _build_summary(sess) if in_active else [{
-            "_type": "buttons",
-            "body":  "Need anything else?",
-            "buttons": [
-                {"id": "lorry_maint", "title": "⚙️ More Actions"},
-                {"id": "hi",          "title": "🏠 Main Menu"},
-            ]
-        }]
-        return [f"✅ *{plate}* marked as *{action}*."] + follow_up
+        elif action in ("RELEASE", "FIXED"):
+            # Add to batch and show updated list
+            batch_key = f"_maint_batch_{action}"
+            batch     = sess.setdefault(batch_key, [])
+            if plate not in batch:
+                batch.append(plate)
+            return _maint_list(action)
 
     # ── manage [PLATE]: shortcut ──────────────────────────────────────────────
     if cmd_lower.startswith("manage ") and not cmd_lower.startswith("manage_lorry_pick"):
@@ -1007,7 +1311,7 @@ def handle_message(phone: str, text: str = None,
         _eng = sess.get("engine")
         if _eng is None and sess.get("user_id"):
             try:
-                _hist = HISTORY_PATH if os.path.exists(HISTORY_PATH) else HISTORY_PATH_OLD
+                _hist = _resolve_history_path()
                 _eng = LorryEngine(MASTER_PATH, _hist, owner_user=sess["user_id"])
             except Exception:
                 pass
@@ -1023,9 +1327,20 @@ def handle_message(phone: str, text: str = None,
         if file_bytes:
             return _handle_excel_upload(phone, sess, file_bytes)
         return ["Please upload the DO Excel file (.xlsx) to continue."]
-    elif state == "REVIEWING":
-        return _handle_reviewing(phone, sess, text)
-    elif state == "CONFIRMING":
+    elif state in ("REVIEWING", "CONFIRMING"):
+        # Allow lorry-status file upload at any point during an active session
+        if file_bytes:
+            try:
+                _df_up = pd.read_excel(io.BytesIO(file_bytes))
+                _df_up.columns = [c.strip().upper() for c in _df_up.columns]
+                _status_result = _handle_lorry_status_upload(phone, sess, _df_up)
+                if _status_result is not None:
+                    # After updating statuses, re-show summary so user sees changes
+                    return _status_result + [_build_summary(sess)]
+            except Exception:
+                pass   # not an Excel — fall through to text handler
+        if state == "REVIEWING":
+            return _handle_reviewing(phone, sess, text)
         return _handle_confirming(phone, sess, text)
     elif state == "DONE":
         # After export, user may still block/change a lorry — revert to CONFIRMING,
@@ -1053,13 +1368,18 @@ def handle_message(phone: str, text: str = None,
 # ── State handlers ────────────────────────────────────────────────────────────
 
 def _get_valid_users() -> list[str]:
-    """Read all non-SPARE users dynamically from master lorry file."""
+    """Read valid users from LORRY_DAILY_PLANNING.xlsx MUATAN sheet.
+    Users are section headers (rows where col 0 has a non-lorry string like ABI/VIVIAN).
+    """
     try:
-        df = pd.read_excel(MASTER_PATH)
-        df.columns = [c.strip().upper() for c in df.columns]
-        users = [u for u in df["USER"].str.strip().str.upper().unique()
-                 if u != "SPARE"]
-        return sorted(users)
+        df = pd.read_excel(PLANNING_PATH, sheet_name="MUATAN", header=None)
+        users = []
+        for val in df.iloc[:, 0].dropna().astype(str):
+            v = val.strip().upper()
+            # Section headers are short non-numeric strings that aren't "LORRY"
+            if v and v != "LORRY" and not re.match(r'^[A-Z]{1,3}\d', v):
+                users.append(v)
+        return sorted(set(users)) if users else ["ABI", "VIVIAN"]
     except Exception:
         return ["ABI", "VIVIAN", "SELAYANG", "BIG"]  # fallback
 
@@ -1089,23 +1409,33 @@ def _handle_user_id(phone, sess, text):
 
     sess["user_id"] = user
     # Use new-format history if it exists, else fall back to old format
-    _hist = HISTORY_PATH if os.path.exists(HISTORY_PATH) else HISTORY_PATH_OLD
+    _hist = _resolve_history_path()
     sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user)
     sess["state"] = "AWAIT_EXCEL"
 
     lorries = sess["engine"].get_eligible_lorry_list()
 
-    # Show which lorries are already taken today
-    taken_today = get_assigned_today()
+    taken_today  = get_assigned_today()
+    broken_today = get_broken_lorries()   # {plate: replacement}
     lines = []
     for _, r in lorries.iterrows():
-        tag = " ⛔ assigned today" if r["LORRY"] in taken_today else ""
-        lines.append(f"  • {r['LORRY']} — {r['TON']}T ({r['USER']}){tag}")
+        plate    = r["LORRY"]
+        ton      = r["TON"]
+        lorry_user = r["USER"]
+        if plate in broken_today:
+            rep = broken_today[plate]
+            tag = f" 🔴 Broken→{rep}" if rep != "NONE" else " 🔴 Broken"
+        elif plate in taken_today:
+            tag = " ⛔ Assigned today"
+        else:
+            tag = " ✅ Available"
+        lines.append(f"  • {plate} — {ton}T ({lorry_user}){tag}")
 
     lorry_text = (
         f"✅ Logged in as *{user}*\n\n"
         f"Your lorries:\n" + "\n".join(lines) + "\n\n"
-        "📎 Now please upload your DO Excel file (.xlsx)."
+        "📎 Now please upload your DO Excel file (.xlsx).\n\n"
+        "_Tip: you can also upload the master lorry file (with a_ *Status* _column) to block/release lorries in bulk._"
     )
     # Quick-action buttons (max 3 for WhatsApp)
     buttons_msg = {
@@ -1114,7 +1444,7 @@ def _handle_user_id(phone, sess, text):
         "buttons": [
             {"id": "clear daily log",     "title": "🗑️ Clear Today Log"},
             {"id": "show assigned today", "title": "📋 Show Assigned"},
-            {"id": "manage lorry",        "title": "🔧 Manage Lorry"},
+            {"id": "show blocked",        "title": "🚫 Show Blocked"},
         ],
     }
 
@@ -1197,10 +1527,88 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
         }
     ]
 
+def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
+    """Handle a lorry-status update file.
+
+    Accepted column names (case-insensitive):
+      LORRY / PLATE / LICENSE  — plate number
+      STATUS                   — "Available" or "Blocked" (or "block"/"avail")
+
+    Reads each row and blocks or releases the lorry in today's log.
+    Returns a reply message list.
+    """
+    # Normalise column names
+    col_map = {c.upper(): c for c in df.columns}
+
+    # Find LORRY column
+    lorry_col = next((col_map[k] for k in ("LORRY", "PLATE", "LICENSE") if k in col_map), None)
+    status_col = col_map.get("STATUS")
+
+    if not lorry_col or not status_col:
+        return None   # not a lorry-status file — caller should fall through
+
+    engine = sess.get("engine")
+    all_plates = set(engine.all_lorries["LORRY"].str.upper()) if engine else set()
+
+    blocked_now  = []
+    released_now = []
+    unknown      = []
+
+    for _, row in df.iterrows():
+        plate  = str(row[lorry_col]).strip().upper()
+        status = str(row[status_col]).strip().lower()
+        if not plate or plate in ("NAN", "NONE", ""):
+            continue
+        if all_plates and plate not in all_plates:
+            unknown.append(plate)
+            continue
+
+        if status.startswith("block"):
+            record_assignments_today([plate])
+            sess.setdefault("unavailable", set()).add(plate)
+            blocked_now.append(plate)
+        elif status.startswith("avail") or status in ("ok", "free", "available"):
+            release_specific_plates([plate])
+            sess.setdefault("unavailable", set()).discard(plate)
+            released_now.append(plate)
+
+    if not blocked_now and not released_now and not unknown:
+        return None   # nothing actionable — fall through to DO-file handler
+
+    lines = ["📋 *Lorry Status Updated from File*\n"]
+    if blocked_now:
+        lines.append(f"⛔ *Blocked ({len(blocked_now)}):* {', '.join(blocked_now)}")
+    if released_now:
+        lines.append(f"✅ *Released ({len(released_now)}):* {', '.join(released_now)}")
+    if unknown:
+        lines.append(f"⚠️ *Not found in master:* {', '.join(unknown)}")
+    lines.append("\nLorry availability updated for today.")
+
+    return [
+        "\n".join(lines),
+        {
+            "_type": "buttons",
+            "body": "What would you like to do next?",
+            "buttons": [
+                {"id": "hi",                  "title": "👋 Upload DOs"},
+                {"id": "show assigned today",  "title": "📋 Show Blocked"},
+                {"id": "manage lorry",         "title": "🔧 Manage Lorry"},
+            ],
+        }
+    ]
+
+
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
         df.columns = [c.strip().upper() for c in df.columns]
+
+        # ── Detect lorry-status file (LORRY + STATUS columns) ───────────────
+        # Must be checked BEFORE DO-file detection so a master-lorry upload
+        # with Status column doesn't accidentally trigger DO assignment flow.
+        _lorry_status_result = _handle_lorry_status_upload(phone, sess, df)
+        if _lorry_status_result is not None:
+            return _lorry_status_result
 
         # ── Detect format: new (ZSDOROUTEWRH) vs old ────────────────────────
         # New format: GROSS WEIGHT (kg), no WEIGHT(T) or ITMREF_0
@@ -1258,39 +1666,109 @@ def _handle_excel_upload(phone, sess, file_bytes):
         sess["is_new_format"] = IS_NEW_FORMAT
 
         # ── Pre-filled detection ─────────────────────────────────────────────
-        # If the uploaded Excel already has LICENSE plates in it, the user is
-        # importing a completed assignment sheet (not asking us to auto-assign).
-        # Read those plates, register them as assigned today, and show a summary.
+        # If the uploaded Excel already has LICENSE plates in it:
+        #   Case A (fully prefilled): register plates as assigned today, show summary, stop.
+        #   Case B (partial — some rows blank): track capacity in session but do NOT
+        #     register plates as "assigned today" so they remain eligible for TRIP 2
+        #     on the blank rows. Continue to auto-assign the blank rows.
         SENTINELS_STR = {"", "nan", "none", "n/a", "-"}
-        prefilled_rows = raw[
-            raw["LICENSE"].astype(str).str.strip().str.lower()
-            .isin(SENTINELS_STR) == False
-        ].copy()
+        _lic_lower = raw["LICENSE"].astype(str).str.strip().str.lower()
+        prefilled_rows = raw[_lic_lower.isin(SENTINELS_STR) == False].copy()
+        _blank_rows = raw[_lic_lower.isin(SENTINELS_STR)].copy()
 
         if not prefilled_rows.empty:
-            result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows)
-            if result is not None:
-                return result
+            if _blank_rows.empty:
+                # Case A: fully prefilled — register, summarise, and stop.
+                result = _handle_prefilled_excel(phone, sess, raw, prefilled_rows)
+                if result is not None:
+                    return result
+            else:
+                # Case B: partial file — skip record_assignments_today so those
+                # lorries stay available for the blank rows (as TRIP 2 if needed).
+                # Just note how many were pre-filled so the bot can mention it.
+                sess["_prefilled_count"] = len(prefilled_rows)
             # result is None → all plates were sentinels, fall through to auto-assign
 
         # ── Build item list: one item per Excel row ─────────────────────────
         # Each row is an independent item that needs its own lorry.
         # Items with the same DO NUMBER belong to the same customer/route
         # but may end up on different lorries (e.g. 17.5T row vs 3.5T row).
+
+        # Route-code filtering: only assign rows whose route prefix belongs to
+        # the logged-in user.  Rows for other users are kept in items (so they
+        # appear in the export) but pre-marked as OTHER_USER so they get a
+        # blank LICENSE in the exported file.
+        _user_prefixes = _load_user_route_prefixes(sess.get("user_id", ""))
+
+        # ── Schedule filter ──────────────────────────────────────────────────
+        # Before 12:00 → assign routes scheduled for TODAY (afternoon DOs).
+        # At/after 12:00 → assign routes scheduled for NEXT WORKING DAY (morning DOs).
+        # Routes not on today's/tomorrow's schedule are left blank (NOT_TODAY).
+        _sched_prefixes = _scheduled_prefixes_for_upload(sess.get("user_id", ""))
+        _upload_hour    = datetime.now().hour
+        _sched_target   = "today (afternoon trip)" if _upload_hour < 12 else "tomorrow (morning trip)"
+
         items = []
+        _other_user_count  = 0
+        _not_today_count   = 0
         for idx, row in raw.iterrows():
+            route_str = str(row["ROUTE"]).strip()
+            pfx = _extract_route_prefix(route_str)
+            _is_mine     = True
+            _is_today    = True
+
+            if _user_prefixes and pfx and pfx not in _user_prefixes:
+                _is_mine = False
+                _other_user_count += 1
+
+            # Schedule check — only for this user's routes
+            if _is_mine and _sched_prefixes is not None:
+                if pfx not in _sched_prefixes:
+                    _is_today = False
+                    _not_today_count += 1
+
+            _lorry_init = None
+            if not _is_mine:
+                _lorry_init = "OTHER_USER"
+            elif not _is_today:
+                _lorry_init = "NOT_TODAY"
+
             items.append({
-                "ROW_IDX":       idx,                         # original df index
+                "ROW_IDX":       idx,
                 "DO NUMBER":     str(row["DO NUMBER"]).strip(),
                 "CUSTOMER NAME": str(row["CUSTOMER NAME"]).strip(),
-                "ROUTE":         str(row["ROUTE"]).strip(),
+                "ROUTE":         route_str,
                 "CODE":          str(row["CODE"]).strip(),
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
-                # assignment fields filled below
-                "LORRY":         None,   # plate string, or "SPLIT", "NO_LORRY"
-                "SPLIT_LORRIES": None,   # list of bins if split
+                "DATE":          str(row.get("DATE", "")).strip(),
+                "STATE":         _state_from_row(row),   # destination state from file
+                "CITY":          str(row.get("CITY", "")).strip(),
+                "LORRY":         _lorry_init,
+                "SPLIT_LORRIES": None,
             })
+
+        # Build schedule notice for the user
+        _sched_notice = []
+        if _sched_prefixes is not None:
+            _day_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+            from datetime import timedelta as _td
+            _now_dt = datetime.now()
+            if _upload_hour < 12:
+                _tgt_date = _now_dt.date()
+            else:
+                _tgt_date = _now_dt.date() + _td(days=1)
+                while _tgt_date.weekday() >= 5:
+                    _tgt_date += _td(days=1)
+            _tgt_wd = _tgt_date.weekday()
+            _sched_notice.append(
+                f"📅 Schedule filter — assigning *{_sched_target}* ({_day_names[_tgt_wd]}). "
+                f"Routes: {', '.join(sorted(_sched_prefixes)) if _sched_prefixes else 'none scheduled'}."
+            )
+            if _not_today_count:
+                _sched_notice.append(
+                    f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s schedule — left unassigned."
+                )
 
         sess["items"]      = items          # row-level item list
         sess["raw_df"]     = raw
@@ -1320,87 +1798,956 @@ def _handle_excel_upload(phone, sess, file_bytes):
         eligible_caps   = sorted(engine.eligible_lorries["TON"].tolist())
         smallest_cap    = eligible_caps[0] if eligible_caps else 1.0
 
-        big_items   = [it for it in items if it["WEIGHT"] > smallest_cap]
-        small_items = [it for it in items if it["WEIGHT"] <= smallest_cap]
+        # ── Route grouping with geographic corridor merging ────────────────────
+        # Step 1: one item-list per exact route code.
+        # Step 2: build "corridor super-groups" — all routes that travel in the
+        #   same cluster+corridor direction AND pass through a shared geographic
+        #   waypoint (or have no parseable waypoints, in which case corridor
+        #   match alone is sufficient).
+        # Step 3: if a super-group is too heavy for the largest lorry, bin-pack
+        #   it into sub-groups (heaviest routes first).
+        # No "heaviest stays alone" rule — every route that goes the same way
+        # should share a lorry; capacity is the only hard limit.
+        from collections import defaultdict
+        from lorry_engine import (
+            _extract_route_intelligence,
+            _routes_on_same_way,
+            _route_centroid,
+            _haversine_km,
+            _bearing_deg,
+            _bearing_diff,
+            _DEPOT,
+            can_share_cross_cluster,
+            MAX_STOPS_PER_LORRY as _MAX_STOPS,
+            MIN_UTIL_TO_ASSIGN  as _MIN_UTIL,
+        )
 
-        pass1 = sorted(big_items,   key=lambda x: x["WEIGHT"], reverse=True)
-        pass2 = sorted(small_items, key=lambda x: x["WEIGHT"], reverse=False)
+        # Step 1 — bucket by (ROUTE, STATE, CITY) for urban routes so items
+        # in the same route code but different states or distant cities don't
+        # share a lorry unnecessarily.
+        # e.g. KV11A-KL-KUALA LUMPUR vs KV11A-SELANGOR-AMPANG are separate.
+        # Outstation routes (LARGE_LONG / MEDIUM_LONG) are NOT split by city —
+        # a single lorry handles all stops on a Kuantan or Seremban run.
+        route_buckets: dict[str, list] = defaultdict(list)
+        for it in items:
+            if it.get("LORRY") in ("OTHER_USER", "NOT_TODAY"):
+                continue
+            _rt_key = it["ROUTE"].strip().upper()
+            _st_key = it.get("STATE", "")
+            _ct_key = it.get("CITY", "").strip().upper()
+            dest_grp = _classify_dest_group(_rt_key, _st_key)
+            if dest_grp in _DEST_URBAN_GROUPS:
+                # Split urban routes by STATE then CITY for accuracy
+                _sub_key = _st_key
+                if _ct_key and _ct_key not in ("NAN", "NONE", ""):
+                    _sub_key = f"{_st_key}|{_ct_key}"
+                if _sub_key:
+                    _rt_key = f"{_rt_key}||{_sub_key}"
+            route_buckets[_rt_key].append(it)
 
-        def _assign_one(item):
-            weight = item["WEIGHT"]
-            route  = item["ROUTE"]
+        # Step 2 — cluster same-way buckets into corridor super-groups
+        # Each super-group is a list of route-bucket lists.
+        max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
+            if not engine.eligible_lorries.empty else 99.0
+
+        # Build live GPS centroids from uploaded file LONGITUD column.
+        # These are more accurate than historical centroids because they
+        # reflect the actual delivery points in this specific DO batch.
+        _live_centroids: dict[str, tuple] = {}
+        for _rt_key_raw, _bucket in route_buckets.items():
+            _lats, _lons = [], []
+            for _it in _bucket:
+                _row_idx = _it.get("ROW_IDX")
+                if _row_idx is None:
+                    continue
+                try:
+                    _lng_raw = str(raw.loc[_row_idx, "LONGITUD"]).strip()
+                    if _lng_raw and _lng_raw.lower() not in ("nan", "none", ""):
+                        _lng_raw = _lng_raw.replace(",", " ")
+                        _parts = _lng_raw.split()
+                        if len(_parts) >= 2:
+                            _lat, _lon = float(_parts[0]), float(_parts[1])
+                            if -90 <= _lat <= 90 and 50 <= _lon <= 180:
+                                _lats.append(_lat)
+                                _lons.append(_lon)
+                except Exception:
+                    pass
+            if _lats:
+                _base_rt = _rt_key_raw.split("||")[0]   # strip state/city suffix
+                _live_centroids[_base_rt] = (
+                    sum(_lats) / len(_lats),
+                    sum(_lons) / len(_lons),
+                )
+
+        def _best_centroid(route_str: str) -> tuple | None:
+            """Return live GPS centroid if available, else historical."""
+            key = route_str.strip().upper().split("||")[0]
+            live = _live_centroids.get(key)
+            if live:
+                return live
+            return _route_centroid(route_str)
+
+        # Build per-route STATE for outstation direction guard.
+        # Two outstation routes with different states are only merged if they
+        # point in the same geographic direction (strict 55° bearing threshold).
+        _route_state: dict[str, str] = {}
+        for _rt_key_raw, _bucket in route_buckets.items():
+            _base_rt = _rt_key_raw.split("||")[0]
+            for _it in _bucket:
+                _st = _it.get("STATE", "").strip().upper()
+                if _st and _st not in ("NAN", "NONE", ""):
+                    _route_state[_base_rt] = _st
+                    break
+
+        bucket_list = list(route_buckets.values())   # list of [item, …]
+        in_group    = [False] * len(bucket_list)
+        super_groups: list[list] = []                # each entry = flat item list
+
+        for i, base_bucket in enumerate(bucket_list):
+            if in_group[i]:
+                continue
+            base_route = base_bucket[0]["ROUTE"]
+            merged_items = list(base_bucket)
+            in_group[i]  = True
+
+            for j in range(i + 1, len(bucket_list)):
+                if in_group[j]:
+                    continue
+                cand_bucket = bucket_list[j]
+                cand_route  = cand_bucket[0]["ROUTE"]
+
+                # All routes already absorbed into merged_items
+                combined_w = sum(it["WEIGHT"] for it in merged_items) + \
+                             sum(it["WEIGHT"] for it in cand_bucket)
+                n_distinct = len({it["ROUTE"] for it in merged_items}) + 1
+
+                if (
+                    combined_w <= max_lorry_cap
+                    and n_distinct <= _MAX_STOPS
+                    and _routes_on_same_way(base_route, cand_route)
+                ):
+                    merged_items += list(cand_bucket)
+                    in_group[j]   = True
+
+            super_groups.append(merged_items)
+
+        # Step 3 — if a super-group is heavier than max lorry cap, bin-pack it
+        # into capacity-sized sub-groups (heaviest route bucket first).
+        sorted_groups: list[list] = []
+        for sg in super_groups:
+            total_w = sum(it["WEIGHT"] for it in sg)
+            if total_w <= max_lorry_cap:
+                sorted_groups.append(sg)
+                continue
+
+            # Over-capacity super-group — split into sub-groups
+            sub_buckets = defaultdict(list)
+            for it in sg:
+                sub_buckets[it["ROUTE"]].append(it)
+            sub_list = sorted(
+                sub_buckets.values(),
+                key=lambda b: sum(i["WEIGHT"] for i in b),
+                reverse=True,
+            )
+
+            current_sub: list = []
+            current_w = 0.0
+            for sub_b in sub_list:
+                w = sum(it["WEIGHT"] for it in sub_b)
+                if current_sub and current_w + w > max_lorry_cap:
+                    sorted_groups.append(current_sub)
+                    current_sub = list(sub_b)
+                    current_w   = w
+                else:
+                    current_sub += list(sub_b)
+                    current_w   += w
+            if current_sub:
+                sorted_groups.append(current_sub)
+
+        # ── Step 4: geographic cross-cluster merge (Nominatim/OSM, free) ─────────
+        # Same-cluster corridor merging (Step 2) only joins routes within the
+        # same region.  Here we try to join groups from DIFFERENT clusters when
+        # Nominatim confirms their destinations are within 300 km straight-line.
+        #
+        # Example: PH01-03 (Pahang/Bentong, 0.275T) + TR02 (Terengganu, 6T)
+        # both use the KL→East highway and their centroids are ≈160 km apart.
+        # East Malaysia (Sabah/Sarawak) is ≈1 000 km from KL → always rejected.
+        def _group_centroid(items):
+            """Average lat/lng centroid using live GPS first, historical fallback."""
+            seen, lats, lons = set(), [], []
+            for it in items:
+                r = it["ROUTE"]
+                if r in seen:
+                    continue
+                seen.add(r)
+                c = _best_centroid(r)   # live GPS preferred over historical
+                if c:
+                    lats.append(c[0]); lons.append(c[1])
+            if not lats:
+                return None
+            return (sum(lats) / len(lats), sum(lons) / len(lons))
+
+        _cross_merged = [False] * len(sorted_groups)
+        _new_groups: list[list] = []
+
+        for i, base_sg in enumerate(sorted_groups):
+            if _cross_merged[i]:
+                continue
+            merged      = list(base_sg)
+            merged_cent = _group_centroid(merged)   # updated as we absorb groups
+
+            for j in range(i + 1, len(sorted_groups)):
+                if _cross_merged[j]:
+                    continue
+                cand_sg    = sorted_groups[j]
+                cand_route = cand_sg[0]["ROUTE"]
+
+                # Skip if all routes in cand share the same cluster as base
+                # (same-cluster merging already handled by corridor merge)
+                base_clusters = {_extract_route_intelligence(it["ROUTE"])["cluster"]
+                                 for it in merged}
+                cand_cluster  = _extract_route_intelligence(cand_route)["cluster"]
+                if base_clusters == {cand_cluster}:
+                    continue
+
+                # KL_VALLEY / KL_CITY routes are local — never bundle with
+                # outstation clusters (prevents KV03A coastal + PK Perak merges
+                # that look like same direction but use different road corridors)
+                _LOCAL_CLUSTERS = {"KL_VALLEY", "KL_CITY"}
+                if (base_clusters & _LOCAL_CLUSTERS) or cand_cluster in _LOCAL_CLUSTERS:
+                    continue
+
+                combined_w = sum(it["WEIGHT"] for it in merged) + \
+                             sum(it["WEIGHT"] for it in cand_sg)
+                n_routes   = len({it["ROUTE"] for it in merged}) + \
+                             len({it["ROUTE"] for it in cand_sg})
+
+                if combined_w > max_lorry_cap:
+                    continue
+                if n_routes > _MAX_STOPS:
+                    continue
+
+                # Geographic check: use live GPS centroid (from uploaded LONGITUD)
+                # when available, falling back to historical centroid.
+                cand_cent = _best_centroid(cand_route)
+                if merged_cent is None or cand_cent is None:
+                    continue
+                dist_km = _haversine_km(merged_cent[0], merged_cent[1],
+                                        cand_cent[0],   cand_cent[1])
+                if dist_km > 180.0:
+                    continue
+
+                # Bearing check — ALL PAIRS with 55° strict threshold.
+                # 80° was too permissive: Seremban (SE 128°) vs Pahang (NE 56°)
+                # = 72.5° bearing diff passed incorrectly. Real GPS gives 80.8°.
+                # 55° blocks clearly different-direction routes while still
+                # allowing same-state or truly adjacent routes (e.g. PH06+PH09
+                # differ by ~25°).
+                _CROSS_BEARING_LIMIT = 55.0
+                b_cand = _bearing_deg(_DEPOT[0], _DEPOT[1],
+                                      cand_cent[0], cand_cent[1])
+                depot_to_cand = _haversine_km(_DEPOT[0], _DEPOT[1],
+                                              cand_cent[0], cand_cent[1])
+                if depot_to_cand < 50.0:   # local route — skip bearing check
+                    continue
+                bearing_ok = True
+                bearing_checked = False
+                for ex_route in {it["ROUTE"] for it in merged}:
+                    ec = _best_centroid(ex_route)
+                    if ec is None:
+                        continue
+                    d_ex = _haversine_km(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
+                    if d_ex < 50.0:
+                        continue
+                    bearing_checked = True
+                    b_ex = _bearing_deg(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
+                    if _bearing_diff(b_ex, b_cand) > _CROSS_BEARING_LIMIT:
+                        bearing_ok = False
+                        break
+                    # State mismatch guard: outstation routes in different states
+                    # must also pass the strict bearing threshold.
+                    # e.g. NS (Negeri Sembilan) vs PH (Pahang) are different
+                    # states pointing in opposite directions — never merge them.
+                    ex_state   = _route_state.get(ex_route.strip().upper().split("||")[0], "")
+                    cand_state = _route_state.get(cand_route.strip().upper().split("||")[0], "")
+                    if (ex_state and cand_state and ex_state != cand_state
+                            and _bearing_diff(b_ex, b_cand) > 30.0):
+                        bearing_ok = False
+                        break
+                if not bearing_checked or not bearing_ok:
+                    continue
+
+                merged += list(cand_sg)
+                _cross_merged[j] = True
+                # Recompute centroid to keep it accurate for subsequent candidates
+                merged_cent = _group_centroid(merged)
+
+            _new_groups.append(merged)
+
+        sorted_groups = _new_groups
+
+        def _parse_date_sortkey(date_str: str) -> str:
+            """Convert any date string to ISO 'YYYY-MM-DD' for correct ordering.
+            Returns '9999-12-31' on failure so undated groups sort last.
+            Handles formats: 'd/m/yy', 'dd/mm/yy', 'YYYY-MM-DD', Excel serials.
+            """
+            s = (date_str or "").strip()
+            if not s or s.lower() in ("nan", "none", ""):
+                return "9999-12-31"
+            for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d", "%-d/%-m/%y"):
+                try:
+                    return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+            try:
+                ts = pd.to_datetime(s, dayfirst=True, errors="coerce")
+                if pd.notna(ts):
+                    return ts.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            return "9999-12-31"
+
+        def _group_sort_key(g):
+            """Sort order:
+            0. Destination priority — LARGE_LONG(0) > MEDIUM_LONG(1) > KL_SELANGOR(2)
+               so long-distance groups claim large/medium lorries first.
+            1. Earliest delivery date (ascending).
+            2. Total weight (descending) so heavier groups within same tier/date
+               claim best-fit lorries before lighter ones.
+            """
+            dest_pri = _DEST_SORT_PRI.get(
+                _classify_dest_group(g[0]["ROUTE"], g[0].get("STATE", "")), 2
+            )
+            dates = [_parse_date_sortkey(it.get("DATE", "")) for it in g]
+            earliest = min(dates) if dates else "9999-12-31"
+            return (dest_pri, earliest, -sum(it["WEIGHT"] for it in g))
+
+        # Destination-priority-first, then date, then heaviest
+        sorted_groups.sort(key=_group_sort_key)
+
+        # Session-level capacity tracker so groups can share a lorry when combined
+        # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
+        _session_loads: dict[str, float] = {}   # plate → tons assigned this session
+        _session_routes: dict[str, str]  = {}   # plate → representative route
+        _lorry_cap_map = {row["LORRY"]: float(row["TON"])
+                          for _, row in engine.eligible_lorries.iterrows()}
+
+        def _assign_group(group_items):
+            """Assign ONE lorry (or split) to cover ALL items in the group.
+            All items in the group share the same route (one route = one lorry).
+            """
+            # Pre-filter: mark items exceeding every available lorry's capacity as
+            # NO_LORRY before computing total_w.  Without this a 27T item in a 35T
+            # group inflates total_w so a 20T lorry ends up with only 8T of feasible
+            # cargo at 44% utilisation instead of the correct 10.5T lorry at 85%.
+            _max_cap = (float(engine.eligible_lorries["TON"].max())
+                        if not engine.eligible_lorries.empty else 0.0)
+            _all_group = list(group_items)
+            if _max_cap > 0:
+                for it in _all_group:
+                    if it.get("LORRY") is None and it["WEIGHT"] > _max_cap:
+                        it["LORRY"] = "NO_LORRY"
+                group_items = [it for it in _all_group if it.get("LORRY") != "NO_LORRY"]
+            else:
+                _all_group = list(group_items)
+            if not group_items:
+                for it in _all_group:
+                    sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
+                return
+
+            # Rule 6b — per-lorry delivery-stop limit.
+            # When a group carries too many individual DOs, split it across two
+            # lorries so drivers aren't overloaded and idle ABI lorries get work.
+            # MAX_STOPS_PER_LORRY (=8) was designed for route-count merging;
+            # here we use a separate threshold for DO count.
+            _MAX_DOS_PER_LORRY = 15
+            if len(group_items) > _MAX_DOS_PER_LORRY:
+                # Only split when the combined weight truly exceeds every
+                # available lorry's capacity.  If the full group fits on a
+                # single lorry (even a large 14T), keep it together so that
+                # lorry reaches high utilisation instead of creating two
+                # under-filled lorries.
+                _pre_total_w = sum(it["WEIGHT"] for it in group_items)
+                _excl_check = sess["unavailable"] | get_assigned_today()
+                _avail_caps = sorted(
+                    float(row["TON"]) for _, row in engine.eligible_lorries.iterrows()
+                    if row["LORRY"] not in _excl_check
+                )
+                if not any(c >= _pre_total_w for c in _avail_caps):
+                    # Too heavy for any single lorry — split by proximity to HQ.
+                    # Nearest DOs load onto the first lorry (first round); the
+                    # remaining DOs go on a second lorry (second round).  This
+                    # ensures the driver can complete the closer deliveries even
+                    # if the full group cannot be handled in one trip.
+                    def _item_dist_hq(it):
+                        c = _route_centroid(it["ROUTE"])
+                        if c is None:
+                            return float("inf")
+                        return _haversine_km(_DEPOT[0], _DEPOT[1], c[0], c[1])
+
+                    _sorted_by_dist = sorted(group_items, key=_item_dist_hq)
+                    _cap1 = max(_avail_caps) if _avail_caps else 0
+                    half_a, half_b = [], []
+                    _fill_w = 0.0
+                    for _it in _sorted_by_dist:
+                        if _fill_w + _it["WEIGHT"] <= _cap1:
+                            half_a.append(_it)
+                            _fill_w += _it["WEIGHT"]
+                        else:
+                            half_b.append(_it)
+                    _assign_group(half_a)
+                    _assign_group(half_b)
+                    # Propagate back to _all_group items that were pre-filtered NO_LORRY
+                    for it in _all_group:
+                        if it.get("LORRY") == "NO_LORRY":
+                            sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                    return
+                # else: weight fits one lorry — fall through to normal single-lorry path
+
+            total_w  = sum(it["WEIGHT"] for it in group_items)
+            route    = group_items[0]["ROUTE"]
+            customer = group_items[0]["CUSTOMER NAME"]
+
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
-            excluded = sess["unavailable"] | get_assigned_today()
 
+            # ── Effective-capacity helper (accounts for 2-trip local runs) ─────
+            # LARGE lorries (≥14T): hard cap — outstation runs take the full day.
+            # MEDIUM lorries (11–14T) on LOCAL routes: 2 trips (morning + afternoon).
+            # SMALL lorries (<11T) on LOCAL routes: 2 trips.
+            # Any lorry on OUTSTATION routes: hard cap (1 trip).
+            def _eff_cap_for(plate: str, grp_dest: str) -> float:
+                cap = float(_lorry_cap_map.get(plate, 0.0))
+                if cap >= 14.0:
+                    return cap   # large lorries never double-trip
+                lorry_dest = _classify_dest_group(
+                    _session_routes.get(plate, ""))
+                # Allow double capacity only when BOTH lorry's existing route
+                # AND the new group are LOCAL (KV/KL/Selangor).
+                if (lorry_dest in _DEST_URBAN_GROUPS
+                        and grp_dest in _DEST_URBAN_GROUPS):
+                    return cap * 2  # morning + afternoon trips
+                return cap
+
+            # ── Destination group — must be defined BEFORE _session_full ─────────
+            # LARGE_LONG  (Pahang/Kuantan/Terengganu/…): must use ≥14T lorry
+            # MEDIUM_LONG (Seremban/NS/Rawang/T.Malim/…): must use ≥11T lorry
+            # KL / SELANGOR / KL_SELANGOR: must use <11T lorry (no large/medium)
+            _item_state = group_items[0].get("STATE", "")
+            _dest_grp   = _classify_dest_group(route, _item_state)
+
+            # Also exclude lorries already full or incompatible with this route
+            _session_full = {
+                p for p in _session_loads
+                if _eff_cap_for(p, _dest_grp) - _session_loads.get(p, 0.0) < total_w
+            }
+            _session_incompatible = {
+                p for p in _session_loads
+                if _session_routes.get(p)
+                and not _routes_on_same_way(route, _session_routes.get(p, ""))
+                and _lorry_cap_map.get(p, 0) - _session_loads.get(p, 0) >= total_w
+            }
+            excluded = sess["unavailable"] | _session_full
+
+            # ── Destination-based lorry size enforcement ───────────────────────
+            _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
+            # Exclude undersized lorries for long-distance destinations
+            if _dest_min_t > 0:
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) < _dest_min_t
+                }
+            # Exclude oversized lorries (≥11T) for KL/Selangor urban routes
+            if _dest_grp in _DEST_URBAN_GROUPS:
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= 11.0
+                }
+
+            # ── Strict lorry-route reservations ───────────────────────────────
+            # e.g. BQY7823 → Rawang only; BQU3875 → Pahang only.
+            # Check each unique route code individually — a joined text would
+            # falsely pass if the group happened to contain an allowed route code
+            # alongside a disallowed one (e.g. "KV02A PH09 ..." lets BQY7823 slip).
+            _unique_routes = {it.get("ROUTE", "") for it in group_items}
+            _strict_excl: set[str] = set()
+            for _ur in _unique_routes:
+                _strict_excl |= _strict_route_excl(_ur)
+            excluded = excluded | _strict_excl
+
+            # ── Cross-direction incompatibility for outstation lorries ──────────
+            # Any lorry already serving an OUTSTATION route (LARGE_LONG or
+            # MEDIUM_LONG) must not switch to a different outstation direction.
+            # This covers large (≥14T), medium (11–14T), AND small lorries like
+            # BQX9983 (10.5T) that serve NS/PH routes — without this, a small
+            # lorry with strong history for both NS05 and PH06 gets assigned both.
+            _session_incompatible_lm = {
+                p for p in _session_loads
+                if _session_routes.get(p)
+                and _classify_dest_group(
+                    _session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
+                and _dest_grp not in _DEST_URBAN_GROUPS
+                and not _routes_on_same_way(route, _session_routes.get(p, ""))
+            }
+            excluded = excluded | _session_incompatible_lm
+
+            # ── Within-session lorry sharing ──────────────────────────────────
+            _share_pool = [
+                (_eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)), p)
+                for p in _session_loads
+                if p in _lorry_cap_map
+                and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
+                and p not in excluded
+                and float(_lorry_cap_map.get(p, 0)) >= _dest_min_t
+            ]
+            if _share_pool:
+                _compat = sorted(
+                    [(r, p) for r, p in _share_pool
+                     if _routes_on_same_way(route, _session_routes.get(p, ""))]
+                )
+                if _compat:
+                    _shared = _compat[0][1]
+                    for it in group_items:
+                        it["LORRY"] = _shared
+                    _session_loads[_shared] = float(_session_loads.get(_shared, 0)) + total_w
+                    for it in _all_group:
+                        sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
+                    return
+
+            # Try single lorry for the whole group
             suggestions = engine.suggest(
                 route=route,
-                total_ton=weight,
+                total_ton=total_w,
                 unavailable=excluded,
                 top_n=1,
+                customer_name=customer,
+                today_date_str=_today(),
             )
 
             if suggestions:
                 single_cap  = suggestions[0]["TON_CAPACITY"]
-                single_util = weight / single_cap if single_cap > 0 else 0
-                split_option = None
-                if single_util < 0.70:
-                    split_option = engine.suggest_split(
-                        route=route,
-                        total_ton=weight,
-                        unavailable=excluded,
-                        single_util_threshold=0.70,
-                    )
-                if split_option is not None:
-                    item["LORRY"]         = "SPLIT"
-                    item["SPLIT_LORRIES"] = [
-                        {"lorry": s["LORRY"],
-                         "rows":  [{"DO": item["DO NUMBER"], "W": s["PORTION"]}],
-                         "cap":   s["TON_CAPACITY"] - s["PORTION"]}
-                        for s in split_option
-                    ]
-                    for s in split_option:
-                        sess["unavailable"].add(s["LORRY"])
+                single_util = total_w / single_cap if single_cap > 0 else 0
+
+                # Rule 8: tightest-fit lorry would still be <10% loaded → leave blank.
+                # Don't waste a large lorry on a tiny DO; let it be manually reviewed.
+                if single_util < _MIN_UTIL:
+                    for it in group_items:
+                        it["LORRY"] = "NO_LORRY"
                 else:
-                    item["LORRY"] = suggestions[0]["LORRY"]
-                    sess["unavailable"].add(item["LORRY"])
+                    split_option = None
+                    if single_util < 0.60:
+                        split_option = engine.suggest_split(
+                            route=route,
+                            total_ton=total_w,
+                            unavailable=excluded,
+                            single_util_threshold=0.60,
+                        )
+                    if split_option is not None:
+                        # Each lorry in the split carries a portion of the items.
+                        # Build bins with their allotted weight (PORTION).
+                        bins = [
+                            {"lorry": s["LORRY"],
+                             "rows":  [],
+                             "remain": s["PORTION"]}   # how much this bin can take
+                            for s in split_option
+                        ]
+                        for s in split_option:
+                            sess["unavailable"].add(s["LORRY"])
+                        # Assign each item to exactly ONE bin (greedy, heaviest first)
+                        item_bin: dict[str, str] = {}
+                        for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
+                            placed = False
+                            for bin_ in bins:
+                                if bin_["remain"] >= it["WEIGHT"] - 0.001:
+                                    bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                    bin_["remain"] -= it["WEIGHT"]
+                                    item_bin[it["DO NUMBER"]] = bin_["lorry"]
+                                    placed = True
+                                    break
+                            if not placed:
+                                bins[0]["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                item_bin[it["DO NUMBER"]] = bins[0]["lorry"]
+                        # Each item gets ONE lorry plate — no more "VEA2818, W3618U" for all
+                        for it in group_items:
+                            it["LORRY"] = item_bin.get(it["DO NUMBER"], bins[0]["lorry"])
+                            it.pop("SPLIT_LORRIES", None)
+                    else:
+                        lorry = suggestions[0]["LORRY"]
+                        for it in group_items:
+                            it["LORRY"] = lorry
             else:
-                remain = weight
+                # No single lorry fits — bin-pack across multiple lorries.
+                # Build bins using tightest-fit first: ask suggest() for the
+                # smallest lorry that can carry the remaining weight.  Fall
+                # back to the largest available only when no single lorry
+                # can carry the full remainder (partial-load pass).
+                remain = total_w
                 bins   = []
                 for _ in range(10):
                     if remain <= 0:
                         break
-                    excl = sess["unavailable"] | get_assigned_today()
-                    sug  = engine.suggest(route=route, total_ton=remain,
-                                          unavailable=excl, top_n=1)
-                    if sug:
-                        lorry = sug[0]["LORRY"]
-                        cap   = sug[0]["TON_CAPACITY"]
-                    else:
-                        all_sug = engine.suggest(route=route, total_ton=0.01,
-                                                  unavailable=excl, top_n=20)
-                        all_sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
-                        if not all_sug:
+                    # Exclude lorries that already carry too much from this
+                    # session to accept 'remain' more tons — otherwise the
+                    # bin-pack re-picks a lorry loaded in an earlier group
+                    # (e.g. BQU3875 filled to 20T getting a second 18T run).
+                    _excl_session_full = {
+                        p for p in _session_loads
+                        if float(_lorry_cap_map.get(p, 0))
+                           - float(_session_loads.get(p, 0)) < remain
+                    }
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full
+                    # Tightest-fit pass: find smallest lorry that handles remain
+                    sug = engine.suggest(route=route, total_ton=remain,
+                                         unavailable=excl, top_n=20,
+                                         customer_name=customer)
+                    if not sug:
+                        # No lorry can carry full remain — grab largest available
+                        # for a partial load, then continue with what's left
+                        sug = engine.suggest(route=route, total_ton=0.001,
+                                             unavailable=excl, top_n=20)
+                        if not sug:
                             break
-                        lorry = all_sug[0]["LORRY"]
-                        cap   = all_sug[0]["TON_CAPACITY"]
+                        sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
+                    lorry   = sug[0]["LORRY"]
+                    cap     = sug[0]["TON_CAPACITY"]
                     portion = min(cap, remain)
-                    bins.append({"lorry": lorry,
-                                 "rows":  [{"DO": item["DO NUMBER"], "W": portion}],
-                                 "cap":   cap - portion})
+                    # Use full lorry capacity for the bin, not just the arithmetic
+                    # portion. Items overflow BQU3875's last few scraps and must
+                    # fit in the next bin — which needs its full capacity available,
+                    # not just the remaining-weight arithmetic.
+                    bins.append({"lorry": lorry, "rows": [], "remain": cap})
                     sess["unavailable"].add(lorry)
                     remain = round(remain - cap, 6)
-                if remain <= 0 and bins:
-                    item["LORRY"]         = "SPLIT"
-                    item["SPLIT_LORRIES"] = bins
-                else:
-                    item["LORRY"] = "NO_LORRY"
-            sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
-        for item in pass1:
-            _assign_one(item)
-        for item in pass2:
-            _assign_one(item)
+                if remain <= 0 and bins:
+                    # Distribute items into bins (each item → one bin, heaviest first)
+                    item_bin2: dict[str, str] = {}
+                    max_bin_cap = max(b["remain"] + sum(
+                        x["W"] for x in b["rows"]) for b in bins) if bins else 0
+                    for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
+                        placed = False
+                        for bin_ in bins:
+                            if bin_["remain"] >= it["WEIGHT"] - 0.001:
+                                bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                bin_["remain"] -= it["WEIGHT"]
+                                item_bin2[it["DO NUMBER"]] = bin_["lorry"]
+                                placed = True
+                                break
+                        if not placed:
+                            # Bins are full — try to grab one more lorry rather
+                            # than giving up (greedy fill can leave tiny tail items
+                            # stranded even when arithmetic says they should fit).
+                            _excl_retry_sf = {
+                                p for p in _session_loads
+                                if float(_lorry_cap_map.get(p, 0))
+                                   - float(_session_loads.get(p, 0)) < it["WEIGHT"]
+                            }
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf
+                            extra_sug  = engine.suggest(
+                                route=route, total_ton=it["WEIGHT"],
+                                unavailable=excl_retry, top_n=1,
+                                customer_name=customer,
+                                today_date_str=_today(),
+                            )
+                            if extra_sug:
+                                extra_lorry = extra_sug[0]["LORRY"]
+                                extra_cap   = extra_sug[0]["TON_CAPACITY"]
+                                new_bin = {"lorry": extra_lorry, "rows": [], "remain": extra_cap}
+                                bins.append(new_bin)
+                                sess["unavailable"].add(extra_lorry)
+                                new_bin["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                new_bin["remain"] -= it["WEIGHT"]
+                                item_bin2[it["DO NUMBER"]] = extra_lorry
+                            else:
+                                item_bin2[it["DO NUMBER"]] = "NO_LORRY"
+                    for it in group_items:
+                        it["LORRY"] = item_bin2.get(it["DO NUMBER"], "NO_LORRY")
+                        it.pop("SPLIT_LORRIES", None)
+                else:
+                    # Bin-pack failed — all lorries taken or too small.
+                    # Last resort: find the tightest-fitting available lorry
+                    # that is NOT overloaded (combined weight ≤ capacity).
+                    # If even the largest lorry can't handle the weight → NO_LORRY.
+                    _excl_lr_sf = {
+                        p for p in _session_loads
+                        if float(_lorry_cap_map.get(p, 0))
+                           - float(_session_loads.get(p, 0)) < total_w
+                    }
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf
+                    last_resort = engine.suggest_largest_available(
+                        route, excl_final, _today(), total_ton=total_w)
+                    if last_resort:
+                        lr_cap  = last_resort[0]["TON_CAPACITY"]
+                        lr_util = total_w / lr_cap if lr_cap > 0 else 0
+                        if lr_util < _MIN_UTIL:
+                            # Even the smallest available lorry would be <10% loaded
+                            for it in group_items:
+                                it["LORRY"] = "NO_LORRY"
+                        else:
+                            lorry = last_resort[0]["LORRY"]
+                            for it in group_items:
+                                it["LORRY"] = lorry
+                    else:
+                        # No lorry can carry this weight without overloading
+                        for it in group_items:
+                            it["LORRY"] = "NO_LORRY"
+
+            for it in _all_group:
+                sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
+
+            # Update session load tracker so subsequent groups can share this lorry
+            for _it in _all_group:
+                _pl = _it.get("LORRY")
+                if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "", None}:
+                    _session_loads[_pl] = float(_session_loads.get(_pl, 0)) + _it["WEIGHT"]
+                    if _pl not in _session_routes:
+                        _session_routes[_pl] = route
+
+        for group in sorted_groups:
+            _assign_group(group)
+
+        # ── Consolidation pass ────────────────────────────────────────────────
+        # Any item still marked NO_LORRY gets a second chance: find a lorry from
+        # this session with enough remaining capacity, or any eligible lorry at all.
+        _excl_consol = sess["unavailable"] | get_assigned_today()
+        for it in items:
+            if it.get("LORRY") != "NO_LORRY":
+                continue
+            w = it["WEIGHT"]
+            # Build candidates: lorries with remaining session capacity ≥ w
+            _cands = [
+                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                for p in _lorry_cap_map
+                if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
+                and p not in _excl_consol
+            ]
+            if not _cands:
+                continue
+            # Prefer same-corridor lorries with tightest remaining fit
+            _compat = sorted(
+                [(r, p) for r, p in _cands
+                 if _routes_on_same_way(it["ROUTE"], _session_routes.get(p, ""))]
+            )
+            _pick = (_compat or sorted(_cands))[0][1]
+            it["LORRY"] = _pick
+            _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
+            if _pick not in _session_routes:
+                _session_routes[_pick] = it["ROUTE"]
+            sess["assigned"][it["DO NUMBER"]] = _pick
+
+        # ── Lorry-swap optimisation ───────────────────────────────────────────
+        # Reduce waste on large lorries (≥10T) by swapping them with a smaller
+        # lorry that is currently carrying a heavier load.  Conditions for a
+        # valid swap: (A is large, B is small), A's load fits on B, B's load is
+        # heavier than A's (so A's utilisation improves after taking B's items).
+        # Pick the swap with the biggest waste reduction each round; repeat
+        # until no improving swap remains.
+        _LARGE_T = 10.0
+        _pit: dict[str, list] = {}
+        for _it in items:
+            _pl = _it.get("LORRY")
+            if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", None}:
+                _pit.setdefault(_pl, []).append(_it)
+
+        _swap_ok = True
+        while _swap_ok:
+            _swap_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _best_delta, _best_pa, _best_pb = 0.0, None, None
+            for _pa, _pa_its in list(_pit.items()):
+                _cap_a = _lorry_cap_map.get(_pa, 0)
+                if _cap_a < _LARGE_T:
+                    continue  # A must be a large lorry
+                _load_a = _ploads[_pa]
+                for _pb, _pb_its in list(_pit.items()):
+                    if _pb == _pa:
+                        continue
+                    _cap_b = _lorry_cap_map.get(_pb, 0)
+                    if _cap_b >= _LARGE_T:
+                        continue  # B must be smaller than A
+                    _load_b = _ploads[_pb]
+                    if _load_b <= _load_a:
+                        continue  # swap only improves if B is heavier
+                    if _load_a > _cap_b:
+                        continue  # A's items must physically fit on B
+                    # Only swap if A's load would fill B to ≥70%.
+                    # This prevents cascading swaps that move heavy, well-fitted
+                    # loads off their historically preferred smaller lorries
+                    # (e.g. KV19A at 92% on BMN3682 should stay there).
+                    if _load_a / _cap_b < 0.70:
+                        continue
+                    _delta = _load_a - _load_b  # negative = waste reduction
+                    if _delta < _best_delta:
+                        _best_delta = _delta
+                        _best_pa, _best_pb = _pa, _pb
+            if _best_pa:
+                for _it in _pit[_best_pa]:
+                    _it["LORRY"] = _best_pb
+                    sess["assigned"][_it["DO NUMBER"]] = _best_pb
+                for _it in _pit[_best_pb]:
+                    _it["LORRY"] = _best_pa
+                    sess["assigned"][_it["DO NUMBER"]] = _best_pa
+                _pit[_best_pa], _pit[_best_pb] = _pit[_best_pb], _pit[_best_pa]
+                _swap_ok = True
+
+        # ── Same-route merge pass ─────────────────────────────────────────────
+        # If two lorries carry compatible routes and lorry A's entire load fits
+        # inside lorry B's remaining capacity, move all of A's DOs onto B and
+        # free lorry A.  Picks the merge that maximises B's utilisation after
+        # the move so we prefer consolidating onto the tightest-fitting lorry.
+        # Example: VEA2818 (1T, PH09, 0.6T) + WLD8738 (5T, PH09, 0.538T)
+        #   → 0.6T fits on WLD8738 (remaining 4.46T) → merge → WLD8738 at 22.8%
+        _merge_ok = True
+        while _merge_ok:
+            _merge_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _best_gain, _best_src, _best_dst = 0.0, None, None
+            for _pa in list(_pit.keys()):
+                _load_a = _ploads[_pa]
+                _route_a = next((it["ROUTE"] for it in _pit[_pa] if it.get("ROUTE")), "") \
+                           or _session_routes.get(_pa, "")
+                for _pb in list(_pit.keys()):
+                    if _pb == _pa:
+                        continue
+                    _load_b = _ploads[_pb]
+                    _cap_b  = float(_lorry_cap_map.get(_pb, 0))
+                    # Route compatibility: check source route against ALL routes
+                    # already on the destination lorry (not just the first item).
+                    # This lets PH07 merge into BQX9983 via the shared-waypoint
+                    # chain  PH07↔PH03(JERANTUT)  even though PH07 and PH02
+                    # (BQX9983's first item) share no waypoints directly.
+                    _routes_b = {it["ROUTE"] for it in _pit[_pb] if it.get("ROUTE")}
+                    if not _routes_b:
+                        _sr = _session_routes.get(_pb, "")
+                        if _sr:
+                            _routes_b = {_sr}
+                    if _route_a and _routes_b:
+                        if not any(_routes_on_same_way(_route_a, _rb) for _rb in _routes_b):
+                            continue
+                    # Same-route items may fill up to 10 % over rated capacity
+                    # so they are never split across lorries unnecessarily.
+                    _same_rt = bool(_route_a and _route_a in _routes_b)
+                    _eff_cap_b = _cap_b * (1.10 if _same_rt else 1.0)
+                    if _load_a + _load_b > _eff_cap_b:
+                        continue
+                    # Score by utilisation GAIN on the destination lorry so that
+                    # underloaded lorries are filled first.
+                    _gain = _load_a / _cap_b if _cap_b else 0
+                    if _gain > _best_gain:
+                        _best_gain = _gain
+                        _best_src, _best_dst = _pa, _pb
+            if _best_src:
+                for _it in _pit[_best_src]:
+                    _it["LORRY"] = _best_dst
+                    sess["assigned"][_it["DO NUMBER"]] = _best_dst
+                _pit[_best_dst].extend(_pit.pop(_best_src))
+                _merge_ok = True
+
+        # ── Partial-transfer rebalance pass ──────────────────────────────────
+        # The merge pass moves entire lorry loads (all-or-nothing).  When two
+        # lorries carry compatible routes but their combined weight exceeds any
+        # single lorry's capacity, the merge fails and one lorry stays severely
+        # underloaded.  This pass moves individual items from well-loaded lorries
+        # onto underloaded ones (< 50 % util) when routes are compatible and
+        # the source stays above the threshold after the transfer — preventing
+        # oscillation.  Each item may only be moved once (tracked by object id).
+        # Example: BPE9788 (14T, 30% Temerloh) absorbs individual Kuantan DOs
+        # from BQX9983 (10.5T, 95%) since PH05/PH09 are both east-bound.
+        _REBAL_THRESHOLD = 0.50
+        _rebal_moved: set = set()
+        _rebal_ok = True
+        while _rebal_ok:
+            _rebal_ok = False
+            _ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+            _underloaded = sorted(
+                [p for p in _pit
+                 if _pit[p]
+                 and float(_lorry_cap_map.get(p, 0)) > 0
+                 and _ploads[p] / float(_lorry_cap_map.get(p, 0)) < _REBAL_THRESHOLD],
+                key=lambda p: _ploads[p] / float(_lorry_cap_map.get(p, 1))
+            )
+            if not _underloaded:
+                break
+            _best_gain, _best_item, _best_src, _best_dst = 0.0, None, None, None
+            for _dst in _underloaded:
+                _cap_dst  = float(_lorry_cap_map.get(_dst, 0))
+                _load_dst = _ploads[_dst]
+                _routes_dst = {x["ROUTE"] for x in _pit[_dst] if x.get("ROUTE")}
+                if not _routes_dst:
+                    _sr = _session_routes.get(_dst, "")
+                    if _sr:
+                        _routes_dst = {_sr}
+                for _src in list(_pit.keys()):
+                    if _src == _dst:
+                        continue
+                    _cap_src  = float(_lorry_cap_map.get(_src, 0))
+                    _load_src = _ploads[_src]
+                    for _it in _pit[_src]:
+                        if id(_it) in _rebal_moved:
+                            continue
+                        if _load_dst + _it["WEIGHT"] > _cap_dst:
+                            continue
+                        # Don't make the source lorry itself underloaded
+                        # (skip only when source has multiple items remaining)
+                        if len(_pit[_src]) > 1 and _cap_src > 0:
+                            if (_load_src - _it["WEIGHT"]) / _cap_src < _REBAL_THRESHOLD:
+                                continue
+                        _route_it = _it.get("ROUTE", "")
+                        if _routes_dst and _route_it:
+                            if not any(_routes_on_same_way(_route_it, _rd) for _rd in _routes_dst):
+                                continue
+                        _gain = _it["WEIGHT"] / _cap_dst
+                        if _gain > _best_gain:
+                            _best_gain = _gain
+                            _best_item = _it
+                            _best_src  = _src
+                            _best_dst  = _dst
+            if _best_item:
+                _best_item["LORRY"] = _best_dst
+                sess["assigned"][_best_item["DO NUMBER"]] = _best_dst
+                _pit[_best_src].remove(_best_item)
+                _pit[_best_dst].append(_best_item)
+                _rebal_moved.add(id(_best_item))
+                if not _pit[_best_src]:
+                    del _pit[_best_src]
+                _rebal_ok = True
+
+        # ── Hard capacity guard ───────────────────────────────────────────────
+        # After all passes, any lorry whose assigned weight still exceeds its
+        # physical capacity is trimmed: keep the nearest DOs (to Shah Alam HQ)
+        # up to the lorry's capacity and mark the overflow as NO_LORRY so the
+        # user can handle them manually or in a second trip.
+        for _pl, _pl_items in list(_pit.items()):
+            _cap = float(_lorry_cap_map.get(_pl, 0))
+            if _cap <= 0:
+                continue
+            _total = sum(x["WEIGHT"] for x in _pl_items)
+            # Same-route items may run up to 10 % over rated capacity so they
+            # are never split.  Multi-route lorries use the hard cap exactly.
+            _pl_routes = {it.get("ROUTE", "").strip().upper() for it in _pl_items
+                          if it.get("ROUTE")}
+            _eff_cap = _cap * (1.10 if len(_pl_routes) == 1 else 1.0)
+            if _total <= _eff_cap:
+                continue
+            # Sort by distance from depot — nearest first
+            def _dist_hq_guard(it):
+                c = _route_centroid(it["ROUTE"])
+                if c is None:
+                    return float("inf")
+                return _haversine_km(_DEPOT[0], _DEPOT[1], c[0], c[1])
+            _sorted_items = sorted(_pl_items, key=_dist_hq_guard)
+            _kept, _fill = [], 0.0
+            for _it in _sorted_items:
+                if _fill + _it["WEIGHT"] <= _eff_cap:
+                    _kept.append(_it)
+                    _fill += _it["WEIGHT"]
+                else:
+                    _it["LORRY"] = "NO_LORRY"
+                    sess["assigned"][_it["DO NUMBER"]] = "NO_LORRY"
+            _pit[_pl] = _kept
+
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
@@ -1412,6 +2759,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
         seen_do = {}
         pending_dos = []
         for item in items:
+            if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY"):
+                continue          # keep in raw_df for export blank; hide from UI
             do_num = item["DO NUMBER"]
             if do_num not in seen_do:
                 seen_do[do_num] = len(pending_dos)
@@ -1421,6 +2770,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     "ROUTE":         item["ROUTE"],
                     "CODE":          item["CODE"],
                     "CUSTOMER NAME": item["CUSTOMER NAME"],
+                    "DATE":          item.get("DATE", ""),
                     "ITEMS":         [],          # list of item dicts
                 })
             pending_dos[seen_do[do_num]]["ITEMS"].append(item)
@@ -1429,11 +2779,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for do in pending_dos:
             do["TOTAL_TON"] = round(sum(it["WEIGHT"] for it in do["ITEMS"]), 3)
 
-        sess["pending_dos"] = pending_dos
+        sess["pending_dos"]   = pending_dos
+        sess["change_do_page"] = 0   # reset Change DO pagination on new upload
 
         # ── Build and return summary ──────────────────────────────────────────
-        total_items = len(items)
+        my_items    = [it for it in items if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY")]
+        total_items = len(my_items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
+        if _other_user_count:
+            header += f"\n📌 _{_other_user_count} row(s) from other users' routes left blank — only your route codes were assigned._"
+        if _sched_notice:
+            header += "\n" + "\n".join(_sched_notice)
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
             return [header + "\n\n" + _summ[0]] + _summ[1:]
@@ -1621,6 +2977,11 @@ def _pick_replacement(broken: str, replacement: str, item: dict,
         )
         if suggestions:
             return suggestions[0]["LORRY"]
+        # Nothing fits by weight — use largest available as last resort
+        last_resort = engine.suggest_largest_available(
+            item.get("ROUTE", ""), excluded)
+        if last_resort:
+            return last_resort[0]["LORRY"]
 
     return "NO_LORRY"
 
@@ -1758,6 +3119,108 @@ def _assign_and_next(sess, lorry_plate):
     return [f"✅ *{lorry_plate}* assigned to DO {do['DO NUMBER']}."] + _suggest_current(sess)
 
 
+
+def _lorry_picker_buttons(sess: dict, do_num: str, page: int = 0) -> list:
+    """
+    Show up to 2 lorry options as tappable buttons + a Next/Prev navigation button.
+    WhatsApp allows max 3 buttons per message, so:
+      Button 1: Lorry option A
+      Button 2: Lorry option B (if available)
+      Button 3: "Next ▶" or "◀ Prev" (navigation)
+
+    Each button tap sends "select_lorry [DO#] [PLATE]" back to the bot.
+    Navigation sends "select_do [DO#] [page]".
+    """
+    engine: LorryEngine = sess.get("engine")
+    if not engine:
+        return ["❌ No engine loaded. Please restart with hi."]
+
+    # Find the target DO/item
+    target = None
+    for it in sess.get("items", []):
+        if it["DO NUMBER"] == do_num:
+            target = it
+            break
+    if not target:
+        return [f"❌ DO# {do_num} not found."]
+
+    # Release current lorry from excluded so it appears as an option
+    cur_lorry = target.get("LORRY", "")
+    split_plates = set()
+    if cur_lorry == "SPLIT" and target.get("SPLIT_LORRIES"):
+        for b in target["SPLIT_LORRIES"]:
+            split_plates.add(b["lorry"])
+    excluded = (sess.get("unavailable", set()) | get_assigned_today()) - {cur_lorry} - split_plates
+
+    weight = target["WEIGHT"]
+    route  = target["ROUTE"]
+    cust   = target.get("CUSTOMER NAME", "")
+
+    # Get suggestions — fetch enough for pagination
+    suggestions = engine.suggest(
+        route=route, total_ton=weight,
+        unavailable=excluded, top_n=20,
+        customer_name=cust,
+    )
+
+    # Build option list: auto-pick first, then suggestions
+    options = [{"plate": "__AUTO__", "label": "Auto-pick best", "desc": "Bot chooses optimal lorry"}]
+    for s in suggestions:
+        util = round((weight / s["TON_CAPACITY"]) * 100, 1) if s["TON_CAPACITY"] > 0 else 0
+        freq = f"{s['FREQ']}trips" if s["FREQ"] > 0 else "new"
+        options.append({
+            "plate": s["LORRY"],
+            "label": s["LORRY"],
+            "desc":  f"{s['TON_CAPACITY']}T {util}% {freq}",
+        })
+
+    PER_PAGE = 2  # 2 lorry options + 1 nav button = 3 total
+    total_pages = max(1, -(-len(options) // PER_PAGE))  # ceiling div
+    page = max(0, min(page, total_pages - 1))
+
+    slice_start = page * PER_PAGE
+    slice_end   = slice_start + PER_PAGE
+    page_opts   = options[slice_start:slice_end]
+
+    # Build buttons
+    buttons = []
+    for opt in page_opts:
+        label = opt["label"][:18] + ".." if len(opt["label"]) > 20 else opt["label"]
+        buttons.append({
+            "id":    f"select_lorry {do_num} {opt['plate']}",
+            "title": label,
+        })
+
+    # Navigation button
+    if total_pages > 1:
+        if page < total_pages - 1:
+            buttons.append({"id": f"select_do {do_num} {page+1}", "title": f"More ({page+1+1}/{total_pages})"})
+        else:
+            buttons.append({"id": f"select_do {do_num} 0",       "title": "From start"})
+
+    # Truncate to max 3
+    buttons = buttons[:3]
+
+    # Body text: show current assignment + lorry details
+    cur_label = ", ".join(split_plates) if split_plates else (cur_lorry if cur_lorry and cur_lorry not in ("NO_LORRY","SPLIT","") else "None")
+    details = []
+    for opt in page_opts:
+        if opt["plate"] != "__AUTO__":
+            details.append(f"  {opt['label']}: {opt['desc']}")
+    detail_str = "\n".join(details)
+    page_info  = f"Page {page+1}/{total_pages}" if total_pages > 1 else ""
+
+    body = (
+        f"DO: {do_num}\n"
+        f"Weight: {round(weight,3)}T  Route: {route[:30]}\n"
+        f"Current: {cur_label}\n"
+        f"{page_info}\n"
+        f"{detail_str}"
+    ).strip()
+
+    return [{"_type": "buttons", "body": body[:1024], "buttons": buttons}]
+
+
 def _build_summary(sess) -> str:
     """Build a clean, mobile-friendly assignment summary."""
     pending  = sess["pending_dos"]   # list of DO groups, each with ITEMS list
@@ -1798,81 +3261,147 @@ def _build_summary(sess) -> str:
     lines.append("")
 
     engine = sess.get("engine")
-    entry_num = 0
 
+    # ── Build lorry-grouped view ──────────────────────────────────────────
+    # Collect all items and build per-lorry buckets (exclude other-user rows)
+    all_items = [it for do in pending for it in do.get("ITEMS", [])
+                 if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY")]
+
+    # Map DO NUMBER → (customer_short, route_code, date)
+    do_meta: dict[str, tuple] = {}
     for do in pending:
-        do_num   = do["DO NUMBER"]
-        customer = do["CUSTOMER NAME"]
-        items    = do.get("ITEMS", [])
+        dn  = do["DO NUMBER"]
+        cust = do["CUSTOMER NAME"][:10]
+        route_code = do["ROUTE"].split(" - ")[0].strip()[:8] if " - " in do["ROUTE"] else do["ROUTE"][:8]
+        dt  = do.get("DATE", "")
+        if dt and dt.lower() in ("nan", "none", ""):
+            dt = ""
+        do_meta[dn] = (cust, route_code, dt)
 
-        # Shorten route: "KV04A - SUNGAI BULOH - U5 - KOTA DAMANSARA - N 4"
-        # → "KV04A  SUNGAI BULOH → KOTA DAMANSARA"
-        route = do["ROUTE"]
-        if "-->" in route:
-            route_short = route.split("-->")[-1].strip()
+    # Group items by lorry plate
+    from collections import defaultdict as _dd
+    lorry_items: dict[str, list] = _dd(list)  # plate → [item, ...]
+    no_lorry_items: list = []
+    for it in all_items:
+        if it["LORRY"] in ("NO_LORRY", None):
+            no_lorry_items.append(it)
         else:
-            parts = [p.strip() for p in route.split(" - ")]
-            code  = parts[0] if parts else ""
-            areas = [p for p in parts[1:]
-                     if len(p) > 3 and (not p.replace(" ", "").isalnum() or len(p) > 5)]
-            if len(areas) >= 2:
-                route_short = f"{code}  {areas[0]} → {areas[1]}"
-            elif areas:
-                route_short = f"{code}  {areas[0]}"
+            lorry_items[it["LORRY"]].append(it)
+
+    # Lorry capacities
+    cap_map: dict[str, float] = {}
+    if engine is not None:
+        for _, r in engine.eligible_lorries.iterrows():
+            cap_map[r["LORRY"]] = float(r["TON"])
+
+    # Sort lorries: by earliest date among their items, then by total weight desc
+    def _lorry_sort(plate):
+        its = lorry_items[plate]
+        dates = [_parse_date_sortkey(it.get("DATE", "")) for it in its]
+        return (min(dates) if dates else "9999-12-31", -sum(i["WEIGHT"] for i in its))
+
+    # _parse_date_sortkey may not be in scope here (defined inside _handle_excel_upload).
+    # Use a local re-implementation for sorting.
+    def _dsort(s):
+        s = (s or "").strip()
+        if not s or s.lower() in ("nan", "none", ""):
+            return "9999-12-31"
+        for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return ts.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return "9999-12-31"
+
+    sorted_lorries = sorted(lorry_items.keys(),
+        key=lambda p: (
+            min((_dsort(it.get("DATE","")) for it in lorry_items[p]), default="9999-12-31"),
+            -sum(i["WEIGHT"] for i in lorry_items[p])
+        ))
+
+    for plate in sorted_lorries:
+        its   = lorry_items[plate]
+        total_w = round(sum(i["WEIGHT"] for i in its), 3)
+        cap     = cap_map.get(plate)
+
+        if cap and cap > 0:
+            # Lorry size class label
+            if cap >= 14.0:
+                _size_tag = "LARGE"
+            elif cap >= 11.0:
+                _size_tag = "MEDIUM"
+            elif cap >= 2.0:
+                _size_tag = "SMALL"
             else:
-                route_short = route[:45]
+                _size_tag = "VAN"
 
-        for item in items:
-            entry_num += 1
-            weight = round(item["WEIGHT"], 3)
-            lorry  = item["LORRY"]
-            itmref = item.get("ITMREF", "")
-            itmref_str = f" ({itmref})" if itmref and itmref != "nan" else ""
+            # Trip display: LARGE (≥14T) never splits; MEDIUM/SMALL on LOCAL routes may split.
+            _trip_info = ""
+            _all_local_its = all(
+                _classify_dest_group(i.get("ROUTE", "")) in _DEST_URBAN_GROUPS
+                for i in its
+            )
+            if cap < 14.0 and _all_local_its and total_w > cap * 1.02:
+                _t1w = round(cap, 1)
+                _t2w = round(total_w - cap, 3)
+                _trip_info = (f"  🌅Morning(T1):{_t1w}T"
+                              f"  🌆Afternoon(T2):{_t2w}T")
 
-            # ── Entry header ──────────────────────────────────────────────
-            lines.append(f"*{entry_num}. {customer}*{itmref_str}")
-            lines.append(f"📍 {route_short}")
-            lines.append(f"🔖 {do_num}")
-            lines.append(f"⚖️  {weight}T")
-
-            # ── Lorry assignment ──────────────────────────────────────────
-            if lorry == "SPLIT" and item.get("SPLIT_LORRIES"):
-                lines.append("🚛 SPLIT LOAD:")
-                for bin_ in (item.get("SPLIT_LORRIES") or []):
-                    bin_w = round(sum(r["W"] for r in bin_["rows"]), 3)
-                    lines.append(f"    • *{bin_['lorry']}* — {bin_w}T")
-                no_lorry  # keep list intact
-
-            elif lorry == "NO_LORRY":
-                lines.append("🚛 ❌ No lorry available")
-                no_lorry.append(do_num)
-
+            util_pct = round(min(total_w, cap) / cap * 100, 1)
+            if util_pct > 100:
+                util_tag = f"🔴 {util_pct}% OVER"
+            elif util_pct >= 75:
+                util_tag = f"✅ {util_pct}%"
+            elif util_pct >= 50:
+                util_tag = f"🟡 {util_pct}%"
             else:
-                # Single lorry — compute utilization
-                cap = None
-                if engine is not None:
-                    row = engine.eligible_lorries[
-                        engine.eligible_lorries["LORRY"] == lorry]
-                    if not row.empty:
-                        cap = float(row.iloc[0]["TON"])
-                if cap and cap > 0:
-                    util_pct = round((weight / cap) * 100, 1)
-                    util_icon = ("⚠️" if util_pct < 50
-                                 else "🟡" if util_pct < 75
-                                 else "✅")
-                    lines.append(f"🚛 *{lorry}*  {util_icon} {util_pct}%")
-                else:
-                    lines.append(f"🚛 *{lorry}*")
+                util_tag = f"⚠️ {util_pct}%"
+            cap_str = f"{cap}T/{_size_tag}"
+        else:
+            util_tag  = ""
+            cap_str   = "?"
+            _trip_info = ""
 
-            # ── Divider between entries ───────────────────────────────────
-            lines.append("─────────────────────")
+        lines.append(f"🚛 *{plate}* ({cap_str})  {util_tag}  _{total_w}T_{_trip_info}")
+
+        # One line per DO under this lorry: DO# first, then route→dest, customer, weight, date
+        for it in sorted(its, key=lambda x: _dsort(x.get("DATE", ""))):
+            dn   = it["DO NUMBER"]
+            dn_short = dn[-5:] if len(dn) >= 5 else dn
+            w    = round(it["WEIGHT"], 3)
+            cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
+            dt_tag = f" [{dt}]" if dt else ""
+            _dest_lbl = {
+                "LARGE_LONG": "🟥", "MEDIUM_LONG": "🟧",
+                "SELANGOR": "🟦", "KL": "🟩", "KL_SELANGOR": "🟩",
+            }.get(_classify_dest_group(it.get("ROUTE", ""), it.get("STATE", "")), "")
+            lines.append(f"  {dn_short}  {_dest_lbl}{rcode}  {cust}  {w}T{dt_tag}")
+
+        lines.append("")   # blank line between lorries
+
+    # ── No-lorry items ────────────────────────────────────────────────────
+    if no_lorry_items:
+        lines.append(f"❌ *NO LORRY ({len(no_lorry_items)} item(s)):*")
+        for it in no_lorry_items:
+            dn   = it["DO NUMBER"]
+            dn_short = dn[-5:] if len(dn) >= 5 else dn
+            w    = round(it["WEIGHT"], 3)
+            cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
+            dt_tag = f" [{dt}]" if dt else ""
+            lines.append(f"  {dn_short}  {rcode}  {cust}  {w}T{dt_tag}")
+        lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────
-    all_items   = [it for do in pending for it in do.get("ITEMS", [])]
-    assigned_ok = sum(1 for it in all_items if it["LORRY"] not in ("NO_LORRY", None))
-    unassigned  = sum(1 for it in all_items if it["LORRY"] == "NO_LORRY")
+    assigned_ok = len(all_items) - len(no_lorry_items)
+    unassigned  = len(no_lorry_items)
 
-    lines.append(f"✅ {assigned_ok} assigned   ❌ {unassigned} unassigned")
+    lines.append(f"✅ {assigned_ok} assigned  ❌ {unassigned} unassigned  🚛 {len(sorted_lorries)} lorry(s)")
     summary_text = "\n".join(lines)
 
     result = [summary_text]
@@ -1894,28 +3423,83 @@ def _build_summary(sess) -> str:
         first_item = do.get("ITEMS", [{}])[0] if do.get("ITEMS") else {}
         lorry      = first_item.get("LORRY", "")
         if lorry == "SPLIT" and first_item.get("SPLIT_LORRIES"):
-            lorry = "+".join(b["lorry"] for b in first_item["SPLIT_LORRIES"])
+            lorry = "+".join(b["lorry"] for b in (first_item.get("SPLIT_LORRIES") or []))
         route = first_item.get("ROUTE", "")[:25]
         if do_num:
-            status = "❌ no lorry" if lorry in ("NO_LORRY", "", None) else lorry
+            status = "No lorry" if lorry in ("NO_LORRY", "", None) else lorry
             do_items.append({
                 "id":          f"select_do {do_num}",
                 "title":       do_num[:24],
                 "description": f"{status} | {route}"[:72],
             })
     if do_items:
+        # Paginate: WhatsApp only supports 9 rows reliably in a single-section list.
+        # Show page from session; add "Next Page" row if more items exist.
+        PAGE       = 9
+        page       = sess.get("change_do_page", 0)
+        start      = page * PAGE
+        chunk      = do_items[start:start + PAGE]
+        has_more   = (start + PAGE) < len(do_items)
+        has_prev   = page > 0
+        if has_more:
+            chunk.append({
+                "id":          f"change_do_page {page + 1}",
+                "title":       "Next page...",
+                "description": f"Showing {start+1}-{start+PAGE} of {len(do_items)}",
+            })
+        elif has_prev:
+            chunk.append({
+                "id":          "change_do_page 0",
+                "title":       "Back to start",
+                "description": f"Page {page+1} of {((len(do_items)-1)//PAGE)+1}",
+            })
         result.append({
             "_type":  "do_list",
             "header": "Change Assignment",
             "body":   "Tap a DO# to pick a different lorry:",
             "button": "Change DO",
-            "items":  do_items,
+            "items":  chunk,
         })
 
     return result
 
 def _handle_confirming(phone, sess, text):
     cmd = text.strip().lower()
+
+    # Pagination for Change DO list
+    if cmd.startswith("change_do_page "):
+        try:
+            page = int(cmd.split()[1])
+            sess["change_do_page"] = page
+        except (IndexError, ValueError):
+            sess["change_do_page"] = 0
+        return _build_summary(sess)
+
+    # ── Propagate change to same-route DOs ───────────────────────────────────
+    if cmd == "propagate yes":
+        ctx = sess.pop("_propagate_ctx", None)
+        if ctx:
+            plate     = ctx["plate"]
+            old_lorry = ctx["old_lorry"]
+            dos       = ctx["dos"]
+            updated   = []
+            for do in sess["pending_dos"]:
+                if do["DO NUMBER"] not in dos:
+                    continue
+                for it in do.get("ITEMS", []):
+                    if it.get("LORRY") == old_lorry:
+                        it["LORRY"]         = plate
+                        it["SPLIT_LORRIES"] = None
+                sess["assigned"][do["DO NUMBER"]] = plate
+                updated.append(do["DO NUMBER"])
+            msg = f"✅ Updated {len(updated)} DO(s) to *{plate}*: {', '.join(updated)}"
+        else:
+            msg = "✅ No propagation context found."
+        return [msg] + _build_summary(sess)
+
+    if cmd == "propagate no":
+        sess.pop("_propagate_ctx", None)
+        return ["✅ Change applied to selected DO only."] + _build_summary(sess)
 
     if cmd in ("yes", "confirm", "ok"):
         return _export_result(sess)
@@ -2055,18 +3639,58 @@ def _handle_confirming(phone, sess, text):
             if plate in blocked_today:
                 return [f"❌ *{plate}* is already assigned/blocked today. Use a different lorry."]
 
+            old_lorry = target_item.get("LORRY", "")
+            sess["_last_change_old_lorry"] = old_lorry
+
             target_item["LORRY"]         = plate
             target_item["SPLIT_LORRIES"] = None
             # Update ALL items in this DO
             for it in target_do.get("ITEMS", []):
                 it["LORRY"]         = plate
                 it["SPLIT_LORRIES"] = None
-            sess["assigned"][do_num]     = plate
+            sess["assigned"][do_num] = plate
+            old_lorry = sess.get("_last_change_old_lorry")
             sess["unavailable"].add(plate)
+
+            # ── Check if other DOs share the same route AND old lorry ────────
+            # If so, ask user whether to propagate the change to them too
+            same_route_dos = []
+            changed_route  = target_do.get("ITEMS", [{}])[0].get("ROUTE", "")
+            for do in sess["pending_dos"]:
+                if do["DO NUMBER"] == do_num:
+                    continue
+                for it in do.get("ITEMS", []):
+                    if (it.get("ROUTE") == changed_route and
+                            it.get("LORRY") == old_lorry and
+                            old_lorry not in (None, "", "NO_LORRY", "SPLIT")):
+                        same_route_dos.append(do["DO NUMBER"])
+                        break
+
+            if same_route_dos:
+                # Store context for propagation confirmation
+                sess["_propagate_ctx"] = {
+                    "plate":    plate,
+                    "old_lorry": old_lorry,
+                    "dos":      same_route_dos,
+                }
+                do_list_str = ", ".join(same_route_dos[:5])
+                return [
+                    f"✅ {do_num} → *{plate}*\n\n"
+                    f"The following DOs share the same route with *{old_lorry}*:\n"
+                    f"{do_list_str}\n\n"
+                    "Apply the same change to these DOs too?",
+                    {"_type": "buttons",
+                     "body": "Propagate change?",
+                     "buttons": [
+                         {"id": "propagate yes", "title": "Yes, update all"},
+                         {"id": "propagate no",  "title": "No, keep as-is"},
+                     ]}
+                ]
+
             return [
                 f"✅ {do_num} → *{plate}*\n"
                 "Reply *yes* to confirm or *change [DO#] [PLATE]* to adjust more."
-            ] + (_s2 if isinstance(_s2 := _build_summary(sess), list) else [_s2])
+            ] + _build_summary(sess)
 
         # ── SPLIT: 2 or more plates ─────────────────────────────────────────
         # Validate plates
@@ -2211,7 +3835,7 @@ def _export_result_inner(sess) -> list[str]:
     # Blank out any stale sentinel strings in LICENSE so we only write real plates
     new_df["LICENSE"] = new_df["LICENSE"].astype(str).replace({"nan": "", "None": ""})
 
-    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "", None}
+    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "OTHER_USER", "NOT_TODAY", "", None}
     confirmed_plates = []
     assigned_row_idxs = set()
 
@@ -2258,6 +3882,22 @@ def _export_result_inner(sess) -> list[str]:
     # Drop internal helper columns added during processing (not in original spec)
     _INTERNAL_COLS = {"WEIGHT(T)"}
 
+    # Add DEST_STATE column showing classified destination per row
+    # Uses actual STATE column from uploaded file when available; falls back to route prefix.
+    if "ROUTE" in new_df.columns:
+        _dest_state_map = {
+            "LARGE_LONG":  "OUTSTATION-LARGE",
+            "MEDIUM_LONG": "OUTSTATION-MEDIUM",
+            "KL":          "KUALA LUMPUR",
+            "SELANGOR":    "SELANGOR",
+            "KL_SELANGOR": "KL/SELANGOR",
+        }
+        def _row_dest_state(row):
+            st = _state_from_row(row)
+            grp = _classify_dest_group(str(row.get("ROUTE", "")), st)
+            return _dest_state_map.get(grp, st or "")
+        new_df["DEST_STATE"] = new_df.apply(_row_dest_state, axis=1)
+
     if is_new_fmt:
         # Reorder columns: required spec first, then any extras from the upload
         ordered = [c for c in NEW_FMT_COLS if c in new_df.columns]
@@ -2273,7 +3913,7 @@ def _export_result_inner(sess) -> list[str]:
             new_rows["DATE"] = today_str
 
     # ── Append assigned rows into master history file ─────────────────────────
-    _hist_path = HISTORY_PATH if os.path.exists(HISTORY_PATH) else HISTORY_PATH_OLD
+    _hist_path = _resolve_history_path()
     try:
         existing_df = pd.read_excel(_hist_path)
         existing_df.columns = [c.strip().upper() for c in existing_df.columns]
@@ -2319,6 +3959,81 @@ def _export_result_inner(sess) -> list[str]:
         if "DATE" in out_df.columns:
             out_df["DATE"] = out_df["DATE"].astype(str)
 
+    # ── TRIP column: mark morning (1) vs afternoon (2) for lorries used twice ──
+    # A lorry that appears on two different route groups in the same session did
+    # two trips.  The first group it served = Trip 1 (morning); second = Trip 2.
+    if "LICENSE" in out_df.columns and "ROUTE" in out_df.columns:
+        _KV_RE = re.compile(r'^KV\d', re.IGNORECASE)
+        # Build plate → ordered list of row indices (preserving output order)
+        _plate_rows: dict[str, list] = {}
+        for _ri, _r in out_df.iterrows():
+            _pl = str(_r.get("LICENSE", "")).strip().upper()
+            if _pl and _pl.lower() not in ("nan", "none", "", "no_lorry",
+                                           "split", "skipped", "other_user"):
+                _plate_rows.setdefault(_pl, []).append(_ri)
+
+        # Track trip number per lorry per row.
+        # Trip rules (based on lorry size AND route type):
+        #   LARGE  (≥14T): always TRIP 1 — one outstation run per day.
+        #   MEDIUM (11–14T) on OUTSTATION routes: TRIP 1 only.
+        #   MEDIUM (11–14T) on LOCAL (KV/KL/Selangor) routes: TRIP 1 morning,
+        #     TRIP 2 afternoon when cumulative weight exceeds capacity.
+        #     Morning: 8:00–11:59am  |  Afternoon: 1:00–5:30pm
+        #   SMALL  (<11T) on LOCAL routes: TRIP 1 / TRIP 2 by capacity.
+        _trip_vals = {}
+        for _pl, _ridxs in _plate_rows.items():
+            _cap_val = 0.0
+            _eng = sess.get("engine")
+            if _eng is not None:
+                for _, _er in _eng.eligible_lorries.iterrows():
+                    if str(_er["LORRY"]).strip().upper() == _pl:
+                        _cap_val = float(_er["TON"])
+                        break
+
+            # Determine if ALL rows for this lorry are on LOCAL routes
+            _lorry_routes = [str(out_df.at[_ri, "ROUTE"]).strip() for _ri in _ridxs]
+            _lorry_all_local = all(
+                _classify_dest_group(r) in _DEST_URBAN_GROUPS
+                for r in _lorry_routes
+            )
+
+            _trip_num = 1
+            _cum_w    = 0.0
+            for _ri in _ridxs:
+                _wt_raw = pd.to_numeric(
+                    out_df.at[_ri, "WEIGHT(T)"] if "WEIGHT(T)" in out_df.columns
+                    else out_df.at[_ri, "GROSS WEIGHT"],
+                    errors="coerce"
+                )
+                _wt = (float(_wt_raw) / 1000.0
+                       if "GROSS WEIGHT" in out_df.columns and "WEIGHT(T)" not in out_df.columns
+                       else float(_wt_raw or 0))
+
+                # LARGE lorries (≥14T): always TRIP 1 regardless of route
+                # MEDIUM/SMALL on LOCAL routes: allow TRIP 2 when capacity overflows
+                _can_trip2 = (
+                    _cap_val > 0
+                    and _cap_val < 14.0       # not a large lorry
+                    and _lorry_all_local      # only local (KV) routes
+                    and _cum_w + _wt > _cap_val * 1.02
+                )
+                if _can_trip2:
+                    _trip_num = 2
+                    _cum_w    = _wt
+                else:
+                    _cum_w += _wt
+                _trip_vals[_ri] = _trip_num
+
+        if _trip_vals:
+            _trip_col = [
+                str(_trip_vals[i]) if i in _trip_vals else ""
+                for i in range(len(out_df))
+            ]
+            # Only insert TRIP column if any lorry does 2 trips
+            if any(v == 2 for v in _trip_vals.values()):
+                _lic_loc = out_df.columns.get_loc("LICENSE")
+                out_df.insert(_lic_loc, "TRIP", _trip_col)
+
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
 
@@ -2338,6 +4053,13 @@ def _export_result_inner(sess) -> list[str]:
 
     buf.seek(0)
     sess["export_bytes"] = buf.read()
+
+    # Generate trip manifest for drivers (second file sent alongside the export)
+    try:
+        sess["trip_manifest_bytes"] = _generate_trip_manifest(sess)
+    except Exception as _tm_err:
+        print(f"⚠️ Trip manifest generation failed: {_tm_err}")
+        sess["trip_manifest_bytes"] = None
 
     # Persist confirmed plates to daily log
     record_assignments_today(list(set(confirmed_plates)))
@@ -2359,6 +4081,525 @@ def _export_result_inner(sess) -> list[str]:
             "buttons": [{"id": "hi", "title": "👋 Hi"}],
         }
     ]
+
+def _generate_trip_manifest(sess) -> bytes:
+    """
+    Build a driver-friendly trip manifest Excel workbook.
+    Stops are sorted geographically using a greedy nearest-neighbour algorithm
+    starting from the depot, so the driver follows the most logical road sequence.
+    Within a given date, stops are chained by proximity; dates appear in order.
+    Columns: # | DATE | DO# | Customer | Route/Area | WT(T) | Dist | Remarks
+    """
+    import math
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    from datetime import date as _date, datetime as _dt
+    from collections import defaultdict as _dd
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    generated_str = _date.today().strftime("%d-%m-%Y")
+    raw_df = sess.get("raw_df")
+
+    _DEPOT = (3.0340, 101.5563)   # Eng Sheng HQ, Shah Alam
+
+    # ── Geo helpers ───────────────────────────────────────────────────────────
+    def _haversine(lat1, lon1, lat2, lon2) -> float:
+        R = 6371.0
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) ** 2
+             + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+             * math.sin(dlon / 2) ** 2)
+        return R * 2 * math.asin(math.sqrt(min(1.0, a)))
+
+    def _parse_latlon(row_idx) -> tuple[float, float] | None:
+        """Parse 'lat lon' or 'lat, lon' from the LONGITUD column."""
+        if raw_df is None or row_idx is None:
+            return None
+        try:
+            v = str(raw_df.loc[row_idx, "LONGITUD"]).strip()
+            if not v or v.lower() in ("nan", "none", ""):
+                return None
+            v = v.replace(",", " ")
+            parts = v.split()
+            if len(parts) >= 2:
+                return (float(parts[0]), float(parts[1]))
+        except Exception:
+            pass
+        return None
+
+    def _nn_sort(pairs: list) -> list:
+        """
+        Greedy nearest-neighbour sort within a single date group.
+        Pairs with no coordinates are appended at the end in route order.
+        """
+        with_coords    = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
+        has_coords     = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
+        no_coords      = [(do, it)     for do, it, ll in with_coords if ll is None]
+
+        result: list = []
+        unvisited     = list(has_coords)
+        cur           = _DEPOT
+
+        while unvisited:
+            nearest = min(unvisited, key=lambda x: _haversine(cur[0], cur[1], x[2][0], x[2][1]))
+            result.append((nearest[0], nearest[1]))
+            cur = nearest[2]
+            unvisited.remove(nearest)
+
+        # Append stops with no coordinates sorted by route then customer
+        no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
+        result.extend(no_coords)
+        return result
+
+    # ── Date helpers ──────────────────────────────────────────────────────────
+    def _fmt_date(s) -> str:
+        s = str(s).strip()
+        if not s or s.lower() in ("nan", "none", "nat", ""):
+            return ""
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+            try:
+                return _dt.strptime(s, fmt).strftime("%d-%m-%Y")
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return ts.strftime("%d-%m-%Y")
+        except Exception:
+            pass
+        return s
+
+    def _date_sortkey(s) -> str:
+        """Return YYYY-MM-DD for chronological sort, '9999-12-31' on failure."""
+        s = str(s or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y"):
+            try:
+                return _dt.strptime(s, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return ts.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return "9999-12-31"
+
+    # ── Gather items per lorry ────────────────────────────────────────────────
+    lorry_pairs: dict[str, list] = _dd(list)
+    no_lorry_pairs: list         = []
+
+    for do in sess.get("pending_dos", []):
+        for it in do.get("ITEMS", []):
+            lorry = it.get("LORRY") or "NO_LORRY"
+            if lorry in ("NO_LORRY", None, ""):
+                no_lorry_pairs.append((do, it))
+            elif lorry != "SPLIT":
+                lorry_pairs[lorry].append((do, it))
+
+    engine  = sess.get("engine")
+    cap_map: dict[str, float] = {}
+    if engine is not None:
+        for _, r in engine.eligible_lorries.iterrows():
+            cap_map[r["LORRY"]] = float(r["TON"])
+
+    sorted_lorries = sorted(
+        lorry_pairs.keys(),
+        key=lambda p: sum(it["WEIGHT"] for _, it in lorry_pairs[p]),
+        reverse=True,
+    )
+
+    # ── Shared styles ─────────────────────────────────────────────────────────
+    _thin       = Side(style="thin", color="BBBBBB")
+    _brd        = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    _TITLE_FILL = PatternFill("solid", fgColor="1F4E79")
+    _TITLE_FONT = Font(color="FFFFFF", bold=True, size=11)
+    _HDR_FILL   = PatternFill("solid", fgColor="2E75B6")
+    _HDR_FONT   = Font(color="FFFFFF", bold=True, size=9)
+    _ALT_FILL   = PatternFill("solid", fgColor="DEEBF7")
+    _DATE_FILL  = PatternFill("solid", fgColor="E2EFDA")  # green tint = first row of new date
+    _FOOT_FILL  = PatternFill("solid", fgColor="FCE4D6")
+    _FOOT_FONT  = Font(bold=True, size=9)
+    _NL_FILL    = PatternFill("solid", fgColor="C00000")
+
+    HEADERS    = ["#", "DATE", "DO #", "CUSTOMER", "ROUTE / AREA", "WT (T)", "DIST", "REMARKS / NOTES"]
+    COL_WIDTHS = [4,   11,     9,      22,          32,             8,        8,      42]
+
+    def _apply_headers(ws, row):
+        for ci, (hdr, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
+            c = ws.cell(row, ci, hdr)
+            c.font = _HDR_FONT; c.fill = _HDR_FILL; c.border = _brd
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.row_dimensions[row].height = 16
+
+    def _route_display(route_str: str) -> str:
+        if " - " in route_str:
+            parts = route_str.split(" - ")
+            return f"{parts[0]}: {' - '.join(parts[1:3])}"[:32]
+        return route_str[:32]
+
+    def _raw_val(row_idx, col: str) -> str:
+        if raw_df is None or row_idx is None:
+            return ""
+        try:
+            v = str(raw_df.loc[row_idx, col]).strip()
+            if v in ("nan", "None", "NaN", ""):
+                return ""
+            # Ignore GPS-coordinate strings accidentally placed in DISTANCE column
+            if col == "DISTANCE" and re.match(r"^-?\d+\.\d+\s+-?\d+\.\d+", v):
+                return ""
+            return v
+        except Exception:
+            return ""
+
+    # ── One sheet per lorry ───────────────────────────────────────────────────
+    last_col = get_column_letter(len(HEADERS))
+    for plate in sorted_lorries:
+        pairs    = lorry_pairs[plate]
+        cap      = cap_map.get(plate, 0)
+        total_w  = round(sum(it["WEIGHT"] for _, it in pairs), 3)
+        util_pct = round(total_w / cap * 100, 1) if cap > 0 else 0
+
+        ws = wb.create_sheet(title=plate[:31].replace("/", "-"))
+        ws.freeze_panes = "A3"
+
+        # Title
+        ws.merge_cells(f"A1:{last_col}1")
+        util_icon = "✅" if util_pct >= 75 else ("🟡" if util_pct >= 50 else "⚠️")
+        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
+                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   "
+                     f"|   Generated: {generated_str}")
+        t = ws.cell(1, 1, title_txt)
+        t.font = _TITLE_FONT; t.fill = _TITLE_FILL
+        t.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+        _apply_headers(ws, 2)
+
+        # Sort: group by date chronologically, then nearest-neighbour within each date
+        date_groups: dict[str, list] = _dd(list)
+        for do, it in pairs:
+            dk = _date_sortkey(do.get("DATE", ""))
+            date_groups[dk].append((do, it))
+
+        sorted_pairs: list = []
+        for dk in sorted(date_groups.keys()):
+            sorted_pairs.extend(_nn_sort(date_groups[dk]))
+
+        prev_date = None
+        for seq, (do, it) in enumerate(sorted_pairs, 1):
+            dr      = seq + 2
+            row_idx = it.get("ROW_IDX")
+            dist_val    = _raw_val(row_idx, "DISTANCE")
+            remarks_val = _raw_val(row_idx, "REMARKS")
+
+            dn_short  = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            date_disp = _fmt_date(do.get("DATE", ""))
+
+            date_changed = (date_disp != prev_date)
+            prev_date    = date_disp
+            fill = _DATE_FILL if date_changed else (_ALT_FILL if seq % 2 == 0 else None)
+
+            row_data = [seq, date_disp, dn_short, do["CUSTOMER NAME"][:22],
+                        _route_display(do["ROUTE"]), round(it["WEIGHT"], 3),
+                        dist_val, remarks_val]
+            for ci, val in enumerate(row_data, 1):
+                c = ws.cell(dr, ci, val)
+                c.border    = _brd
+                c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
+                if fill:
+                    c.fill = fill
+            if remarks_val:
+                ws.row_dimensions[dr].height = min(60, max(15, len(remarks_val) // 5 * 8))
+
+        # Footer
+        fr = len(sorted_pairs) + 3
+        ws.merge_cells(f"A{fr}:E{fr}")
+        c = ws.cell(fr, 1, f"TOTAL — {len(sorted_pairs)} stop(s)")
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="right")
+
+        c = ws.cell(fr, 6, total_w)
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
+
+        ws.merge_cells(f"G{fr}:{last_col}{fr}")
+        c = ws.cell(fr, 7, f"{util_icon} {util_pct}% utilisation  ({total_w}T / {cap}T)")
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
+
+    # ── NO LORRY sheet ────────────────────────────────────────────────────────
+    if no_lorry_pairs:
+        ws = wb.create_sheet(title="NO LORRY")
+        ws.merge_cells(f"A1:{last_col}1")
+        t = ws.cell(1, 1,
+            f"UNASSIGNED — {len(no_lorry_pairs)} item(s)  |  Generated: {generated_str}  — Needs manual assignment")
+        t.font = Font(color="FFFFFF", bold=True, size=11)
+        t.fill = _NL_FILL
+        t.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+        _apply_headers(ws, 2)
+        nl_sorted = _nn_sort(no_lorry_pairs)
+        for seq, (do, it) in enumerate(nl_sorted, 1):
+            dr = seq + 2
+            row_idx     = it.get("ROW_IDX")
+            remarks_val = _raw_val(row_idx, "REMARKS")
+            dn_short    = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            date_disp   = _fmt_date(do.get("DATE", ""))
+            for ci, val in enumerate(
+                [seq, date_disp, dn_short, do["CUSTOMER NAME"][:22],
+                 _route_display(do["ROUTE"]), round(it["WEIGHT"], 3), "",
+                 remarks_val or "⚠️ No lorry assigned"],
+                1,
+            ):
+                c = ws.cell(dr, ci, val)
+                c.border = _brd
+                c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
+        for ci, w in enumerate(COL_WIDTHS, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+    generated_str = _date.today().strftime("%d-%m-%Y")
+    raw_df = sess.get("raw_df")
+
+    # ── Normalise a date string to DD-MM-YYYY for display ────────────────────
+    def _fmt_date(s) -> str:
+        s = str(s).strip()
+        if not s or s.lower() in ("nan", "none", "nat", ""):
+            return ""
+        # Pandas Timestamp str e.g. "2026-05-18 00:00:00"
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+            try:
+                return _dt.strptime(s, fmt).strftime("%d-%m-%Y")
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return ts.strftime("%d-%m-%Y")
+        except Exception:
+            pass
+        return s
+
+    # ── Sort key: date then route ─────────────────────────────────────────────
+    def _sort_key(pair):
+        do, _ = pair
+        s = str(do.get("DATE", "") or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y"):
+            try:
+                return (_dt.strptime(s, fmt).strftime("%Y-%m-%d"), do["ROUTE"], do["CUSTOMER NAME"])
+            except ValueError:
+                pass
+        try:
+            ts = pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
+            if pd.notna(ts):
+                return (ts.strftime("%Y-%m-%d"), do["ROUTE"], do["CUSTOMER NAME"])
+        except Exception:
+            pass
+        return ("9999-12-31", do["ROUTE"], do["CUSTOMER NAME"])
+
+    # ── Gather items per lorry ────────────────────────────────────────────────
+    lorry_pairs: dict[str, list] = _dd(list)
+    no_lorry_pairs: list         = []
+
+    for do in sess.get("pending_dos", []):
+        for it in do.get("ITEMS", []):
+            lorry = it.get("LORRY") or "NO_LORRY"
+            if lorry in ("NO_LORRY", None, ""):
+                no_lorry_pairs.append((do, it))
+            elif lorry != "SPLIT":
+                lorry_pairs[lorry].append((do, it))
+
+    engine  = sess.get("engine")
+    cap_map: dict[str, float] = {}
+    if engine is not None:
+        for _, r in engine.eligible_lorries.iterrows():
+            cap_map[r["LORRY"]] = float(r["TON"])
+
+    sorted_lorries = sorted(
+        lorry_pairs.keys(),
+        key=lambda p: sum(it["WEIGHT"] for _, it in lorry_pairs[p]),
+        reverse=True,
+    )
+
+    # ── Shared styles ─────────────────────────────────────────────────────────
+    _thin       = Side(style="thin", color="BBBBBB")
+    _brd        = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    _TITLE_FILL = PatternFill("solid", fgColor="1F4E79")
+    _TITLE_FONT = Font(color="FFFFFF", bold=True, size=11)
+    _HDR_FILL   = PatternFill("solid", fgColor="2E75B6")
+    _HDR_FONT   = Font(color="FFFFFF", bold=True, size=9)
+    _ALT_FILL   = PatternFill("solid", fgColor="DEEBF7")
+    _DATE_FILL  = PatternFill("solid", fgColor="E2EFDA")   # green tint for date change rows
+    _FOOT_FILL  = PatternFill("solid", fgColor="FCE4D6")
+    _FOOT_FONT  = Font(bold=True, size=9)
+    _NL_FILL    = PatternFill("solid", fgColor="C00000")
+
+    # DATE column added as column 2 (after #)
+    HEADERS    = ["#", "DATE", "DO #", "CUSTOMER", "ROUTE / AREA", "WT (T)", "DIST", "REMARKS / NOTES"]
+    COL_WIDTHS = [4,   11,     9,      22,          32,             8,        8,      42]
+
+    def _apply_headers(ws, row):
+        for ci, (hdr, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
+            c = ws.cell(row, ci, hdr)
+            c.font = _HDR_FONT; c.fill = _HDR_FILL; c.border = _brd
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.row_dimensions[row].height = 16
+
+    def _route_display(route_str: str) -> str:
+        if " - " in route_str:
+            parts = route_str.split(" - ")
+            return f"{parts[0]}: {' - '.join(parts[1:3])}"[:32]
+        return route_str[:32]
+
+    def _raw_val(row_idx, col: str) -> str:
+        if raw_df is None or row_idx is None:
+            return ""
+        try:
+            v = str(raw_df.loc[row_idx, col]).strip()
+            if v in ("nan", "None", "NaN", ""):
+                return ""
+            # Ignore GPS-coordinate strings accidentally placed in DISTANCE column
+            if col == "DISTANCE" and re.match(r"^-?\d+\.\d+\s+-?\d+\.\d+", v):
+                return ""
+            return v
+        except Exception:
+            return ""
+
+    # ── One sheet per lorry ───────────────────────────────────────────────────
+    last_col = get_column_letter(len(HEADERS))
+    for plate in sorted_lorries:
+        pairs    = lorry_pairs[plate]
+        cap      = cap_map.get(plate, 0)
+        total_w  = round(sum(it["WEIGHT"] for _, it in pairs), 3)
+        util_pct = round(total_w / cap * 100, 1) if cap > 0 else 0
+
+        ws = wb.create_sheet(title=plate[:31].replace("/", "-"))
+        ws.freeze_panes = "A3"
+
+        # Title — generated date (not DO date)
+        ws.merge_cells(f"A1:{last_col}1")
+        util_icon = "✅" if util_pct >= 75 else ("🟡" if util_pct >= 50 else "⚠️")
+        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
+                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   "
+                     f"|   Generated: {generated_str}")
+        t = ws.cell(1, 1, title_txt)
+        t.font = _TITLE_FONT; t.fill = _TITLE_FILL
+        t.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+        _apply_headers(ws, 2)
+
+        # Sort: date first so same-day deliveries are grouped, then route, then customer
+        sorted_pairs = sorted(pairs, key=_sort_key)
+
+        prev_date = None
+        for seq, (do, it) in enumerate(sorted_pairs, 1):
+            dr      = seq + 2
+            row_idx = it.get("ROW_IDX")
+            dist_val    = _raw_val(row_idx, "DISTANCE")
+            remarks_val = _raw_val(row_idx, "REMARKS")
+
+            dn_short  = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            date_disp = _fmt_date(do.get("DATE", ""))
+
+            # Shade first row of each new date group in green tint so dates are visually separated
+            date_changed = (date_disp != prev_date)
+            prev_date    = date_disp
+            fill = _DATE_FILL if date_changed else (_ALT_FILL if seq % 2 == 0 else None)
+
+            row_data = [
+                seq,
+                date_disp,
+                dn_short,
+                do["CUSTOMER NAME"][:22],
+                _route_display(do["ROUTE"]),
+                round(it["WEIGHT"], 3),
+                dist_val,
+                remarks_val,
+            ]
+            for ci, val in enumerate(row_data, 1):
+                c = ws.cell(dr, ci, val)
+                c.border    = _brd
+                c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
+                if fill:
+                    c.fill = fill
+            if remarks_val:
+                ws.row_dimensions[dr].height = min(60, max(15, len(remarks_val) // 5 * 8))
+
+        # Footer
+        fr = len(sorted_pairs) + 3
+        ws.merge_cells(f"A{fr}:E{fr}")
+        c = ws.cell(fr, 1, f"TOTAL — {len(sorted_pairs)} stop(s)")
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="right")
+
+        c = ws.cell(fr, 6, total_w)
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
+
+        ws.merge_cells(f"G{fr}:{last_col}{fr}")
+        c = ws.cell(fr, 7, f"{util_icon} {util_pct}% utilisation  ({total_w}T / {cap}T)")
+        c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
+
+    # ── NO LORRY sheet ────────────────────────────────────────────────────────
+    if no_lorry_pairs:
+        ws = wb.create_sheet(title="NO LORRY")
+        ws.merge_cells(f"A1:{last_col}1")
+        t = ws.cell(1, 1,
+            f"UNASSIGNED — {len(no_lorry_pairs)} item(s)  |  Generated: {generated_str}  — Needs manual assignment")
+        t.font = Font(color="FFFFFF", bold=True, size=11)
+        t.fill = _NL_FILL
+        t.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+        _apply_headers(ws, 2)
+        for seq, (do, it) in enumerate(sorted(no_lorry_pairs, key=_sort_key), 1):
+            dr = seq + 2
+            row_idx     = it.get("ROW_IDX")
+            remarks_val = _raw_val(row_idx, "REMARKS")
+            dn_short    = do["DO NUMBER"][-5:] if len(do["DO NUMBER"]) >= 5 else do["DO NUMBER"]
+            date_disp   = _fmt_date(do.get("DATE", ""))
+            for ci, val in enumerate(
+                [seq, date_disp, dn_short, do["CUSTOMER NAME"][:22],
+                 _route_display(do["ROUTE"]), round(it["WEIGHT"], 3), "",
+                 remarks_val or "⚠️ No lorry assigned"],
+                1,
+            ):
+                c = ws.cell(dr, ci, val)
+                c.border = _brd
+                c.alignment = Alignment(vertical="top", wrap_text=(ci == len(HEADERS)))
+        for ci, w in enumerate(COL_WIDTHS, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def get_trip_manifest_bytes(phone: str) -> bytes | None:
+    """Return trip manifest bytes if available (generated at Yes confirm), then clear."""
+    sess = sessions.get(phone, {})
+    if sess.get("state") in ("DONE", "CONFIRMING"):
+        data = sess.get("trip_manifest_bytes")
+        if data:
+            sess["trip_manifest_bytes"] = None
+        return data
+    return None
+
 
 def get_export_bytes(phone: str) -> bytes | None:
     """Return export bytes if available (DONE or re-exported after post-yes block), then clear."""
