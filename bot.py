@@ -2277,23 +2277,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
             }
             excluded = sess["unavailable"] | _session_full
 
-            # ── Destination-based lorry size enforcement ───────────────────────
-            _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
-            # Exclude undersized lorries for long-distance destinations
-            if _dest_min_t > 0:
-                excluded = excluded | {
-                    str(r["LORRY"]).strip().upper()
-                    for _, r in engine.eligible_lorries.iterrows()
-                    if float(r["TON"]) < _dest_min_t
-                }
-            # Exclude oversized lorries (≥11T) for KL/Selangor urban routes
-            if _dest_grp in _DEST_URBAN_GROUPS:
-                excluded = excluded | {
-                    str(r["LORRY"]).strip().upper()
-                    for _, r in engine.eligible_lorries.iterrows()
-                    if float(r["TON"]) >= 11.0
-                }
-
             # ── Strict lorry-route reservations ───────────────────────────────
             # e.g. BQY7823 → Rawang only; BQU3875 → Pahang only.
             # Check each unique route code individually — a joined text would
@@ -2360,8 +2343,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) < _dest_min_t
                 }
-            # Exclude oversized lorries (≥11T) for KL/Selangor urban routes
-            if _dest_grp in _DEST_URBAN_GROUPS:
+            # Exclude oversized lorries (≥11T) for KL/Selangor urban routes —
+            # UNLESS the route's designated preferred lorries are all large
+            # (e.g. KV20A→BPE9788 13T handles a heavy SE corridor run, not a
+            # tight-street shophouse route — must not be blocked by urban cap).
+            _pref_all_large = (
+                bool(_preferred)
+                and all(_lorry_cap_map.get(p, 0) >= 11.0
+                        for p in _preferred if p in _lorry_cap_map)
+            )
+            if _dest_grp in _DEST_URBAN_GROUPS and not _pref_all_large:
                 excluded = excluded | {
                     str(r["LORRY"]).strip().upper()
                     for _, r in engine.eligible_lorries.iterrows()
