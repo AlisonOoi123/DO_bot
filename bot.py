@@ -2216,25 +2216,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _strict_excl |= _strict_route_excl(_ur)
             excluded = excluded | _strict_excl
 
-            # ── Cross-direction incompatibility for large lorries ─────────────
-            # Large (≥14T) lorries do exactly 1 outstation trip and cannot switch
-            # direction mid-session.  Medium lorries (11–14T) serving LOCAL routes
-            # may do a 2nd trip so they are NOT blocked cross-direction for LOCAL.
+            # ── Cross-direction incompatibility for outstation lorries ──────────
+            # Any lorry already serving an OUTSTATION route (LARGE_LONG or
+            # MEDIUM_LONG) must not switch to a different outstation direction.
+            # This covers large (≥14T), medium (11–14T), AND small lorries like
+            # BQX9983 (10.5T) that serve NS/PH routes — without this, a small
+            # lorry with strong history for both NS05 and PH06 gets assigned both.
             _session_incompatible_lm = {
                 p for p in _session_loads
-                if _lorry_cap_map.get(p, 0) >= 14.0   # large lorries only
-                and _session_routes.get(p)
-                and not _routes_on_same_way(route, _session_routes.get(p, ""))
-            }
-            # Also block medium lorries that already served OUTSTATION from
-            # switching to a different outstation direction.
-            _session_incompatible_lm |= {
-                p for p in _session_loads
-                if 11.0 <= _lorry_cap_map.get(p, 0) < 14.0   # medium
+                if _session_routes.get(p)
                 and _classify_dest_group(
                     _session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
                 and _dest_grp not in _DEST_URBAN_GROUPS
-                and _session_routes.get(p)
                 and not _routes_on_same_way(route, _session_routes.get(p, ""))
             }
             excluded = excluded | _session_incompatible_lm
