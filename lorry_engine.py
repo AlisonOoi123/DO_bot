@@ -514,36 +514,65 @@ class LorryEngine:
             raw = pd.read_excel(path, sheet_name="MUATAN", header=None)
         except Exception:
             # Fallback: try reading as plain master lorry format
-            raw = pd.read_excel(path)
-            raw.columns = [c.strip().upper() for c in raw.columns]
-            raw["USER"] = raw["USER"].str.strip().str.upper()
-            raw = raw.drop_duplicates(subset=["LORRY"], keep="first")
-            self.eligible_lorries = raw[raw["USER"].isin({self.owner_user, "SPARE"})].copy()
-            self.all_lorries = raw.copy()
+            try:
+                raw = pd.read_excel(path)
+                raw.columns = [c.strip().upper() for c in raw.columns]
+                raw["USER"] = raw["USER"].str.strip().str.upper()
+                raw = raw.drop_duplicates(subset=["LORRY"], keep="first")
+                self.eligible_lorries = raw[raw["USER"].isin({self.owner_user, "SPARE"})].copy()
+                self.all_lorries = raw.copy()
+            except Exception:
+                self.eligible_lorries = pd.DataFrame(columns=["LORRY", "TON", "USER", "Status"])
+                self.all_lorries = self.eligible_lorries.copy()
             return
 
+        # Detect layout: new format has header row 0 with "NAME","LORRY",…
+        # Col 0 = NAME (user), Col 1 = LORRY plate, Col 5 = LORRY NAIK (5%)
+        # Old layout (no header): Col 0 = LORRY/section label, Col 4 = LORRY NAIK
+        first_val = str(raw.iloc[0, 0]).strip().upper() if len(raw) > 0 else ""
+        new_format = first_val in ("NAME",)  # header row present
+
         rows = []
-        current_user = "SPARE"
-        for _, r in raw.iterrows():
-            val0 = str(r.iloc[0]).strip() if pd.notna(r.iloc[0]) else ""
-            if not val0 or val0.upper() == "LORRY":
-                continue
-            # Section header: short label without digits (ABI, VIVIAN, SPARE, …)
-            if re.match(r'^[A-Za-z]+$', val0) and len(val0) <= 10:
-                current_user = val0.upper()
-                continue
-            # Lorry row — col 4 is LORRY NAIK (kg)
-            naik_kg = r.iloc[4] if pd.notna(r.iloc[4]) else r.iloc[3]
-            try:
-                naik_ton = float(naik_kg) / 1000.0
-            except (ValueError, TypeError):
-                continue
-            rows.append({
-                "LORRY":  val0.upper(),
-                "TON":    naik_ton,
-                "USER":   current_user,
-                "Status": "Available",
-            })
+        if new_format:
+            # Skip header row; col 0 = user, col 1 = plate, col 5 = LORRY NAIK kg
+            for _, r in raw.iloc[1:].iterrows():
+                user_val  = str(r.iloc[0]).strip().upper() if pd.notna(r.iloc[0]) else ""
+                plate_val = str(r.iloc[1]).strip().upper() if pd.notna(r.iloc[1]) else ""
+                if not plate_val or plate_val in ("LORRY", "NAN", ""):
+                    continue
+                naik_kg = r.iloc[5] if len(r) > 5 and pd.notna(r.iloc[5]) else (
+                          r.iloc[4] if len(r) > 4 and pd.notna(r.iloc[4]) else None)
+                try:
+                    naik_ton = float(naik_kg) / 1000.0
+                except (ValueError, TypeError):
+                    continue
+                rows.append({
+                    "LORRY":  plate_val,
+                    "TON":    naik_ton,
+                    "USER":   user_val if user_val else "SPARE",
+                    "Status": "Available",
+                })
+        else:
+            # Old layout: section header rows interspersed, col 0 = plate/label, col 4 = LORRY NAIK
+            current_user = "SPARE"
+            for _, r in raw.iterrows():
+                val0 = str(r.iloc[0]).strip() if pd.notna(r.iloc[0]) else ""
+                if not val0 or val0.upper() == "LORRY":
+                    continue
+                if re.match(r'^[A-Za-z]+$', val0) and len(val0) <= 10:
+                    current_user = val0.upper()
+                    continue
+                naik_kg = r.iloc[4] if pd.notna(r.iloc[4]) else r.iloc[3]
+                try:
+                    naik_ton = float(naik_kg) / 1000.0
+                except (ValueError, TypeError):
+                    continue
+                rows.append({
+                    "LORRY":  val0.upper(),
+                    "TON":    naik_ton,
+                    "USER":   current_user,
+                    "Status": "Available",
+                })
 
         df = pd.DataFrame(rows).drop_duplicates(subset=["LORRY"], keep="first")
         self.all_lorries = df.copy()
