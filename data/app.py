@@ -5,10 +5,15 @@ Requires: pip install flask requests pandas openpyxl
 """
 
 import os
+import sys
 import io
 import json
 import requests
 from flask import Flask, request, Response
+
+# Use the root-level bot.py (which has all planning-file and engine improvements).
+# data/app.py lives one level below the project root, so we add the parent to sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bot
 
 app = Flask(__name__)
