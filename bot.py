@@ -228,8 +228,49 @@ _DEST_SORT_PRI = {
 # is allowed to serve.  Any route whose prefix is NOT in the set is blocked.
 _LORRY_STRICT_ROUTE: dict[str, set] = {
     "BQU3875": {"PH"},           # 21T — Pahang routes only
-    "BQY7823": {"KV01A", "KV02A"},  # 14.5T — Rawang / T.Malim outstation direction only
+    "BQY7823": {"KV01A", "KV02A"},  # 14.5T — Rawang / T.Malim north corridor only
 }
+
+# ── Route-to-lorry ownership (preferred lorry per route corridor) ─────────────
+# When the preferred lorry is available and has capacity, it is tried FIRST
+# and given a strong priority boost.  Other lorries can still be used as
+# fallback if the preferred lorry is full or unavailable.
+# Key: route-code PREFIX (2–5 chars, matched with startswith).
+# Value: ordered list of plates — first plate is the primary, rest are backups
+# within the same corridor before falling to general assignment.
+_ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
+    # North KL corridor (outstation Rawang / T.Malim direction)
+    "KV01A": ["BQY7823"],
+    "KV02A": ["BQY7823"],
+    # Inner-KL tight streets (4.2T lorries only — can't park 14T there)
+    "KV06A": ["W3618U", "W3826C"],
+    "KV07A": ["W3618U", "W3826C"],
+    # Central KL
+    "KV10A": ["W3826C", "W3618U"],
+    # Pudu / Ampang — tiny shophouse deliveries; must use a van or small lorry
+    "KV11A": ["VEA2818", "VKN8836", "W3618U", "W3826C"],
+    # Southeast KL corridor (Sungai Besi / Cheras / Kajang / Semenyih / Bangi)
+    "KV18A": ["BPE9788", "VJN9910"],
+    "KV19A": ["BPE9788", "VJN9910"],
+    "KV20A": ["BPE9788", "VJN9910"],
+    # NS (Negeri Sembilan) corridor — BMN3682 is the designated NS lorry
+    "NS04":  ["BMN3682"],
+    "NS05":  ["BMN3682"],
+    "NS06":  ["BMN3682"],
+}
+
+# Maximum average DO weight (tonnes) below which a route is considered
+# "tiny-item" and must NOT be served by a large lorry (≥11T).
+# KV11A averages ~0.046T per DO — a 14T truck cannot park in those streets.
+_TINY_ITEM_AVG_WEIGHT_T = 0.15   # if avg DO weight ≤ 150 kg → tiny-item route
+
+def _preferred_lorries_for_route(route_text: str) -> list[str]:
+    """Return the ordered list of preferred plates for this route, or []."""
+    r = route_text.strip().upper()
+    for pfx, plates in _ROUTE_PREFERRED_LORRY.items():
+        if r.startswith(pfx):
+            return plates
+    return []
 
 def _strict_route_excl(route_text: str) -> set:
     """Return plates that must NOT serve this route due to strict reservations.
@@ -2280,6 +2321,67 @@ def _handle_excel_upload(phone, sess, file_bytes):
             }
             excluded = excluded | _session_incompatible_lm
 
+            # ── Preferred lorry enforcement (runs BEFORE size exclusions) ─────
+            # Preferred lorries bypass the standard size-minimum rules because
+            # they are operationally designated for that corridor (e.g. BMN3682
+            # at 8.66T handles NS04/NS05 even though MEDIUM_LONG min is 10.5T).
+            _preferred = _preferred_lorries_for_route(route)
+            _base_excluded = excluded   # save pre-size excluded set for fallback
+            if _preferred:
+                # Only hard-exclude preferred lorries if they're truly unavailable
+                # (unavailable set or already full this session).
+                _hard_excl = sess["unavailable"] | get_assigned_today()
+                _pref_avail = [
+                    p for p in _preferred
+                    if p in _lorry_cap_map
+                    and p not in _hard_excl
+                    and _session_loads.get(p, 0) < _lorry_cap_map.get(p, 0) * 0.98
+                    and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w * 0.85
+                ]
+                if _pref_avail:
+                    # Force assignment to the first available preferred lorry
+                    _chosen = _pref_avail[0]
+                    for it in group_items:
+                        it["LORRY"] = _chosen
+                    _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
+                    if _chosen not in _session_routes:
+                        _session_routes[_chosen] = route
+                    for it in _all_group:
+                        sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
+                    return
+                # Preferred lorries full/unavailable → fall through to open assignment
+
+            # ── Destination-based lorry size enforcement ───────────────────────
+            _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
+            # Exclude undersized lorries for long-distance destinations
+            if _dest_min_t > 0:
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) < _dest_min_t
+                }
+            # Exclude oversized lorries (≥11T) for KL/Selangor urban routes
+            if _dest_grp in _DEST_URBAN_GROUPS:
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= 11.0
+                }
+
+            # ── Tiny-item route guard ─────────────────────────────────────────
+            # Routes with very small average DO weight (e.g. KV11A ~46 kg each)
+            # must use a van or small lorry — a 14T truck cannot park in those
+            # narrow streets and the turns-per-km economics don't work.
+            _n_items = len(group_items)
+            _avg_w = total_w / _n_items if _n_items > 0 else total_w
+            if _avg_w <= _TINY_ITEM_AVG_WEIGHT_T:
+                # Exclude any lorry ≥ 4.5T — these tiny-item routes need vans/small lorries
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) >= 4.5
+                }
+
             # ── Within-session lorry sharing ──────────────────────────────────
             _share_pool = [
                 (_eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)), p)
@@ -2505,11 +2607,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
             w = it["WEIGHT"]
             it_dest = _classify_dest_group(it.get("ROUTE", ""), it.get("STATE", ""))
             # Build candidates: lorries with remaining session capacity ≥ w
+            _it_dest_min_t = _DEST_MIN_TON.get(it_dest, 0.0)
+            _it_large = it_dest not in _DEST_URBAN_GROUPS
             _cands = [
                 (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
                 for p in _lorry_cap_map
                 if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
                 and p not in _excl_consol
+                # Size minimum: e.g. LARGE_LONG needs ≥14T lorry
+                and float(_lorry_cap_map.get(p, 0)) >= _it_dest_min_t
+                # Preferred lorry override: honour ownership map in consolidation too
+                and (not _preferred_lorries_for_route(it.get("ROUTE", ""))
+                     or p in _preferred_lorries_for_route(it.get("ROUTE", "")))
                 # Direction guard: don't assign an outstation lorry that already
                 # committed to a different outstation direction.
                 and not (
