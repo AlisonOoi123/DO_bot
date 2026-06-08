@@ -22,7 +22,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
-PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY_DAILY_PLANNING.xlsx")         # lorry naik + route codes
+PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY DAILY PLANNING.xlsx")         # lorry naik + route codes
 MASTER_PATH    = PLANNING_PATH   # alias kept for backwards compat inside engine calls
 # History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
 HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
