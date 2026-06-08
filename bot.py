@@ -2349,12 +2349,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Preferred lorries bypass the standard size-minimum rules because
             # they are operationally designated for that corridor (e.g. BMN3682
             # at 8.66T handles NS04/NS05 even though MEDIUM_LONG min is 10.5T).
-            _preferred = _preferred_lorries_for_route(route)
+            #
+            # Use the DOMINANT route (most items) to select the preferred lorry,
+            # not just the first item — a merged group may contain multiple routes.
+            _route_counts: dict[str, int] = {}
+            for _it in group_items:
+                _route_counts[_it.get("ROUTE", "")] = _route_counts.get(_it.get("ROUTE", ""), 0) + 1
+            _dominant_route = max(_route_counts, key=lambda r: _route_counts[r])
+            _preferred = _preferred_lorries_for_route(_dominant_route)
             _base_excluded = excluded   # save pre-size excluded set for fallback
             if _preferred:
-                # Only hard-exclude preferred lorries if they're truly unavailable
-                # (unavailable set or already full this session).
-                _hard_excl = sess["unavailable"] | get_assigned_today()
+                # Hard-exclude preferred lorries if: truly unavailable, full, OR
+                # strictly forbidden for ANY route in this group (e.g. BQY7823
+                # must not be picked if group includes NS04 alongside KV01A).
+                _hard_excl = sess["unavailable"] | get_assigned_today() | _strict_excl
                 _pref_avail = [
                     p for p in _preferred
                     if p in _lorry_cap_map
@@ -2368,7 +2376,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         it["LORRY"] = _chosen
                     _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
                     if _chosen not in _session_routes:
-                        _session_routes[_chosen] = route
+                        _session_routes[_chosen] = _dominant_route
                     for it in _all_group:
                         sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
                     return
@@ -2719,14 +2727,42 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _best_delta = _delta
                         _best_pa, _best_pb = _pa, _pb
             if _best_pa:
-                for _it in _pit[_best_pa]:
-                    _it["LORRY"] = _best_pb
-                    sess["assigned"][_it["DO NUMBER"]] = _best_pb
-                for _it in _pit[_best_pb]:
-                    _it["LORRY"] = _best_pa
-                    sess["assigned"][_it["DO NUMBER"]] = _best_pa
-                _pit[_best_pa], _pit[_best_pb] = _pit[_best_pb], _pit[_best_pa]
-                _swap_ok = True
+                # Validate swap: both lorries must be allowed for the routes
+                # they'd receive after the swap (strict reservations + direction).
+                _routes_pa = {it["ROUTE"] for it in _pit[_best_pa] if it.get("ROUTE")}
+                _routes_pb = {it["ROUTE"] for it in _pit[_best_pb] if it.get("ROUTE")}
+                # Check strict route rules for the swap
+                _swap_pa_ok = not any(
+                    _best_pa in _strict_route_excl(r) for r in _routes_pb
+                )
+                _swap_pb_ok = not any(
+                    _best_pb in _strict_route_excl(r) for r in _routes_pa
+                )
+                # Check geographic direction: lorry A can only receive B's routes
+                # if they share a direction with A's current outstation routes (if any).
+                _dest_pa_routes = [_classify_dest_group(r) for r in _routes_pa]
+                _dest_pb_routes = [_classify_dest_group(r) for r in _routes_pb]
+                _outstation_dir_ok = True
+                for _ra in _routes_pa:
+                    for _rb in _routes_pb:
+                        _da = _classify_dest_group(_ra)
+                        _db = _classify_dest_group(_rb)
+                        if (_da not in _DEST_URBAN_GROUPS
+                                and _db not in _DEST_URBAN_GROUPS
+                                and not _routes_on_same_way(_ra, _rb)):
+                            _outstation_dir_ok = False
+                            break
+                    if not _outstation_dir_ok:
+                        break
+                if _swap_pa_ok and _swap_pb_ok and _outstation_dir_ok:
+                    for _it in _pit[_best_pa]:
+                        _it["LORRY"] = _best_pb
+                        sess["assigned"][_it["DO NUMBER"]] = _best_pb
+                    for _it in _pit[_best_pb]:
+                        _it["LORRY"] = _best_pa
+                        sess["assigned"][_it["DO NUMBER"]] = _best_pa
+                    _pit[_best_pa], _pit[_best_pb] = _pit[_best_pb], _pit[_best_pa]
+                    _swap_ok = True
 
         # ── Same-route merge pass ─────────────────────────────────────────────
         # If two lorries carry compatible routes and lorry A's entire load fits
@@ -2775,11 +2811,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _best_gain = _gain
                         _best_src, _best_dst = _pa, _pb
             if _best_src:
-                for _it in _pit[_best_src]:
-                    _it["LORRY"] = _best_dst
-                    sess["assigned"][_it["DO NUMBER"]] = _best_dst
-                _pit[_best_dst].extend(_pit.pop(_best_src))
-                _merge_ok = True
+                # Validate: destination lorry must be allowed for all source routes
+                _src_routes = {it["ROUTE"] for it in _pit[_best_src] if it.get("ROUTE")}
+                _merge_route_ok = not any(
+                    _best_dst in _strict_route_excl(r) for r in _src_routes
+                )
+                if _merge_route_ok:
+                    for _it in _pit[_best_src]:
+                        _it["LORRY"] = _best_dst
+                        sess["assigned"][_it["DO NUMBER"]] = _best_dst
+                    _pit[_best_dst].extend(_pit.pop(_best_src))
+                    _merge_ok = True
 
         # ── Partial-transfer rebalance pass ──────────────────────────────────
         # The merge pass moves entire lorry loads (all-or-nothing).  When two
