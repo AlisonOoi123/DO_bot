@@ -1974,10 +1974,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
                              sum(it["WEIGHT"] for it in cand_bucket)
                 n_distinct = len({it["ROUTE"] for it in merged_items}) + 1
 
+                # Don't merge routes whose preferred-lorry sets are disjoint
+                _base_pref = set(_preferred_lorries_for_route(base_route))
+                _cand_pref = set(_preferred_lorries_for_route(cand_route))
+                _pref_overlap = (
+                    not _base_pref
+                    or not _cand_pref
+                    or bool(_base_pref & _cand_pref)
+                )
+
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
                     and _routes_on_same_way(base_route, cand_route)
+                    and _pref_overlap
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
