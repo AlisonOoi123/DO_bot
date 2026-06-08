@@ -73,7 +73,12 @@ def _load_schedule(user: str) -> dict[int, set[str]]:
         return {}
     try:
         u = user.strip().upper()
-        sheet = f"SCHD({u.lower()})"   # e.g. SCHD(abi)
+        target = f"SCHD({u.lower()})"   # e.g. SCHD(abi)
+        # Sheet names may have trailing spaces — find by stripped comparison
+        xl = pd.ExcelFile(PLANNING_PATH)
+        sheet = next((s for s in xl.sheet_names if s.strip() == target), None)
+        if sheet is None:
+            return {}
         df = pd.read_excel(PLANNING_PATH, sheet_name=sheet, header=None)
     except Exception:
         return {}
