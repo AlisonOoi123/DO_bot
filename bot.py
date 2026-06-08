@@ -229,6 +229,7 @@ _DEST_SORT_PRI = {
 _LORRY_STRICT_ROUTE: dict[str, set] = {
     "BQU3875": {"PH"},           # 21T — Pahang routes only
     "BQY7823": {"KV01A", "KV02A"},  # 14.5T — Rawang / T.Malim north corridor only
+    "WA6899M": {"PH"},           # 13T spare — Pahang routes only (avoid sending for urban)
 }
 
 # ── Route-to-lorry ownership (preferred lorry per route corridor) ─────────────
@@ -248,15 +249,24 @@ _ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     # Central KL
     "KV10A": ["W3826C", "W3618U"],
     # Pudu / Ampang — tiny shophouse deliveries; must use a van or small lorry
-    "KV11A": ["VEA2818", "VKN8836", "W3618U", "W3826C"],
+    "KV11A": ["VKN8836", "W3618U", "W3826C"],
     # Southeast KL corridor (Sungai Besi / Cheras / Kajang / Semenyih / Bangi)
-    "KV18A": ["BPE9788", "VJN9910"],
-    "KV19A": ["BPE9788", "VJN9910"],
-    "KV20A": ["BPE9788", "VJN9910"],
+    "KV18A": ["BPE9788", "VJN9910", "VEA2818"],
+    "KV19A": ["BPE9788", "VJN9910", "VEA2818"],
+    "KV20A": ["BPE9788", "VJN9910", "VEA2818"],
     # NS (Negeri Sembilan) corridor — BMN3682 is the designated NS lorry
     "NS04":  ["BMN3682"],
     "NS05":  ["BMN3682"],
     "NS06":  ["BMN3682"],
+    # Pahang interior corridor — BPE9788 primary, WA6899M spare (only if BPE9788 full)
+    "PH01":  ["BPE9788", "WA6899M"],
+    "PH02":  ["BPE9788", "WA6899M"],
+    "PH03":  ["BPE9788", "WA6899M"],
+    "PH04":  ["BPE9788", "WA6899M"],
+    "PH05":  ["BPE9788", "WA6899M"],
+    "PH06":  ["BPE9788", "WA6899M"],
+    "PH07":  ["BPE9788", "WA6899M"],
+    "PH08":  ["BPE9788", "WA6899M"],
 }
 
 # Maximum average DO weight (tonnes) below which a route is considered
@@ -3083,6 +3093,35 @@ def _handle_excel_upload(phone, sess, file_bytes):
             header += f"\n📌 _{_other_user_count} row(s) from other users' routes left blank — only your route codes were assigned._"
         if _sched_notice:
             header += "\n" + "\n".join(_sched_notice)
+
+        # ── Low-utilisation warnings for outstation lorries ───────────────────
+        # Flag any lorry heading out of the city (LARGE_LONG / MEDIUM_LONG) at
+        # less than 40% capacity — these are expensive trips with low payload.
+        _lorry_items: dict[str, list] = {}
+        for _it in my_items:
+            _pl = _it.get("LORRY")
+            if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "", None}:
+                _lorry_items.setdefault(_pl, []).append(_it)
+        _low_util_warns = []
+        for _pl, _its in _lorry_items.items():
+            _pl_load = sum(_i["WEIGHT"] for _i in _its)
+            _pl_cap  = float(_lorry_cap_map.get(_pl, 0)) if "_lorry_cap_map" in dir() else 0.0
+            if _pl_cap <= 0:
+                continue
+            _util = _pl_load / _pl_cap
+            # Only warn for outstation lorries (not urban)
+            _pl_route = _its[0].get("ROUTE", "")
+            _pl_state = _its[0].get("STATE", "")
+            _pl_dest  = _classify_dest_group(_pl_route, _pl_state)
+            if _pl_dest not in _DEST_URBAN_GROUPS and _util < 0.40:
+                _low_util_warns.append(
+                    f"⚠️ *{_pl}* outstation at only {_util*100:.0f}% load "
+                    f"({_pl_load:.3f}T / {_pl_cap:.1f}T) — "
+                    f"consider holding until more DOs accumulate."
+                )
+        if _low_util_warns:
+            header += "\n" + "\n".join(_low_util_warns)
+
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
             return [header + "\n\n" + _summ[0]] + _summ[1:]
