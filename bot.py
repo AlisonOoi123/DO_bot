@@ -1850,6 +1850,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
         max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
             if not engine.eligible_lorries.empty else 99.0
 
+        # Build route→state map for state-mismatch guards in cross-cluster merge
+        _route_state: dict[str, str] = {}
+        for _rt_key, _bucket in route_buckets.items():
+            _st = _bucket[0].get("STATE", "") if _bucket else ""
+            if _st:
+                _route_state[_rt_key.strip().upper()] = str(_st).strip().upper()
+
         bucket_list = list(route_buckets.values())   # list of [item, …]
         in_group    = [False] * len(bucket_list)
         super_groups: list[list] = []                # each entry = flat item list
@@ -1979,13 +1986,25 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
 
                 # Geographic check: candidate centroid vs merged group centroid
-                cand_cent = _route_centroid(cand_route)
+                cand_cent = _best_centroid(cand_route)
                 if merged_cent is None or cand_cent is None:
                     continue
                 dist_km = _haversine_km(merged_cent[0], merged_cent[1],
                                         cand_cent[0],   cand_cent[1])
                 if dist_km > 180.0:
                     continue
+
+                # State mismatch guard: block outstation routes from different states
+                cand_state = (_route_state.get(cand_route.strip().upper().split("||")[0])
+                              or _route_state.get(cand_route.strip().upper(), ""))
+                base_states = {(_route_state.get(it["ROUTE"].strip().upper().split("||")[0])
+                                or _route_state.get(it["ROUTE"].strip().upper(), ""))
+                               for it in merged}
+                base_states.discard("")
+                if cand_state and base_states and cand_state not in base_states:
+                    # Different outstation states — only allow if very close in direction
+                    # (≤30° bearing diff) e.g. NS+KV but NOT NS+PH
+                    pass  # enforced below via _CROSS_BEARING_LIMIT (tighter than 30°)
 
                 # Bearing check — ALL PAIRS: candidate must be directionally
                 # compatible with every existing regional route in the group.
@@ -2001,7 +2020,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 bearing_ok = True
                 bearing_checked = False  # must have ≥1 regional route in group to merge
                 for ex_route in {it["ROUTE"] for it in merged}:
-                    ec = _route_centroid(ex_route)
+                    ec = _best_centroid(ex_route)
                     if ec is None:
                         continue
                     d_ex = _haversine_km(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
@@ -2009,7 +2028,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         continue
                     bearing_checked = True
                     b_ex = _bearing_deg(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
-                    if _bearing_diff(b_ex, b_cand) > 80.0:
+                    diff = _bearing_diff(b_ex, b_cand)
+                    # Stricter threshold when routes are in different states
+                    ex_state = (_route_state.get(ex_route.strip().upper().split("||")[0])
+                                or _route_state.get(ex_route.strip().upper(), ""))
+                    limit = 30.0 if (ex_state and cand_state and ex_state != cand_state) else _CROSS_BEARING_LIMIT
+                    if diff > limit:
                         bearing_ok = False
                         break
                 # Reject if merged group has no regional routes — can't validate direction
@@ -2455,12 +2479,21 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if it.get("LORRY") != "NO_LORRY":
                 continue
             w = it["WEIGHT"]
+            it_dest = _classify_dest_group(it.get("ROUTE", ""), it.get("STATE", ""))
             # Build candidates: lorries with remaining session capacity ≥ w
             _cands = [
                 (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
                 for p in _lorry_cap_map
                 if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
                 and p not in _excl_consol
+                # Direction guard: don't assign an outstation lorry that already
+                # committed to a different outstation direction.
+                and not (
+                    _session_routes.get(p)
+                    and it_dest not in _DEST_URBAN_GROUPS
+                    and _classify_dest_group(_session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
+                    and not _routes_on_same_way(it.get("ROUTE", ""), _session_routes.get(p, ""))
+                )
             ]
             if not _cands:
                 continue
