@@ -1713,7 +1713,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         #     register plates as "assigned today" so they remain eligible for TRIP 2
         #     on the blank rows. Continue to auto-assign the blank rows.
         SENTINELS_STR = {"", "nan", "none", "n/a", "-"}
-        _lic_lower = raw["LICENSE"].astype(str).str.strip().str.lower()
+        _lic_lower = raw["LICENSE"].fillna("").astype(str).str.strip().str.lower()
         prefilled_rows = raw[_lic_lower.isin(SENTINELS_STR) == False].copy()
         _blank_rows = raw[_lic_lower.isin(SENTINELS_STR)].copy()
 
@@ -1773,6 +1773,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _lorry_init = "OTHER_USER"
             elif not _is_today:
                 _lorry_init = "NOT_TODAY"
+            elif sess.get("_prefilled_count"):
+                # Case B: pre-filled file — rows that already have a valid lorry
+                # plate in LICENSE keep that assignment so session_loads is accurate.
+                _existing_lic = str(row.get("LICENSE", "")).strip()
+                _lic_key = _existing_lic.lower()
+                if _lic_key and _lic_key not in {"", "nan", "none", "n/a", "-"}:
+                    _lorry_init = _existing_lic.upper()
 
             items.append({
                 "ROW_IDX":       idx,
@@ -1870,8 +1877,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Outstation routes (LARGE_LONG / MEDIUM_LONG) are NOT split by city —
         # a single lorry handles all stops on a Kuantan or Seremban run.
         route_buckets: dict[str, list] = defaultdict(list)
+        # Session loads to be populated — pre-filled items (Case B) seed it now
+        # so that blank-row assignment knows lorry capacities are partially used.
+        _prefill_loads: dict[str, float] = {}
+        _prefill_routes: dict[str, str]  = {}
+        SKIP_SENTINELS = {"OTHER_USER", "NOT_TODAY", "NO_LORRY", "SPLIT",
+                          "SKIPPED", "OTHER_USER", None, ""}
+
         for it in items:
-            if it.get("LORRY") in ("OTHER_USER", "NOT_TODAY"):
+            lorry = it.get("LORRY")
+            if lorry and lorry not in SKIP_SENTINELS and lorry not in {"OTHER_USER","NOT_TODAY","NO_LORRY"}:
+                # Pre-filled item — record it as already assigned
+                if it.get("LORRY") not in (None,):
+                    plate = lorry.strip().upper()
+                    if re.match(r'^[A-Z]{1,3}\d', plate):  # looks like a lorry plate
+                        _prefill_loads[plate] = _prefill_loads.get(plate, 0) + it["WEIGHT"]
+                        if plate not in _prefill_routes:
+                            _prefill_routes[plate] = it["ROUTE"]
+                        sess["assigned"][it["DO NUMBER"]] = plate
+
+        for it in items:
+            lorry = it.get("LORRY")
+            if lorry in ("OTHER_USER", "NOT_TODAY"):
+                continue
+            # Skip pre-filled items — they're already in sess["assigned"]
+            if lorry and lorry not in (None,) and re.match(r'^[A-Z]{1,3}\d', lorry.strip().upper()):
                 continue
             _rt_key = it["ROUTE"].strip().upper()
             _st_key = it.get("STATE", "")
@@ -2155,8 +2185,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         # Session-level capacity tracker so groups can share a lorry when combined
         # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
-        _session_loads: dict[str, float] = {}   # plate → tons assigned this session
-        _session_routes: dict[str, str]  = {}   # plate → representative route
+        # Seed session loads from pre-filled items (Case B re-upload)
+        _session_loads: dict[str, float] = dict(_prefill_loads)
+        _session_routes: dict[str, str]  = dict(_prefill_routes)
         _lorry_cap_map = {row["LORRY"]: float(row["TON"])
                           for _, row in engine.eligible_lorries.iterrows()}
 
@@ -2318,7 +2349,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     p for p in _preferred
                     if p in _lorry_cap_map
                     and p not in _hard_excl
-                    and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w * 0.85
+                    and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                 ]
                 if _pref_avail:
                     # Force assignment to the first available preferred lorry
