@@ -53,6 +53,96 @@ def _load_user_route_prefixes(user: str) -> set | None:
     except Exception:
         return None
 
+# Day-name aliases used in the SCHD sheet headers
+_SCHD_DAY_MAP = {
+    "MON": 0, "MONDAY": 0,
+    "TUES": 1, "TUES.": 1, "TUESDAYS": 1, "TUESDAY": 1, "TUE": 1, "TEUS": 1,
+    "WED": 2, "WEDNESDAY": 2,
+    "THUS": 3, "THURS": 3, "THURSDAY": 3, "THU": 3,
+    "FRI": 4, "FRIDAY": 4,
+    "SAT": 5, "SATURDAY": 5,
+    "SUN": 6, "SUNDAY": 6,
+}
+
+def _load_schedule(user: str) -> dict[int, set[str]]:
+    """Return {weekday_int: set_of_route_prefixes} from the SCHD sheet.
+    weekday_int follows Python's datetime.weekday(): Mon=0 … Sun=6.
+    Returns empty dict if the sheet doesn't exist (no schedule filtering).
+    """
+    if not os.path.exists(PLANNING_PATH):
+        return {}
+    try:
+        u = user.strip().upper()
+        sheet = f"SCHD({u.lower()})"   # e.g. SCHD(abi)
+        df = pd.read_excel(PLANNING_PATH, sheet_name=sheet, header=None)
+    except Exception:
+        return {}
+
+    schedule: dict[int, set[str]] = {}
+    # Find the header row (contains day names like MON, TUES, WED …)
+    header_row_idx = None
+    day_cols: dict[int, int] = {}   # weekday_int → column index
+    for ri in range(min(5, len(df))):
+        for ci in range(len(df.columns)):
+            val = str(df.iloc[ri, ci]).strip().upper().rstrip(".")
+            if val in _SCHD_DAY_MAP:
+                header_row_idx = ri
+                break
+        if header_row_idx is not None:
+            break
+
+    if header_row_idx is None:
+        return {}
+
+    for ci in range(len(df.columns)):
+        val = str(df.iloc[header_row_idx, ci]).strip().upper().rstrip(".")
+        if val in _SCHD_DAY_MAP:
+            day_cols[_SCHD_DAY_MAP[val]] = ci
+
+    # Rows below header contain route strings per day column
+    for ri in range(header_row_idx + 1, len(df)):
+        for wd, ci in day_cols.items():
+            cell = str(df.iloc[ri, ci]).strip()
+            if not cell or cell.lower() in ("nan", "none", ""):
+                continue
+            m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', cell)
+            if m:
+                schedule.setdefault(wd, set()).add(m.group(1).upper())
+
+    return schedule
+
+
+def _scheduled_prefixes_for_upload(user: str, upload_dt: datetime | None = None) -> set[str] | None:
+    """Return the set of route prefixes that should be assigned for this upload.
+
+    Logic:
+      • Upload before 12:00 → assign TODAY's scheduled routes
+        (these are the afternoon-trip DOs for today)
+      • Upload at/after 12:00 → assign NEXT WORKING DAY's morning routes
+    Returns None if no schedule found (skip filtering entirely).
+    """
+    schedule = _load_schedule(user)
+    if not schedule:
+        return None
+
+    now = upload_dt or datetime.now()
+    if now.hour < 12:
+        target_date = now.date()
+    else:
+        from datetime import timedelta as _timedelta
+        target_date = now.date() + _timedelta(days=1)
+        # Skip weekends
+        while target_date.weekday() >= 5:
+            target_date += _timedelta(days=1)
+
+    wd = target_date.weekday()
+    prefixes = schedule.get(wd)
+    if prefixes is None:
+        # No routes scheduled for that day — return empty set (nothing to assign)
+        return set()
+    return prefixes
+
+
 def _extract_route_prefix(route: str) -> str:
     """Extract the leading route code token (e.g. 'KV19A', 'PH09', 'JH09')."""
     m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
@@ -1605,16 +1695,38 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # blank LICENSE in the exported file.
         _user_prefixes = _load_user_route_prefixes(sess.get("user_id", ""))
 
+        # ── Schedule filter ──────────────────────────────────────────────────
+        # Before 12:00 → assign routes scheduled for TODAY (afternoon DOs).
+        # At/after 12:00 → assign routes scheduled for NEXT WORKING DAY (morning DOs).
+        # Routes not on today's/tomorrow's schedule are left blank (NOT_TODAY).
+        _sched_prefixes = _scheduled_prefixes_for_upload(sess.get("user_id", ""))
+        _upload_hour    = datetime.now().hour
+        _sched_target   = "today (afternoon trip)" if _upload_hour < 12 else "tomorrow (morning trip)"
+
         items = []
-        _other_user_count = 0
+        _other_user_count  = 0
+        _not_today_count   = 0
         for idx, row in raw.iterrows():
             route_str = str(row["ROUTE"]).strip()
-            _is_mine  = True
-            if _user_prefixes:
-                pfx = _extract_route_prefix(route_str)
-                if pfx and pfx not in _user_prefixes:
-                    _is_mine = False
-                    _other_user_count += 1
+            pfx = _extract_route_prefix(route_str)
+            _is_mine     = True
+            _is_today    = True
+
+            if _user_prefixes and pfx and pfx not in _user_prefixes:
+                _is_mine = False
+                _other_user_count += 1
+
+            # Schedule check — only for this user's routes
+            if _is_mine and _sched_prefixes is not None:
+                if pfx not in _sched_prefixes:
+                    _is_today = False
+                    _not_today_count += 1
+
+            _lorry_init = None
+            if not _is_mine:
+                _lorry_init = "OTHER_USER"
+            elif not _is_today:
+                _lorry_init = "NOT_TODAY"
 
             items.append({
                 "ROW_IDX":       idx,
@@ -1627,9 +1739,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "DATE":          str(row.get("DATE", "")).strip(),
                 "STATE":         _state_from_row(row),   # destination state from file
                 "CITY":          str(row.get("CITY", "")).strip(),
-                "LORRY":         None if _is_mine else "OTHER_USER",
+                "LORRY":         _lorry_init,
                 "SPLIT_LORRIES": None,
             })
+
+        # Build schedule notice for the user
+        _sched_notice = []
+        if _sched_prefixes is not None:
+            _day_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+            from datetime import timedelta as _td
+            _now_dt = datetime.now()
+            if _upload_hour < 12:
+                _tgt_date = _now_dt.date()
+            else:
+                _tgt_date = _now_dt.date() + _td(days=1)
+                while _tgt_date.weekday() >= 5:
+                    _tgt_date += _td(days=1)
+            _tgt_wd = _tgt_date.weekday()
+            _sched_notice.append(
+                f"📅 Schedule filter — assigning *{_sched_target}* ({_day_names[_tgt_wd]}). "
+                f"Routes: {', '.join(sorted(_sched_prefixes)) if _sched_prefixes else 'none scheduled'}."
+            )
+            if _not_today_count:
+                _sched_notice.append(
+                    f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s schedule — left unassigned."
+                )
 
         sess["items"]      = items          # row-level item list
         sess["raw_df"]     = raw
@@ -1691,7 +1825,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # a single lorry handles all stops on a Kuantan or Seremban run.
         route_buckets: dict[str, list] = defaultdict(list)
         for it in items:
-            if it.get("LORRY") == "OTHER_USER":
+            if it.get("LORRY") in ("OTHER_USER", "NOT_TODAY"):
                 continue
             _rt_key = it["ROUTE"].strip().upper()
             _st_key = it.get("STATE", "")
@@ -2307,7 +2441,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Update session load tracker so subsequent groups can share this lorry
             for _it in _all_group:
                 _pl = _it.get("LORRY")
-                if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "", None}:
+                if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "", None}:
                     _session_loads[_pl] = float(_session_loads.get(_pl, 0)) + _it["WEIGHT"]
                     if _pl not in _session_routes:
                         _session_routes[_pl] = route
@@ -2566,7 +2700,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         seen_do = {}
         pending_dos = []
         for item in items:
-            if item.get("LORRY") == "OTHER_USER":
+            if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY"):
                 continue          # keep in raw_df for export blank; hide from UI
             do_num = item["DO NUMBER"]
             if do_num not in seen_do:
@@ -2590,11 +2724,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
         sess["change_do_page"] = 0   # reset Change DO pagination on new upload
 
         # ── Build and return summary ──────────────────────────────────────────
-        my_items    = [it for it in items if it.get("LORRY") != "OTHER_USER"]
+        my_items    = [it for it in items if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY")]
         total_items = len(my_items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
         if _other_user_count:
             header += f"\n📌 _{_other_user_count} row(s) from other users' routes left blank — only your route codes were assigned._"
+        if _sched_notice:
+            header += "\n" + "\n".join(_sched_notice)
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
             return [header + "\n\n" + _summ[0]] + _summ[1:]
@@ -3070,7 +3206,7 @@ def _build_summary(sess) -> str:
     # ── Build lorry-grouped view ──────────────────────────────────────────
     # Collect all items and build per-lorry buckets (exclude other-user rows)
     all_items = [it for do in pending for it in do.get("ITEMS", [])
-                 if it.get("LORRY") != "OTHER_USER"]
+                 if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY")]
 
     # Map DO NUMBER → (customer_short, route_code, date)
     do_meta: dict[str, tuple] = {}
@@ -3640,7 +3776,7 @@ def _export_result_inner(sess) -> list[str]:
     # Blank out any stale sentinel strings in LICENSE so we only write real plates
     new_df["LICENSE"] = new_df["LICENSE"].astype(str).replace({"nan": "", "None": ""})
 
-    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "OTHER_USER", "", None}
+    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "OTHER_USER", "NOT_TODAY", "", None}
     confirmed_plates = []
     assigned_row_idxs = set()
 
