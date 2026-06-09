@@ -2474,6 +2474,29 @@ def _handle_excel_upload(phone, sess, file_bytes):
             }
             excluded = excluded | _session_incompatible_lm
 
+            # ── State-boundary exclusion ──────────────────────────────────────
+            # If a lorry is already assigned items destined for state X, it must
+            # not also pick up items destined for a different state Y.
+            # Build lorry→states map from items already assigned this session.
+            _grp_state = (group_items[0].get("STATE", "").strip().upper()
+                          if group_items else "")
+            _state_excl: set[str] = set()
+            if _grp_state:
+                _sess_lorry_st: dict[str, set] = {}
+                for _sit in items:
+                    _spl = _sit.get("LORRY")
+                    _sst = _sit.get("STATE", "").strip().upper()
+                    if _spl and _sst and _spl not in {
+                        "NO_LORRY", "OTHER_USER", "NOT_TODAY",
+                        "SPLIT", "SKIPPED", "", None
+                    }:
+                        _sess_lorry_st.setdefault(_spl, set()).add(_sst)
+                _state_excl = {
+                    p for p, sts in _sess_lorry_st.items()
+                    if _grp_state not in sts
+                }
+            excluded = excluded | _state_excl
+
             # ── Preferred lorry enforcement (runs BEFORE size exclusions) ─────
             # Preferred lorries bypass the standard size-minimum rules because
             # they are operationally designated for that corridor (e.g. BMN3682
@@ -2488,30 +2511,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _preferred = _preferred_lorries_for_route(_dominant_route)
             _base_excluded = excluded   # save pre-size excluded set for fallback
             if _preferred:
-                # Hard-exclude preferred lorries if: truly unavailable, full, OR
-                # strictly forbidden for ANY route in this group (e.g. BQY7823
-                # must not be picked if group includes NS04 alongside KV01A).
-                _hard_excl = sess["unavailable"] | get_assigned_today() | _strict_excl
-                # Build lorry→assigned-states map from items already assigned in
-                # this session, so we can enforce the state boundary rule here.
-                _pref_lorry_states: dict[str, set] = {}
-                for _pit in items:
-                    _ppl = _pit.get("LORRY")
-                    _pst = _pit.get("STATE", "").strip().upper()
-                    if _ppl and _pst and _ppl not in {
-                        "NO_LORRY", "OTHER_USER", "NOT_TODAY", "SPLIT", "SKIPPED", "", None
-                    }:
-                        _pref_lorry_states.setdefault(_ppl, set()).add(_pst)
-                _group_state = group_items[0].get("STATE", "").strip().upper() if group_items else ""
+                # Hard-exclude preferred lorries if: truly unavailable, full,
+                # strictly forbidden for ANY route in this group, OR already
+                # committed to a different destination state.
+                _hard_excl = (sess["unavailable"] | get_assigned_today()
+                               | _strict_excl | _state_excl)
                 _pref_avail = [
                     p for p in _preferred
                     if p in _lorry_cap_map
                     and p not in _hard_excl
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
-                    # State boundary: don't assign if lorry already serving a different state
-                    and (not _group_state
-                         or not _pref_lorry_states.get(p)
-                         or _group_state in _pref_lorry_states[p])
                 ]
                 if _pref_avail:
                     # Force assignment to the first available preferred lorry
