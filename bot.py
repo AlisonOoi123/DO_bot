@@ -2588,8 +2588,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 single_util = total_w / single_cap if single_cap > 0 else 0
 
                 # Rule 8: tightest-fit lorry would still be <10% loaded → leave blank.
-                # Don't waste a large lorry on a tiny DO; let it be manually reviewed.
-                if single_util < _MIN_UTIL:
+                # Exception: never apply to urban routes (KL/Selangor) or tiny-item
+                # routes — those items must always ship regardless of truck fill %.
+                # Rule 8 targets outstation trucks (don't waste a 14T for 100 kg on
+                # a 200 km run), not inner-city vans delivering AEON shophouse goods.
+                _rule8_applies = (
+                    _dest_grp not in _DEST_URBAN_GROUPS
+                    and _avg_w > _TINY_ITEM_AVG_WEIGHT_T
+                )
+                if single_util < _MIN_UTIL and _rule8_applies:
                     for it in group_items:
                         it["LORRY"] = "NO_LORRY"
                 else:
