@@ -30,6 +30,67 @@ HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # 
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
 
+# ── Malaysia States & Cities reference data ───────────────────────────────────
+# Loaded once at startup from the "Malaysia States & Cities" sheet in
+# LORRY DAILY PLANNING.xlsx.  Used to:
+#   1. Normalise / fill missing STATE values from CITY in DO items.
+#   2. Validate that two cities belong to the same state before merging.
+_CITY_TO_STATE: dict[str, str] = {}   # city.upper() → canonical state key
+_STATE_TO_CITIES: dict[str, set] = {} # canonical state key → set of city names (upper)
+
+# Normalise verbose sheet state names to the shorter keys used in DO items.
+_STATE_NAME_NORM: dict[str, str] = {
+    "KUALA LUMPUR (FEDERAL TERRITORY)": "KUALA LUMPUR",
+    "WILAYAH PERSEKUTUAN KUALA LUMPUR": "KUALA LUMPUR",
+    "W.P. KUALA LUMPUR":                "KUALA LUMPUR",
+    "PUTRAJAYA (FEDERAL TERRITORY)":    "PUTRAJAYA",
+    "WILAYAH PERSEKUTUAN PUTRAJAYA":    "PUTRAJAYA",
+    "LABUAN (FEDERAL TERRITORY)":       "LABUAN",
+    "WILAYAH PERSEKUTUAN LABUAN":       "LABUAN",
+    "PULAU PINANG":                     "PENANG",
+    "PULAU PINANG (PENANG)":            "PENANG",
+    "NEGERI SEMBILAN":                  "NEGERI SEMBILAN",   # keep as-is
+}
+
+def _norm_state(st: str) -> str:
+    """Normalise a state name to the canonical short form used in DO items."""
+    return _STATE_NAME_NORM.get(st, st)
+
+def _load_malaysia_geo() -> None:
+    """Populate _CITY_TO_STATE and _STATE_TO_CITIES from the planning sheet."""
+    global _CITY_TO_STATE, _STATE_TO_CITIES
+    if not os.path.exists(PLANNING_PATH):
+        return
+    try:
+        df = pd.read_excel(PLANNING_PATH,
+                           sheet_name="Malaysia States & Cities",
+                           usecols=[0, 1], header=0)
+        df.columns = ["STATE", "CITY"]
+        df = df.dropna(subset=["STATE", "CITY"])
+        for _, row in df.iterrows():
+            st_raw = str(row["STATE"]).strip().upper()
+            st  = _norm_state(st_raw)
+            cty = str(row["CITY"]).strip().upper()
+            if st and cty:
+                _CITY_TO_STATE[cty] = st
+                _STATE_TO_CITIES.setdefault(st, set()).add(cty)
+    except Exception:
+        pass   # sheet missing or malformed — fall back to item STATE column
+
+_load_malaysia_geo()
+
+
+def _resolve_state(state_raw: str, city_raw: str) -> str:
+    """Return the canonical STATE for an item.
+    Priority: explicit STATE column → lookup city in _CITY_TO_STATE.
+    """
+    st = state_raw.strip().upper()
+    if st and st not in ("NAN", "NONE", "-", ""):
+        return st
+    cty = city_raw.strip().upper()
+    return _CITY_TO_STATE.get(cty, "")
+
+
 def _load_user_route_prefixes(user: str) -> set | None:
     """Return the set of route-code prefixes assigned to *user* by reading
     the '{USER} ROUTE' sheet from LORRY_DAILY_PLANNING.xlsx.
@@ -358,13 +419,20 @@ def _postcode_to_state(postcode) -> str:
 
 def _state_from_row(row) -> str:
     """Derive destination state from a DataFrame row.
-    Priority: STATE column > POSCODE > LONGITUD geocoding (future).
+    Priority: STATE column > CITY lookup (Malaysia States & Cities sheet)
+             > POSCODE range table.
     """
     # 1. Explicit STATE column
     raw_state = str(row.get("STATE", "")).strip().upper()
     if raw_state and raw_state not in ("NAN", "NONE", "", "-"):
         return raw_state
-    # 2. POSCODE column
+    # 2. City lookup against Malaysia States & Cities reference
+    raw_city = str(row.get("CITY", "")).strip().upper()
+    if raw_city and raw_city not in ("NAN", "NONE", "", "-"):
+        st = _CITY_TO_STATE.get(raw_city, "")
+        if st:
+            return st
+    # 3. POSCODE column fallback
     pc_val = row.get("POSCODE", "") or row.get("POSTCODE", "")
     if pc_val:
         st = _postcode_to_state(pc_val)
@@ -2120,13 +2188,33 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _city_dist_ok = True
                 if (_base_dest_g in {"LARGE_LONG", "MEDIUM_LONG"}
                         or _cand_dest_g in {"LARGE_LONG", "MEDIUM_LONG"}):
-                    _bc = _live_centroids.get(base_bkey) or _live_centroids.get(base_route)
-                    _cc = _live_centroids.get(cand_bkey) or _live_centroids.get(cand_route)
-                    if _bc and _cc:
-                        _city_dist_ok = (
-                            _haversine_km(_bc[0], _bc[1], _cc[0], _cc[1])
-                            <= _MAX_CITY_MERGE_KM_OUTSTATION
-                        )
+                    # a) Cross-validate cities against the Malaysia States & Cities
+                    #    reference: if both cities are known and map to different
+                    #    states, hard-block the merge (border GPS can fool distance).
+                    _base_cities = {
+                        it.get("CITY", "").strip().upper() for it in base_bucket
+                    }
+                    _cand_cities = {
+                        it.get("CITY", "").strip().upper() for it in cand_bucket
+                    }
+                    for _bc_city in _base_cities:
+                        _bc_st = _CITY_TO_STATE.get(_bc_city, "")
+                        for _cc_city in _cand_cities:
+                            _cc_st = _CITY_TO_STATE.get(_cc_city, "")
+                            if _bc_st and _cc_st and _bc_st != _cc_st:
+                                _city_dist_ok = False
+                                break
+                        if not _city_dist_ok:
+                            break
+                    # b) GPS distance between centroids
+                    if _city_dist_ok:
+                        _bc = _live_centroids.get(base_bkey) or _live_centroids.get(base_route)
+                        _cc = _live_centroids.get(cand_bkey) or _live_centroids.get(cand_route)
+                        if _bc and _cc:
+                            _city_dist_ok = (
+                                _haversine_km(_bc[0], _bc[1], _cc[0], _cc[1])
+                                <= _MAX_CITY_MERGE_KM_OUTSTATION
+                            )
 
                 if (
                     combined_w <= max_lorry_cap
