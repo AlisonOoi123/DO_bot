@@ -2852,7 +2852,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # fit in the next bin — which needs its full capacity available,
                     # not just the remaining-weight arithmetic.
                     bins.append({"lorry": lorry, "rows": [], "remain": cap})
-                    sess["unavailable"].add(lorry)
+                    # Urban lorries do 2 trips — only mark unavailable for outstation
+                    # so subsequent urban groups can still share them.
+                    if _dest_grp not in _DEST_URBAN_GROUPS:
+                        sess["unavailable"].add(lorry)
+                    else:
+                        # Track in session loads so capacity is accounted for
+                        _session_loads[lorry] = float(_session_loads.get(lorry, 0)) + cap
                     remain = round(remain - cap, 6)
 
                 if remain <= 0 and bins:
@@ -2890,7 +2896,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 extra_cap   = extra_sug[0]["TON_CAPACITY"]
                                 new_bin = {"lorry": extra_lorry, "rows": [], "remain": extra_cap}
                                 bins.append(new_bin)
-                                sess["unavailable"].add(extra_lorry)
+                                if _dest_grp not in _DEST_URBAN_GROUPS:
+                                    sess["unavailable"].add(extra_lorry)
+                                else:
+                                    _session_loads[extra_lorry] = float(_session_loads.get(extra_lorry, 0)) + extra_cap
                                 new_bin["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
                                 new_bin["remain"] -= it["WEIGHT"]
                                 item_bin2[it["DO NUMBER"]] = extra_lorry
@@ -3048,7 +3057,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _pick = (_compat or _any_fit)[0][1]
             it["LORRY"] = _pick
             _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
-            _consol_lorry_states.setdefault(_pick, set()).add(it_state)
+            if it_state:   # guard against empty state poisoning future checks
+                _consol_lorry_states.setdefault(_pick, set()).add(it_state)
             _record_lorry_state(_pick, it_state)
             if _pick not in _session_routes:
                 _session_routes[_pick] = it["ROUTE"]
