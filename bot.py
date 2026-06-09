@@ -2062,14 +2062,25 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     or bool(_base_pref & _cand_pref)
                 )
 
-                # Don't merge buckets whose GPS bearing octants are incompatible.
-                # Extract the octant from the bucket key (format: route||state|OCTANT).
+                # Don't merge buckets whose GPS bearing octants are incompatible,
+                # or whose destination STATES differ.
+                # State boundary rule: even if two sub-buckets share the same
+                # route code and bearing direction (e.g. KV01A-SELANGOR-N vs
+                # KV01A-PERAK-N), they are in different states → different lorry.
+                # A route that "passes through" multiple states (e.g. KV01A going
+                # through Batang Kali/Selangor before Tanjung Malim/Perak) should
+                # split into per-state sub-runs so each lorry covers one state.
                 def _octant_from_bkey(bk: str) -> str:
                     parts = bk.split("||")
                     if len(parts) >= 2:
                         sub = parts[1].split("|")
                         if len(sub) >= 2:
                             return sub[-1]
+                    return ""
+                def _state_from_bkey(bk: str) -> str:
+                    parts = bk.split("||")
+                    if len(parts) >= 2:
+                        return parts[1].split("|")[0].strip().upper()
                     return ""
                 _OPPOSITE = {"N": "S", "S": "N", "NE": "SW", "SW": "NE",
                              "E": "W", "W": "E", "SE": "NW", "NW": "SE"}
@@ -2080,6 +2091,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     or _oct_base == "LOCAL" or _oct_cand == "LOCAL"
                     or _oct_cand != _OPPOSITE.get(_oct_base, "")
                 )
+                # State boundary check — different state = different lorry
+                _st_base = _state_from_bkey(base_bkey)
+                _st_cand = _state_from_bkey(cand_bkey)
+                _same_state = (
+                    not _st_base or not _st_cand
+                    or _st_base == _st_cand
+                )
 
                 if (
                     combined_w <= max_lorry_cap
@@ -2087,6 +2105,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and _routes_on_same_way(base_route, cand_route)
                     and _pref_overlap
                     and _geo_ok
+                    and _same_state
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
@@ -2923,8 +2942,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _best_src:
                 # Validate: destination lorry must be allowed for all source routes,
                 # and must be a preferred lorry for any route that has preferences.
-                _src_routes = {it["ROUTE"] for it in _pit[_best_src] if it.get("ROUTE")}
-                _merge_route_ok = not any(
+                # Also block merging if source and destination items are in
+                # different destination states — state boundary must not be crossed.
+                _src_routes  = {it["ROUTE"] for it in _pit[_best_src] if it.get("ROUTE")}
+                _src_states  = {it.get("STATE", "").strip().upper()
+                                for it in _pit[_best_src] if it.get("STATE")}
+                _dst_states2 = {it.get("STATE", "").strip().upper()
+                                for it in _pit[_best_dst] if it.get("STATE")}
+                _src_states.discard(""); _dst_states2.discard("")
+                _state_merge_ok = (
+                    not _src_states or not _dst_states2
+                    or bool(_src_states & _dst_states2)
+                )
+                _merge_route_ok = _state_merge_ok and not any(
                     _best_dst in _strict_route_excl(r) for r in _src_routes
                 ) and not any(
                     _preferred_lorries_for_route(r)
@@ -2997,6 +3027,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         # no restriction when no preferred lorry is available)
                         _it_pref = _preferred_lorries_for_route(_route_it)
                         if _it_pref and _dst not in _it_pref:
+                            continue
+                        # State boundary: don't move item to lorry already
+                        # committed to a different destination state
+                        _it_state = _it.get("STATE", "").strip().upper()
+                        _dst_states = {x.get("STATE", "").strip().upper()
+                                       for x in _pit[_dst] if x.get("STATE")}
+                        if _it_state and _dst_states and _it_state not in _dst_states:
                             continue
                         if _routes_dst and _route_it:
                             if not any(_routes_on_same_way(_route_it, _rd) for _rd in _routes_dst):
