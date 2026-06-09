@@ -2768,44 +2768,81 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # ── Consolidation pass ────────────────────────────────────────────────
         # Any item still marked NO_LORRY gets a second chance: find a lorry from
         # this session with enough remaining capacity, or any eligible lorry at all.
+        # Preferred lorries are tried FIRST but if all are full/unavailable, any
+        # eligible lorry is used — the DO must ship.
         _excl_consol = sess["unavailable"] | get_assigned_today()
+
+        # Pre-build lorry→assigned-states map for state boundary checks
+        _consol_lorry_states: dict[str, set] = {}
+        for _cit in items:
+            _cpl = _cit.get("LORRY")
+            _cst = _cit.get("STATE", "").strip().upper()
+            if _cpl and _cst and _cpl not in {
+                "NO_LORRY", "OTHER_USER", "NOT_TODAY", "SPLIT", "SKIPPED", "", None
+            }:
+                _consol_lorry_states.setdefault(_cpl, set()).add(_cst)
+
         for it in items:
             if it.get("LORRY") != "NO_LORRY":
                 continue
             w = it["WEIGHT"]
             it_dest = _classify_dest_group(it.get("ROUTE", ""), it.get("STATE", ""))
-            # Build candidates: lorries with remaining session capacity ≥ w
+            it_state = it.get("STATE", "").strip().upper()
             _it_dest_min_t = _DEST_MIN_TON.get(it_dest, 0.0)
-            _it_large = it_dest not in _DEST_URBAN_GROUPS
-            _cands = [
-                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
-                for p in _lorry_cap_map
-                if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
-                and p not in _excl_consol
-                # Size minimum: e.g. LARGE_LONG needs ≥14T lorry
-                and float(_lorry_cap_map.get(p, 0)) >= _it_dest_min_t
-                # Preferred lorry override: honour ownership map in consolidation too
-                and (not _preferred_lorries_for_route(it.get("ROUTE", ""))
-                     or p in _preferred_lorries_for_route(it.get("ROUTE", "")))
-                # Direction guard: don't assign an outstation lorry that already
-                # committed to a different outstation direction.
-                and not (
+            _it_pref = _preferred_lorries_for_route(it.get("ROUTE", ""))
+            _it_strict_excl = _strict_route_excl(it.get("ROUTE", ""))
+
+            def _consol_eligible(p: str, require_same_state: bool = False) -> bool:
+                """Core eligibility check for consolidation candidates."""
+                if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) < w:
+                    return False
+                if p in _excl_consol or p in _it_strict_excl:
+                    return False
+                if float(_lorry_cap_map.get(p, 0)) < _it_dest_min_t:
+                    return False
+                if require_same_state and it_state:
+                    _lst = _consol_lorry_states.get(p, set())
+                    if _lst and it_state not in _lst:
+                        return False
+                # Direction guard for outstation lorries
+                if (
                     _session_routes.get(p)
                     and it_dest not in _DEST_URBAN_GROUPS
                     and _classify_dest_group(_session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
                     and not _routes_on_same_way(it.get("ROUTE", ""), _session_routes.get(p, ""))
-                )
+                ):
+                    return False
+                return True
+
+            # Priority tiers — stops at first non-empty tier so DO always ships:
+            # 1. Preferred lorry + same destination state
+            # 2. Preferred lorry (any state — route owner takes priority)
+            # 3. Any lorry + same destination state
+            # 4. Any lorry (last resort — DO must ship)
+            _tiers = [
+                [p for p in _it_pref if p in _lorry_cap_map and _consol_eligible(p, require_same_state=True)],
+                [p for p in _it_pref if p in _lorry_cap_map and _consol_eligible(p)],
+                [p for p in _lorry_cap_map if _consol_eligible(p, require_same_state=True)],
+                [p for p in _lorry_cap_map if _consol_eligible(p)],
             ]
-            if not _cands:
+            _cand_plates = next((t for t in _tiers if t), [])
+            if not _cand_plates:
                 continue
-            # Prefer same-corridor lorries with tightest remaining fit
+
+            # Among eligible plates, prefer same-corridor then tightest fit
             _compat = sorted(
-                [(r, p) for r, p in _cands
+                [(float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                 for p in _cand_plates
                  if _routes_on_same_way(it["ROUTE"], _session_routes.get(p, ""))]
             )
-            _pick = (_compat or sorted(_cands))[0][1]
+            _any_fit = sorted(
+                [(float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                 for p in _cand_plates]
+            )
+            _pick = (_compat or _any_fit)[0][1]
             it["LORRY"] = _pick
             _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
+            _consol_lorry_states.setdefault(_pick, set()).add(it_state)
             if _pick not in _session_routes:
                 _session_routes[_pick] = it["ROUTE"]
             sess["assigned"][it["DO NUMBER"]] = _pick
@@ -3022,12 +3059,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         # is not allowed to serve the item's route
                         if _route_it and _dst in _strict_route_excl(_route_it):
                             continue
-                        # Preferred lorry guard: if the route has designated
-                        # lorries, only move to one of them (or to lorries with
-                        # no restriction when no preferred lorry is available)
-                        _it_pref = _preferred_lorries_for_route(_route_it)
-                        if _it_pref and _dst not in _it_pref:
-                            continue
+                        # Preferred lorry guard: prefer designated lorries, but
+                        # don't block the move entirely — rebalance is an optimisation,
+                        # not an assignment gate. Only block if _dst is strictly excluded.
+                        _it_pref_rb = _preferred_lorries_for_route(_route_it)
+                        if _it_pref_rb and _dst not in _it_pref_rb:
+                            # Still allow if no preferred lorry is present in the
+                            # underloaded pool (all full/unavailable → any is OK)
+                            _pref_in_pool = any(
+                                p in _it_pref_rb and p in _pit
+                                for p in _it_pref_rb
+                            )
+                            if _pref_in_pool:
+                                continue
                         # State boundary: don't move item to lorry already
                         # committed to a different destination state
                         _it_state = _it.get("STATE", "").strip().upper()
