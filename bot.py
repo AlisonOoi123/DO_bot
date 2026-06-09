@@ -1906,6 +1906,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # so that blank-row assignment knows lorry capacities are partially used.
         _prefill_loads: dict[str, float] = {}
         _prefill_routes: dict[str, str]  = {}
+        _prefill_states: dict[str, set]  = {}   # plate → set of destination states
         SKIP_SENTINELS = {"OTHER_USER", "NOT_TODAY", "NO_LORRY", "SPLIT",
                           "SKIPPED", "OTHER_USER", None, ""}
 
@@ -1919,6 +1920,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _prefill_loads[plate] = _prefill_loads.get(plate, 0) + it["WEIGHT"]
                         if plate not in _prefill_routes:
                             _prefill_routes[plate] = it["ROUTE"]
+                        _st = it.get("STATE", "").strip().upper()
+                        if _st:
+                            _prefill_states.setdefault(plate, set()).add(_st)
                         sess["assigned"][it["DO NUMBER"]] = plate
 
         def _bearing_octant(lat: float, lon: float) -> str:
@@ -2326,10 +2330,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Session-level capacity tracker so groups can share a lorry when combined
         # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
         # Seed session loads from pre-filled items (Case B re-upload)
-        _session_loads: dict[str, float] = dict(_prefill_loads)
-        _session_routes: dict[str, str]  = dict(_prefill_routes)
+        _session_loads: dict[str, float]  = dict(_prefill_loads)
+        _session_routes: dict[str, str]   = dict(_prefill_routes)
+        # Track which destination states each lorry has been assigned to THIS
+        # session. Seeded from pre-filled items so re-uploads respect prior state.
+        _session_lorry_states: dict[str, set] = {
+            p: set(sts) for p, sts in _prefill_states.items()
+        }
         _lorry_cap_map = {row["LORRY"]: float(row["TON"])
                           for _, row in engine.eligible_lorries.iterrows()}
+
+        def _record_lorry_state(plate: str, state: str) -> None:
+            """Update _session_lorry_states whenever a lorry is assigned."""
+            if plate and state:
+                _session_lorry_states.setdefault(plate, set()).add(state.strip().upper())
 
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
@@ -2476,25 +2490,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
             excluded = excluded | _session_incompatible_lm
 
             # ── State-boundary exclusion ──────────────────────────────────────
-            # If a lorry is already assigned items destined for state X, it must
-            # not also pick up items destined for a different state Y.
-            # Build lorry→states map from items already assigned this session.
+            # A lorry committed to state X this session must not serve state Y.
+            # Uses _session_lorry_states (running tracker, updated after each
+            # assignment) so it is never confused by pre-assigned rows from
+            # other days that happen to share the same items list.
             _grp_state = (group_items[0].get("STATE", "").strip().upper()
                           if group_items else "")
             _state_excl: set[str] = set()
             if _grp_state:
-                _sess_lorry_st: dict[str, set] = {}
-                for _sit in items:
-                    _spl = _sit.get("LORRY")
-                    _sst = _sit.get("STATE", "").strip().upper()
-                    if _spl and _sst and _spl not in {
-                        "NO_LORRY", "OTHER_USER", "NOT_TODAY",
-                        "SPLIT", "SKIPPED", "", None
-                    }:
-                        _sess_lorry_st.setdefault(_spl, set()).add(_sst)
                 _state_excl = {
-                    p for p, sts in _sess_lorry_st.items()
-                    if _grp_state not in sts
+                    p for p, sts in _session_lorry_states.items()
+                    if sts and _grp_state not in sts
                 }
             excluded = excluded | _state_excl
 
@@ -2531,6 +2537,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
                     if _chosen not in _session_routes:
                         _session_routes[_chosen] = _dominant_route
+                    _record_lorry_state(_chosen, _grp_state)
                     for it in _all_group:
                         sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
                     return
@@ -2594,6 +2601,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     for it in group_items:
                         it["LORRY"] = _shared
                     _session_loads[_shared] = float(_session_loads.get(_shared, 0)) + total_w
+                    _record_lorry_state(_shared, _grp_state)
                     for it in _all_group:
                         sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
                     return
@@ -2786,13 +2794,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for it in _all_group:
                 sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
 
-            # Update session load tracker so subsequent groups can share this lorry
+            # Update session load and state trackers for subsequent groups
             for _it in _all_group:
                 _pl = _it.get("LORRY")
                 if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "", None}:
                     _session_loads[_pl] = float(_session_loads.get(_pl, 0)) + _it["WEIGHT"]
                     if _pl not in _session_routes:
                         _session_routes[_pl] = route
+                    _record_lorry_state(_pl, _it.get("STATE", ""))
 
         for group in sorted_groups:
             _assign_group(group)
@@ -2833,7 +2842,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if float(_lorry_cap_map.get(p, 0)) < _it_dest_min_t:
                     return False
                 if require_same_state and it_state:
-                    _lst = _consol_lorry_states.get(p, set())
+                    # Check both consolidation-pass states AND full session states
+                    _lst = _consol_lorry_states.get(p, set()) | _session_lorry_states.get(p, set())
                     if _lst and it_state not in _lst:
                         return False
                 # Direction guard for outstation lorries
@@ -2875,6 +2885,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             it["LORRY"] = _pick
             _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + w
             _consol_lorry_states.setdefault(_pick, set()).add(it_state)
+            _record_lorry_state(_pick, it_state)
             if _pick not in _session_routes:
                 _session_routes[_pick] = it["ROUTE"]
             sess["assigned"][it["DO NUMBER"]] = _pick
