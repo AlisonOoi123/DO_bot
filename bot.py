@@ -2694,7 +2694,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -2741,7 +2741,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -2772,7 +2772,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -2833,7 +2833,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _it_pref = _preferred_lorries_for_route(it.get("ROUTE", ""))
             _it_strict_excl = _strict_route_excl(it.get("ROUTE", ""))
 
-            def _consol_eligible(p: str, require_same_state: bool = False) -> bool:
+            def _consol_eligible(p: str) -> bool:
                 """Core eligibility check for consolidation candidates."""
                 if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) < w:
                     return False
@@ -2841,8 +2841,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return False
                 if float(_lorry_cap_map.get(p, 0)) < _it_dest_min_t:
                     return False
-                if require_same_state and it_state:
-                    # Check both consolidation-pass states AND full session states
+                # Hard state boundary — never mix states regardless of tier.
+                # _session_lorry_states tracks states assigned in this session;
+                # _consol_lorry_states tracks assignments made during this pass.
+                if it_state:
                     _lst = _consol_lorry_states.get(p, set()) | _session_lorry_states.get(p, set())
                     if _lst and it_state not in _lst:
                         return False
@@ -2856,15 +2858,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return False
                 return True
 
-            # Priority tiers — stops at first non-empty tier so DO always ships:
-            # 1. Preferred lorry + same destination state
-            # 2. Preferred lorry (any state — route owner takes priority)
-            # 3. Any lorry + same destination state
-            # 4. Any lorry (last resort — DO must ship)
+            # Priority tiers — state boundary is always enforced (see _consol_eligible).
+            # 1. Preferred lorry for this route
+            # 2. Any eligible lorry (last resort — DO must ship)
             _tiers = [
-                [p for p in _it_pref if p in _lorry_cap_map and _consol_eligible(p, require_same_state=True)],
                 [p for p in _it_pref if p in _lorry_cap_map and _consol_eligible(p)],
-                [p for p in _lorry_cap_map if _consol_eligible(p, require_same_state=True)],
                 [p for p in _lorry_cap_map if _consol_eligible(p)],
             ]
             _cand_plates = next((t for t in _tiers if t), [])
