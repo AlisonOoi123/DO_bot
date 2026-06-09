@@ -2492,11 +2492,26 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # strictly forbidden for ANY route in this group (e.g. BQY7823
                 # must not be picked if group includes NS04 alongside KV01A).
                 _hard_excl = sess["unavailable"] | get_assigned_today() | _strict_excl
+                # Build lorry→assigned-states map from items already assigned in
+                # this session, so we can enforce the state boundary rule here.
+                _pref_lorry_states: dict[str, set] = {}
+                for _pit in items:
+                    _ppl = _pit.get("LORRY")
+                    _pst = _pit.get("STATE", "").strip().upper()
+                    if _ppl and _pst and _ppl not in {
+                        "NO_LORRY", "OTHER_USER", "NOT_TODAY", "SPLIT", "SKIPPED", "", None
+                    }:
+                        _pref_lorry_states.setdefault(_ppl, set()).add(_pst)
+                _group_state = group_items[0].get("STATE", "").strip().upper() if group_items else ""
                 _pref_avail = [
                     p for p in _preferred
                     if p in _lorry_cap_map
                     and p not in _hard_excl
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
+                    # State boundary: don't assign if lorry already serving a different state
+                    and (not _group_state
+                         or not _pref_lorry_states.get(p)
+                         or _group_state in _pref_lorry_states[p])
                 ]
                 if _pref_avail:
                     # Force assignment to the first available preferred lorry
