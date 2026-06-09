@@ -273,6 +273,7 @@ _ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
 # "tiny-item" and must NOT be served by a large lorry (≥11T).
 # KV11A averages ~0.046T per DO — a 14T truck cannot park in those streets.
 _TINY_ITEM_AVG_WEIGHT_T = 0.15   # if avg DO weight ≤ 150 kg → tiny-item route
+_CROSS_BEARING_LIMIT   = 90.0    # max bearing diff (°) for same-direction merge
 
 def _preferred_lorries_for_route(route_text: str) -> list[str]:
     """Return the ordered list of preferred plates for this route, or []."""
