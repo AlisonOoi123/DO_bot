@@ -2247,12 +2247,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
 
                 # State boundary: NEVER merge groups from different destination states.
-                # Each lorry must serve exactly one state — NS, PH, KL, Selangor, etc.
-                cand_state = (_route_state.get(cand_route.strip().upper().split("||")[0])
-                              or _route_state.get(cand_route.strip().upper(), ""))
-                base_states = {(_route_state.get(it["ROUTE"].strip().upper().split("||")[0])
-                                or _route_state.get(it["ROUTE"].strip().upper(), ""))
-                               for it in merged}
+                # Read STATE directly from item dicts — the _route_state lookup was
+                # unreliable because cand_route is a full route text ("PH04-->Benta")
+                # while _route_state keys are route prefixes ("PH04").
+                cand_state  = cand_sg[0].get("STATE", "").strip().upper() if cand_sg else ""
+                base_states = {it.get("STATE", "").strip().upper() for it in merged}
+                base_states.discard("")
                 base_states.discard("")
                 if cand_state and base_states and cand_state not in base_states:
                     continue   # hard block — different states never share a lorry
@@ -2270,7 +2270,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 bearing_ok = True
                 bearing_checked = False  # must have ≥1 regional route in group to merge
-                for ex_route in {it["ROUTE"] for it in merged}:
+                for ex_it in merged:
+                    ex_route = ex_it["ROUTE"]
                     ec = _best_centroid(ex_route)
                     if ec is None:
                         continue
@@ -2280,10 +2281,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     bearing_checked = True
                     b_ex = _bearing_deg(_DEPOT[0], _DEPOT[1], ec[0], ec[1])
                     diff = _bearing_diff(b_ex, b_cand)
-                    # Stricter threshold when routes are in different states
-                    ex_state = (_route_state.get(ex_route.strip().upper().split("||")[0])
-                                or _route_state.get(ex_route.strip().upper(), ""))
-                    limit = 30.0 if (ex_state and cand_state and ex_state != cand_state) else _CROSS_BEARING_LIMIT
+                    # States are already equal at this point (hard block above);
+                    # limit is always _CROSS_BEARING_LIMIT for same-state routes.
+                    limit = _CROSS_BEARING_LIMIT
                     if diff > limit:
                         bearing_ok = False
                         break
