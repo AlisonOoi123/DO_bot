@@ -2207,11 +2207,24 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if base_clusters == {cand_cluster}:
                     continue
 
-                # KL_VALLEY / KL_CITY routes are local — never bundle with
-                # outstation clusters (prevents KV03A coastal + PK Perak merges
-                # that look like same direction but use different road corridors)
+                # Urban routes (KL_VALLEY / KL_CITY) never bundle with outstation.
                 _LOCAL_CLUSTERS = {"KL_VALLEY", "KL_CITY"}
                 if (base_clusters & _LOCAL_CLUSTERS) or cand_cluster in _LOCAL_CLUSTERS:
+                    continue
+
+                # Outstation↔urban dest-group mixing: if one side is urban and
+                # the other is outstation (LARGE_LONG / MEDIUM_LONG), block merge.
+                _base_dest_grps = {
+                    _classify_dest_group(it["ROUTE"], it.get("STATE", ""))
+                    for it in merged
+                }
+                _cand_dest_grp = _classify_dest_group(cand_sg[0]["ROUTE"],
+                                                       cand_sg[0].get("STATE", ""))
+                _base_is_outstation = any(
+                    g in {"LARGE_LONG", "MEDIUM_LONG"} for g in _base_dest_grps
+                )
+                _cand_is_outstation = _cand_dest_grp in {"LARGE_LONG", "MEDIUM_LONG"}
+                if _base_is_outstation != _cand_is_outstation:
                     continue
 
                 combined_w = sum(it["WEIGHT"] for it in merged) + \
@@ -2233,7 +2246,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if dist_km > 180.0:
                     continue
 
-                # State mismatch guard: block outstation routes from different states
+                # State boundary: NEVER merge groups from different destination states.
+                # Each lorry must serve exactly one state — NS, PH, KL, Selangor, etc.
                 cand_state = (_route_state.get(cand_route.strip().upper().split("||")[0])
                               or _route_state.get(cand_route.strip().upper(), ""))
                 base_states = {(_route_state.get(it["ROUTE"].strip().upper().split("||")[0])
@@ -2241,9 +2255,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                for it in merged}
                 base_states.discard("")
                 if cand_state and base_states and cand_state not in base_states:
-                    # Different outstation states — only allow if very close in direction
-                    # (≤30° bearing diff) e.g. NS+KV but NOT NS+PH
-                    pass  # enforced below via _CROSS_BEARING_LIMIT (tighter than 30°)
+                    continue   # hard block — different states never share a lorry
 
                 # Bearing check — ALL PAIRS: candidate must be directionally
                 # compatible with every existing regional route in the group.
