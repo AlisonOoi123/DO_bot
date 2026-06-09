@@ -272,8 +272,13 @@ _ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
 # Maximum average DO weight (tonnes) below which a route is considered
 # "tiny-item" and must NOT be served by a large lorry (≥11T).
 # KV11A averages ~0.046T per DO — a 14T truck cannot park in those streets.
-_TINY_ITEM_AVG_WEIGHT_T = 0.15   # if avg DO weight ≤ 150 kg → tiny-item route
-_CROSS_BEARING_LIMIT   = 90.0    # max bearing diff (°) for same-direction merge
+_TINY_ITEM_AVG_WEIGHT_T  = 0.15   # if avg DO weight ≤ 150 kg → tiny-item route
+_CROSS_BEARING_LIMIT     = 90.0   # max bearing diff (°) for same-direction merge
+# Max GPS distance (km) allowed when merging two city clusters on the SAME lorry.
+# Within a state, cities within this radius can share; farther cities get their own lorry.
+# Urban KL/Selangor routes: unlimited (already bucketed by city, proximity via bearing).
+_MAX_CITY_MERGE_KM_OUTSTATION = 80.0   # e.g. Bahau↔Kuala Pilah ~30 km ✓, PD↔Bahau ~120 km ✗
+
 
 def _preferred_lorries_for_route(route_text: str) -> list[str]:
     """Return the ordered list of preferred plates for this route, or []."""
@@ -2104,6 +2109,25 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     or _st_base == _st_cand
                 )
 
+                # City-proximity check for outstation routes: only merge city
+                # clusters within the same state if their GPS centroids are
+                # within _MAX_CITY_MERGE_KM_OUTSTATION of each other.
+                # Urban routes (KL/Selangor) are already city-bucketed; skip check.
+                _base_dest_g = _classify_dest_group(base_route,
+                                                     _st_base or "")
+                _cand_dest_g = _classify_dest_group(cand_route,
+                                                     _st_cand or "")
+                _city_dist_ok = True
+                if (_base_dest_g in {"LARGE_LONG", "MEDIUM_LONG"}
+                        or _cand_dest_g in {"LARGE_LONG", "MEDIUM_LONG"}):
+                    _bc = _live_centroids.get(base_bkey) or _live_centroids.get(base_route)
+                    _cc = _live_centroids.get(cand_bkey) or _live_centroids.get(cand_route)
+                    if _bc and _cc:
+                        _city_dist_ok = (
+                            _haversine_km(_bc[0], _bc[1], _cc[0], _cc[1])
+                            <= _MAX_CITY_MERGE_KM_OUTSTATION
+                        )
+
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
@@ -2111,6 +2135,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and _pref_overlap
                     and _geo_ok
                     and _same_state
+                    and _city_dist_ok
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
@@ -2237,13 +2262,25 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if n_routes > _MAX_STOPS:
                     continue
 
-                # Geographic check: candidate centroid vs merged group centroid
+                # Geographic check: candidate centroid vs merged group centroid.
+                # Use tighter threshold for outstation routes so only nearby
+                # cities within the same state share a lorry.
                 cand_cent = _best_centroid(cand_route)
                 if merged_cent is None or cand_cent is None:
                     continue
                 dist_km = _haversine_km(merged_cent[0], merged_cent[1],
                                         cand_cent[0],   cand_cent[1])
-                if dist_km > 180.0:
+                _cg_base = _classify_dest_group(
+                    merged[0]["ROUTE"], merged[0].get("STATE", ""))
+                _cg_cand = _classify_dest_group(
+                    cand_sg[0]["ROUTE"], cand_sg[0].get("STATE", ""))
+                _max_dist = (
+                    _MAX_CITY_MERGE_KM_OUTSTATION
+                    if (_cg_base in {"LARGE_LONG", "MEDIUM_LONG"}
+                        or _cg_cand in {"LARGE_LONG", "MEDIUM_LONG"})
+                    else 180.0   # urban routes: generous radius
+                )
+                if dist_km > _max_dist:
                     continue
 
                 # State boundary: NEVER merge groups from different destination states.
@@ -2868,14 +2905,43 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and not _routes_on_same_way(it.get("ROUTE", ""), _session_routes.get(p, ""))
                 ):
                     return False
+                # GPS city-proximity guard for outstation: if this item's GPS
+                # is known, only allow lorries whose assigned items' centroid
+                # is within _MAX_CITY_MERGE_KM_OUTSTATION of this item.
+                if (it_dest not in _DEST_URBAN_GROUPS
+                        and it.get("GPS_LAT") is not None
+                        and it.get("GPS_LON") is not None):
+                    _p_route = _session_routes.get(p, "")
+                    _p_cent  = _live_centroids.get(_p_route)
+                    if _p_cent:
+                        _p_dist = _haversine_km(
+                            it["GPS_LAT"], it["GPS_LON"],
+                            _p_cent[0],   _p_cent[1]
+                        )
+                        if _p_dist > _MAX_CITY_MERGE_KM_OUTSTATION:
+                            return False
                 return True
 
-            # Priority tiers — state boundary is always enforced (see _consol_eligible).
+            # Priority tiers — state boundary always enforced; prefer GPS-nearest lorry.
             # 1. Preferred lorry for this route
-            # 2. Any eligible lorry (last resort — DO must ship)
+            # 2. Any eligible lorry sorted by GPS proximity (nearest first)
+            _it_lat = it.get("GPS_LAT")
+            _it_lon = it.get("GPS_LON")
+
+            def _gps_dist_to_lorry(plate: str) -> float:
+                """Distance (km) from this item to lorry's current centroid, or 0."""
+                _pr  = _session_routes.get(plate, "")
+                _pc  = _live_centroids.get(_pr)
+                if _pc and _it_lat is not None and _it_lon is not None:
+                    return _haversine_km(_it_lat, _it_lon, _pc[0], _pc[1])
+                return 0.0
+
             _tiers = [
                 [p for p in _it_pref if p in _lorry_cap_map and _consol_eligible(p)],
-                [p for p in _lorry_cap_map if _consol_eligible(p)],
+                sorted(
+                    [p for p in _lorry_cap_map if _consol_eligible(p)],
+                    key=_gps_dist_to_lorry
+                ),
             ]
             _cand_plates = next((t for t in _tiers if t), [])
             if not _cand_plates:
