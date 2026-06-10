@@ -1603,6 +1603,7 @@ def _handle_user_id(phone, sess, text):
         "buttons": [
             {"id": "trip_day_today",    "title": f"Today ({_today_name[:3]})"},
             {"id": "trip_day_tomorrow", "title": f"Tomorrow ({_tomorrow_name[:3]})"},
+            {"id": "clear daily log",   "title": "🗑️ Clear Today Log"},
         ],
     }
 
@@ -1629,6 +1630,7 @@ def _handle_trip_day(phone, sess, text):
             "buttons": [
                 {"id": "trip_day_today",    "title": f"Today ({_today_name[:3]})"},
                 {"id": "trip_day_tomorrow", "title": f"Tomorrow ({_tomorrow_name[:3]})"},
+                {"id": "clear daily log",   "title": "🗑️ Clear Today Log"},
             ],
         }]
 
@@ -1649,15 +1651,6 @@ def _handle_trip_day(phone, sess, text):
         "📎 Please upload your DO Excel file (.xlsx) now.\n\n"
         "_Tip: you can also upload the master lorry file (with a_ *Status* _column) "
         "to block/release lorries in bulk._",
-        {
-            "_type": "buttons",
-            "body": "Quick actions:",
-            "buttons": [
-                {"id": "clear daily log",     "title": "🗑️ Clear Today Log"},
-                {"id": "show assigned today", "title": "📋 Show Assigned"},
-                {"id": "show blocked",        "title": "🚫 Show Blocked"},
-            ],
-        },
     ]
 
 
