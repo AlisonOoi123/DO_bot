@@ -195,24 +195,57 @@ def _save_remarks_llm_cache() -> None:
     except Exception:
         pass
 
-def _llm_parse_remarks_batch(remarks_list: list[str]) -> None:
-    """Send un-cached remarks to Claude Haiku in ONE batch call and cache results.
+_REMARKS_LLM_SYSTEM = (
+    "You normalize Malaysian delivery remarks (mixed Malay/English, "
+    "often with typos) into delivery-day constraints.\n"
+    "Weekday numbers: Monday=0 Tuesday=1 Wednesday=2 Thursday=3 "
+    "Friday=4 Saturday=5 Sunday=6.\n"
+    "Malay days: ISNIN=0 SELASA=1 RABU=2 KHAMIS=3 JUMAAT=4 SABTU=5 AHAD=6.\n"
+    "For each numbered remark, output the list of weekdays the "
+    "customer accepts delivery, or null if the remark contains no "
+    "day restriction (e.g. it's about packaging, payment, location, "
+    "'setiap hari'/daily, or is unintelligible).\n"
+    "Respond ONLY with valid JSON matching: "
+    "{\"results\":[{\"index\":0,\"days\":[1,4]},{\"index\":1,\"days\":null}]}"
+)
 
-    Cache value per remark: list of weekday ints (Mon=0…Sun=6), or None when
-    the remark carries no day restriction. Silently does nothing when no
-    ANTHROPIC_API_KEY is configured or the API call fails — the regex parser
-    remains the fallback.
-    """
+def _llm_call_local(todo: list[str]) -> dict | None:
+    """Call LM Studio (OpenAI-compatible) local LLM. Returns parsed dict or None."""
+    import requests as _req
+    base_url = os.environ.get("LOCAL_LLM_URL", "http://localhost:1234/v1")
+    model = os.environ.get("LOCAL_LLM_MODEL", "local-model")
+    numbered = "\n".join(f"{i}: {r}" for i, r in enumerate(todo))
+    try:
+        resp = _req.post(
+            f"{base_url}/chat/completions",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _REMARKS_LLM_SYSTEM},
+                    {"role": "user", "content": numbered},
+                ],
+                "temperature": 0,
+                "max_tokens": 2048,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        # Extract JSON from possible <think>...</think> wrapper (deepseek-r1)
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        # Extract first {...} block
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception as e:
+        print(f"⚠️ Local LLM call failed: {e}")
+    return None
+
+
+def _llm_call_anthropic(todo: list[str]) -> dict | None:
+    """Call Anthropic Claude Haiku. Returns parsed dict or None."""
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        return
-    cache = _load_remarks_llm_cache()
-    todo = sorted({
-        r.strip() for r in remarks_list
-        if r and r.strip() and r.strip().lower() not in ("nan", "none")
-        and r.strip() not in cache
-    })
-    if not todo:
-        return
+        return None
     try:
         import anthropic
         client = anthropic.Anthropic()
@@ -220,17 +253,7 @@ def _llm_parse_remarks_batch(remarks_list: list[str]) -> None:
         response = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=2048,
-            system=(
-                "You normalize Malaysian delivery remarks (mixed Malay/English, "
-                "often with typos) into delivery-day constraints.\n"
-                "Weekday numbers: Monday=0 Tuesday=1 Wednesday=2 Thursday=3 "
-                "Friday=4 Saturday=5 Sunday=6.\n"
-                "Malay days: ISNIN=0 SELASA=1 RABU=2 KHAMIS=3 JUMAAT=4 SABTU=5 AHAD=6.\n"
-                "For each numbered remark, output the list of weekdays the "
-                "customer accepts delivery, or null if the remark contains no "
-                "day restriction (e.g. it's about packaging, payment, location, "
-                "'setiap hari'/daily, or is unintelligible)."
-            ),
+            system=_REMARKS_LLM_SYSTEM,
             messages=[{"role": "user", "content": numbered}],
             output_config={
                 "format": {
@@ -265,15 +288,44 @@ def _llm_parse_remarks_batch(remarks_list: list[str]) -> None:
             },
         )
         text = next(b.text for b in response.content if b.type == "text")
-        parsed = json.loads(text)
-        with _remarks_llm_lock:
-            for entry in parsed.get("results", []):
-                idx = entry.get("index")
-                if isinstance(idx, int) and 0 <= idx < len(todo):
-                    cache[todo[idx]] = entry.get("days")
-            _save_remarks_llm_cache()
+        return json.loads(text)
     except Exception as e:
-        print(f"⚠️ LLM remarks parsing skipped: {e}")
+        print(f"⚠️ Anthropic LLM call failed: {e}")
+    return None
+
+
+def _llm_parse_remarks_batch(remarks_list: list[str]) -> None:
+    """Send un-cached remarks to LLM (local first, Anthropic fallback) in one batch.
+
+    Priority: LM Studio local (LOCAL_LLM_URL env) → Anthropic API (ANTHROPIC_API_KEY env).
+    Results cached to disk. Silently falls back to regex when both unavailable.
+    """
+    cache = _load_remarks_llm_cache()
+    todo = sorted({
+        r.strip() for r in remarks_list
+        if r and r.strip() and r.strip().lower() not in ("nan", "none")
+        and r.strip() not in cache
+    })
+    if not todo:
+        return
+
+    local_url = os.environ.get("LOCAL_LLM_URL", "http://localhost:1234/v1")
+    use_local = bool(local_url)
+
+    parsed = None
+    if use_local:
+        parsed = _llm_call_local(todo)
+    if parsed is None and os.environ.get("ANTHROPIC_API_KEY"):
+        parsed = _llm_call_anthropic(todo)
+    if parsed is None:
+        return
+
+    with _remarks_llm_lock:
+        for entry in parsed.get("results", []):
+            idx = entry.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(todo):
+                cache[todo[idx]] = entry.get("days")
+        _save_remarks_llm_cache()
 
 def _remarks_days_for(remarks: str) -> set[int] | None:
     """Delivery-day set for a remark: LLM cache first, regex fallback."""
