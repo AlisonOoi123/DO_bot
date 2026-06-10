@@ -2741,7 +2741,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _grp_state:
                 _state_excl = {
                     p for p, sts in _session_lorry_states.items()
-                    if sts and not any(_states_compatible(_grp_state, s) for s in sts)
+                    if sts and _grp_state not in sts
                 }
             excluded = excluded | _state_excl
 
@@ -3096,7 +3096,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # _consol_lorry_states tracks assignments made during this pass.
                 if it_state:
                     _lst = _consol_lorry_states.get(p, set()) | _session_lorry_states.get(p, set())
-                    if _lst and not any(_states_compatible(it_state, s) for s in _lst):
+                    if _lst and it_state not in _lst:
                         return False
                 # Direction guard for outstation lorries
                 if (
