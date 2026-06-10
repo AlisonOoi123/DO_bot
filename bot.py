@@ -152,19 +152,51 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
 
     Returns:
         None  — no day information found (no restriction applies)
-        set() — explicit day set; empty means 'never' (shouldn't occur)
+        set   — explicit day set; caller should check trip weekday is in set
     """
     if not remarks or str(remarks).strip().lower() in ("nan", "none", ""):
         return None
     txt = str(remarks).strip().upper()
-    # "SETIAP HARI" / "DAILY" → every day, no restriction
+
+    # "SETIAP HARI" / "DAILY" / "EVERY DAY" → no restriction
     if re.search(r'\bSETIAP\s+HARI\b|\bDAILY\b|\bEVERY\s+DAY\b', txt):
         return None
-    # "SETIAP <day>" → just that day
+
+    # Operational / informational remarks that mention days as context (not
+    # delivery-day restrictions).  Examples:
+    #   "LORRY OPERASI ISNIN-SABTU 4PM"  — lorry hours, not customer restriction
+    #   "WAKTU OPERASI ..."               — operation hours note
+    if re.search(r'\b(?:OPERASI|WAKTU\s+OPERASI|OPERATION\s+HOURS?|OPERATING\s+HOURS?)\b', txt):
+        return None
+
+    # Negative patterns: a day mentioned as CLOSED / OFF / not accepted.
+    # Patterns: "<DAY> OFF", "<DAY> TUTUP", "<DAY> TAK TERIMA", "TUTUP <DAY>",
+    #           "CLOSED <DAY>", "TAK TERIMA <DAY>", "<DAY> TIDAK HANTAR"
+    _NEG_SUFFIX = (
+        r'\s+(?:OFF|TUTUP|TAK\s+TERIMA(?:\s+BARANG)?'
+        r'|TIDAK\s+(?:TERIMA|HANTAR|ACCEPT|BOLEH)'
+        r'|CLOSED|BLOCKED|SKIP|TOLAK)'
+    )
+    _NEG_PREFIX = (
+        r'(?:TUTUP|CLOSED|OFF|TAK\s+TERIMA(?:\s+BARANG)?'
+        r'|TIDAK\s+(?:TERIMA|HANTAR))\s+'
+    )
+    neg_days: set[int] = set()
+    for kw, wd in _REMARKS_KEYWORD_DAY:
+        kw_re = r'\b' + re.escape(kw) + r'\b'
+        if re.search(kw_re + _NEG_SUFFIX, txt):
+            neg_days.add(wd)
+        if re.search(_NEG_PREFIX + kw_re, txt):
+            neg_days.add(wd)
+
+    # Positive day keywords (not in the negated set)
     days: set[int] = set()
     for kw, wd in _REMARKS_KEYWORD_DAY:
-        if re.search(r'\b' + re.escape(kw) + r'\b', txt):
+        if wd not in neg_days and re.search(r'\b' + re.escape(kw) + r'\b', txt):
             days.add(wd)
+
+    # If only negation was found (no positive days), treat as no restriction —
+    # the customer just noted which day(s) to avoid; all others are fine.
     return days if days else None
 
 
@@ -201,11 +233,17 @@ _REMARKS_LLM_SYSTEM = (
     "Weekday numbers: Monday=0 Tuesday=1 Wednesday=2 Thursday=3 "
     "Friday=4 Saturday=5 Sunday=6.\n"
     "Malay days: ISNIN=0 SELASA=1 RABU=2 KHAMIS=3 JUMAAT=4 SABTU=5 AHAD=6.\n"
-    "For each numbered remark, output the list of weekdays the "
-    "customer accepts delivery, or null if the remark contains no "
-    "day restriction (e.g. it's about packaging, payment, location, "
-    "'setiap hari'/daily, or is unintelligible).\n"
-    "Respond ONLY with valid JSON matching: "
+    "IMPORTANT rules:\n"
+    "- If the remark says a day is OFF/TUTUP/TAK TERIMA/CLOSED (negative), "
+    "that day is EXCLUDED. If no positive delivery days remain, return null.\n"
+    "- If the remark is about lorry/shop OPERATION HOURS (e.g. 'OPERASI "
+    "ISNIN-SABTU 4PM', 'WAKTU OPERASI', 'JUMAAT HANYA 3PM'), return null — "
+    "it is NOT a customer delivery-day restriction.\n"
+    "- Return null for packaging, payment, location, 'setiap hari'/daily, "
+    "or unintelligible remarks.\n"
+    "For each numbered remark output the list of weekdays the customer "
+    "ACCEPTS delivery, or null.\n"
+    "Respond ONLY with valid JSON: "
     "{\"results\":[{\"index\":0,\"days\":[1,4]},{\"index\":1,\"days\":null}]}"
 )
 
