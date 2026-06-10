@@ -236,6 +236,25 @@ _DEST_MIN_TON = {
 # Groups that use urban (<11T) lorries only
 _DEST_URBAN_GROUPS = {"KL", "SELANGOR", "KL_SELANGOR"}
 
+# States considered mutually compatible for urban lorries.
+# KL and Selangor urban delivery vans serve BOTH states freely — the hard
+# state-boundary rule (no mixing) must NOT apply within this set.
+_URBAN_COMPATIBLE_STATES: frozenset[str] = frozenset({
+    "KUALA LUMPUR", "W.P. KUALA LUMPUR", "WILAYAH PERSEKUTUAN KUALA LUMPUR",
+    "SELANGOR", "KL", "WP KL",
+})
+
+def _states_compatible(s1: str, s2: str) -> bool:
+    """Return True if two destination states are allowed to share the same lorry."""
+    if not s1 or not s2:
+        return True
+    if s1.upper() == s2.upper():
+        return True
+    # Urban states (KL / Selangor variants) share lorries freely
+    if s1.upper() in _URBAN_COMPATIBLE_STATES and s2.upper() in _URBAN_COMPATIBLE_STATES:
+        return True
+    return False
+
 def _classify_dest_group(route: str, state: str = "") -> str:
     """Return destination group for a route + optional explicit state.
 
@@ -2722,7 +2741,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _grp_state:
                 _state_excl = {
                     p for p, sts in _session_lorry_states.items()
-                    if sts and _grp_state not in sts
+                    if sts and not any(_states_compatible(_grp_state, s) for s in sts)
                 }
             excluded = excluded | _state_excl
 
@@ -3077,7 +3096,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # _consol_lorry_states tracks assignments made during this pass.
                 if it_state:
                     _lst = _consol_lorry_states.get(p, set()) | _session_lorry_states.get(p, set())
-                    if _lst and it_state not in _lst:
+                    if _lst and not any(_states_compatible(it_state, s) for s in _lst):
                         return False
                 # Direction guard for outstation lorries
                 if (
@@ -3187,7 +3206,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 # State boundary — only block if lorry already committed to a DIFFERENT state
                 _fp_states = _consol_lorry_states.get(_fp, set()) | _session_lorry_states.get(_fp, set())
-                if it_state and _fp_states and it_state not in _fp_states:
+                if it_state and _fp_states and not any(_states_compatible(it_state, s) for s in _fp_states):
                     continue
                 _force_candidates.append((_fp_rem, _fp))
 
