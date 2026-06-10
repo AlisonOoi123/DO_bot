@@ -289,9 +289,33 @@ _DEST_SORT_PRI = {
 # is allowed to serve.  Any route whose prefix is NOT in the set is blocked.
 _LORRY_STRICT_ROUTE: dict[str, set] = {
     "BQU3875": {"PH"},           # 21T — Pahang routes only
-    "BQY7823": {"KV01A", "KV02A"},  # 14.5T — Rawang / T.Malim north corridor only
+    # BQY7823 (14.5T) is PREFERRED for KV01A/KV02A (Rawang/T.Malim) but not
+    # strictly forbidden elsewhere — when KV-north is handled by another lorry,
+    # BQY7823 can serve Pahang or other outstation routes as best-fit.
     "WA6899M": {"PH"},           # 13T spare — Pahang routes only (avoid sending for urban)
 }
+
+# ── Explicit route corridor groups (routes that must be merged before lorry lock) ──
+# Routes within the same corridor group always merge in Step 2, even when
+# _routes_on_same_way() returns False due to waypoint mismatch.
+# This prevents greedy single-route assignment from starving adjacent routes
+# that belong to the same physical delivery corridor.
+_ROUTE_CORRIDOR_GROUPS: dict[str, list] = {
+    "NS":       ["NS04", "NS05", "NS06", "NS07", "NS08"],
+    "PH_INT":   ["PH01", "PH02", "PH03", "PH04", "PH05", "PH06", "PH07", "PH08"],
+    "KV_NORTH": ["KV01A", "KV02A", "KV04A"],
+    "KV_EAST":  ["KV10A", "KV11A", "KV12A"],
+}
+
+def _same_corridor_group(route1: str, route2: str) -> bool:
+    """Return True when both routes belong to the same delivery corridor group."""
+    r1 = route1.strip().upper()
+    r2 = route2.strip().upper()
+    for pfxs in _ROUTE_CORRIDOR_GROUPS.values():
+        if (any(r1.startswith(p) for p in pfxs)
+                and any(r2.startswith(p) for p in pfxs)):
+            return True
+    return False
 
 # ── Route-to-lorry ownership (preferred lorry per route corridor) ─────────────
 # When the preferred lorry is available and has capacity, it is tried FIRST
@@ -2216,14 +2240,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 <= _MAX_CITY_MERGE_KM_OUTSTATION
                             )
 
+                _corridor_merge = _same_corridor_group(base_route, cand_route)
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
-                    and _routes_on_same_way(base_route, cand_route)
+                    and (_routes_on_same_way(base_route, cand_route) or _corridor_merge)
                     and _pref_overlap
                     and _geo_ok
                     and _same_state
-                    and _city_dist_ok
+                    and (_city_dist_ok or _corridor_merge)
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
@@ -2482,6 +2507,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if plate and state:
                 _session_lorry_states.setdefault(plate, set()).add(state.strip().upper())
 
+        # Track reason each DO number ended up unassigned (NO_LORRY)
+        _unassigned_reasons: dict[str, str] = {}   # DO_NUMBER → reason code
+
+        def _mark_no_lorry(items_list, reason: str) -> None:
+            for _it in items_list:
+                _it["LORRY"] = "NO_LORRY"
+                _unassigned_reasons[_it["DO NUMBER"]] = reason
+
         def _assign_group(group_items):
             """Assign ONE lorry (or split) to cover ALL items in the group.
             All items in the group share the same route (one route = one lorry).
@@ -2497,6 +2530,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 for it in _all_group:
                     if it.get("LORRY") is None and it["WEIGHT"] > _max_cap:
                         it["LORRY"] = "NO_LORRY"
+                        _unassigned_reasons[it["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
                 group_items = [it for it in _all_group if it.get("LORRY") != "NO_LORRY"]
             else:
                 _all_group = list(group_items)
@@ -2767,8 +2801,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and _avg_w > _TINY_ITEM_AVG_WEIGHT_T
                 )
                 if single_util < _MIN_UTIL and _rule8_applies:
-                    for it in group_items:
-                        it["LORRY"] = "NO_LORRY"
+                    _mark_no_lorry(group_items, "LOAD_BELOW_MIN_UTIL")
                 else:
                     split_option = None
                     if single_util < 0.60:
@@ -2905,8 +2938,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 item_bin2[it["DO NUMBER"]] = extra_lorry
                             else:
                                 item_bin2[it["DO NUMBER"]] = "NO_LORRY"
+                                _unassigned_reasons[it["DO NUMBER"]] = "CAPACITY_FULL"
                     for it in group_items:
                         it["LORRY"] = item_bin2.get(it["DO NUMBER"], "NO_LORRY")
+                        if it["LORRY"] == "NO_LORRY":
+                            _unassigned_reasons.setdefault(it["DO NUMBER"], "CAPACITY_FULL")
                         it.pop("SPLIT_LORRIES", None)
                 else:
                     # Bin-pack failed — all lorries taken or too small.
@@ -2926,16 +2962,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         lr_util = total_w / lr_cap if lr_cap > 0 else 0
                         if lr_util < _MIN_UTIL:
                             # Even the smallest available lorry would be <10% loaded
-                            for it in group_items:
-                                it["LORRY"] = "NO_LORRY"
+                            _mark_no_lorry(group_items, "CAPACITY_FULL")
                         else:
                             lorry = last_resort[0]["LORRY"]
                             for it in group_items:
                                 it["LORRY"] = lorry
                     else:
                         # No lorry can carry this weight without overloading
-                        for it in group_items:
-                            it["LORRY"] = "NO_LORRY"
+                        _mark_no_lorry(group_items, "NO_ELIGIBLE_LORRY")
 
             for it in _all_group:
                 sess["assigned"][it["DO NUMBER"]] = it["LORRY"]
@@ -3380,8 +3414,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for do in pending_dos:
             do["TOTAL_TON"] = round(sum(it["WEIGHT"] for it in do["ITEMS"]), 3)
 
-        sess["pending_dos"]   = pending_dos
-        sess["change_do_page"] = 0   # reset Change DO pagination on new upload
+        sess["pending_dos"]          = pending_dos
+        sess["change_do_page"]       = 0
+        sess["unassigned_reasons"]   = _unassigned_reasons
 
         # ── Build and return summary ──────────────────────────────────────────
         my_items    = [it for it in items if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY")]
@@ -3419,6 +3454,57 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 )
         if _low_util_warns:
             header += "\n" + "\n".join(_low_util_warns)
+
+        # ── Unassigned reason breakdown ───────────────────────────────────────
+        _no_lorry_items = [it for it in my_items if it.get("LORRY") == "NO_LORRY"]
+        if _no_lorry_items and _unassigned_reasons:
+            from collections import Counter
+            _reason_counts = Counter(
+                _unassigned_reasons.get(it["DO NUMBER"], "NO_ELIGIBLE_LORRY")
+                for it in _no_lorry_items
+            )
+            _reason_labels = {
+                "LOAD_EXCEEDS_ALL_LORRIES": "load > max lorry cap",
+                "NO_ELIGIBLE_LORRY":        "no eligible lorry found",
+                "CAPACITY_FULL":            "all lorries at capacity",
+                "LOAD_BELOW_MIN_UTIL":      "load too small (min util rule)",
+            }
+            _reason_parts = [
+                f"{v}× {_reason_labels.get(k, k)}"
+                for k, v in sorted(_reason_counts.items(), key=lambda x: -x[1])
+            ]
+            header += f"\n❌ *Unassigned reasons:* " + ", ".join(_reason_parts)
+
+        # ── Idle lorry diagnostic ─────────────────────────────────────────────
+        _assigned_plates = {
+            it.get("LORRY") for it in my_items
+            if it.get("LORRY") not in {
+                "NO_LORRY", "OTHER_USER", "NOT_TODAY", "SPLIT", "SKIPPED", "", None
+            }
+        }
+        _idle_lorries = [
+            p for p in _lorry_cap_map
+            if p not in _assigned_plates
+            and p not in sess.get("unavailable", set())
+        ]
+        if _idle_lorries:
+            _idle_parts = []
+            for _ip in sorted(_idle_lorries):
+                _ic = _lorry_cap_map.get(_ip, 0)
+                # Find which route prefixes list this lorry as preferred
+                _ip_routes = [
+                    pfx for pfx, plates in _ROUTE_PREFERRED_LORRY.items()
+                    if _ip in plates
+                ]
+                _ip_strict = [
+                    pfx for pfx, pls in _LORRY_STRICT_ROUTE.items()
+                    if pfx == _ip
+                ]
+                if _ip_routes:
+                    _idle_parts.append(f"{_ip} ({_ic:.1f}T, preferred for {'/'.join(_ip_routes[:3])})")
+                else:
+                    _idle_parts.append(f"{_ip} ({_ic:.1f}T, no preferred route)")
+            header += "\n🅿️ *Idle lorries:* " + ", ".join(_idle_parts)
 
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
@@ -4016,6 +4102,7 @@ def _build_summary(sess) -> str:
         lines.append("")   # blank line between lorries
 
     # ── No-lorry items ────────────────────────────────────────────────────
+    _reasons = sess.get("unassigned_reasons", {})
     if no_lorry_items:
         lines.append(f"❌ *NO LORRY ({len(no_lorry_items)} item(s)):*")
         for it in no_lorry_items:
@@ -4024,7 +4111,9 @@ def _build_summary(sess) -> str:
             w    = round(it["WEIGHT"], 3)
             cust, rcode, dt = do_meta.get(dn, (dn, "", ""))
             dt_tag = f" [{dt}]" if dt else ""
-            lines.append(f"  {dn_short}  {rcode}  {cust}  {w}T{dt_tag}")
+            _rsn = _reasons.get(dn, "")
+            _rsn_tag = f" ({_rsn})" if _rsn else ""
+            lines.append(f"  {dn_short}  {rcode}  {cust}  {w}T{dt_tag}{_rsn_tag}")
         lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────
