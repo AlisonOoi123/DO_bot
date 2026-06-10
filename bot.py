@@ -125,7 +125,47 @@ _SCHD_DAY_MAP = {
     "SUN": 6, "SUNDAY": 6,
 }
 
-def _load_schedule(user: str) -> dict[int, set[str]]:
+# ── REMARKS delivery-day parser ───────────────────────────────────────────────
+# Maps BM/English keywords found in the REMARKS column to weekday integers.
+# Mon=0 … Sun=6 (Python datetime.weekday() convention).
+_REMARKS_KEYWORD_DAY: list[tuple[str, int]] = [
+    # Malay day names
+    ("ISNIN",   0), ("SENIN",  0),
+    ("SELASA",  1),
+    ("RABU",    2),
+    ("KHAMIS",  3),
+    ("JUMAAT",  4), ("JUMAT", 4),
+    ("SABTU",   5),
+    ("AHAD",    6), ("MINGGU", 6),
+    # English day names / abbrevs
+    ("MONDAY",  0), ("MON",   0),
+    ("TUESDAY", 1), ("TUES",  1), ("TUE", 1),
+    ("WEDNESDAY",2),("WED",   2),
+    ("THURSDAY",3), ("THURS", 3), ("THU", 3),
+    ("FRIDAY",  4), ("FRI",   4),
+    ("SATURDAY",5), ("SAT",   5),
+    ("SUNDAY",  6), ("SUN",   6),
+]
+
+def _parse_remarks_days(remarks: str) -> set[int] | None:
+    """Parse a REMARKS string into a set of delivery weekday integers.
+
+    Returns:
+        None  — no day information found (no restriction applies)
+        set() — explicit day set; empty means 'never' (shouldn't occur)
+    """
+    if not remarks or str(remarks).strip().lower() in ("nan", "none", ""):
+        return None
+    txt = str(remarks).strip().upper()
+    # "SETIAP HARI" / "DAILY" → every day, no restriction
+    if re.search(r'\bSETIAP\s+HARI\b|\bDAILY\b|\bEVERY\s+DAY\b', txt):
+        return None
+    # "SETIAP <day>" → just that day
+    days: set[int] = set()
+    for kw, wd in _REMARKS_KEYWORD_DAY:
+        if re.search(r'\b' + re.escape(kw) + r'\b', txt):
+            days.add(wd)
+    return days if days else None
     """Return {weekday_int: set_of_route_prefixes} from the SCHD sheet.
     weekday_int follows Python's datetime.weekday(): Mon=0 … Sun=6.
     Returns empty dict if the sheet doesn't exist (no schedule filtering).
@@ -1947,6 +1987,24 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _is_today = False
                     _not_today_count += 1
 
+            # REMARKS delivery-day check — supplements the SCHD filter.
+            # If REMARKS specifies delivery days (e.g. "SELASA DAN JUMAAT")
+            # and today's trip-day weekday is not in that set, defer the item.
+            _remarks_raw = str(row.get("REMARKS", "")).strip()
+            if _is_mine and _is_today:
+                _remarks_days = _parse_remarks_days(_remarks_raw)
+                if _remarks_days is not None:
+                    # Determine the effective weekday for this trip
+                    from datetime import timedelta as _td
+                    _trip_target = datetime.now().date()
+                    if sess.get("trip_day") == "tomorrow":
+                        _trip_target += _td(days=1)
+                        while _trip_target.weekday() >= 5:
+                            _trip_target += _td(days=1)
+                    if _trip_target.weekday() not in _remarks_days:
+                        _is_today = False
+                        _not_today_count += 1
+
             _lorry_init = None
             if not _is_mine:
                 _lorry_init = "OTHER_USER"
@@ -1983,6 +2041,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "DATE":          str(row.get("DATE", "")).strip(),
                 "STATE":         _state_from_row(row),   # destination state from file
                 "CITY":          str(row.get("CITY", "")).strip(),
+                "REMARKS":       _remarks_raw,
                 "GPS_LAT":       _gps_lat,
                 "GPS_LON":       _gps_lon,
                 "LORRY":         _lorry_init,
@@ -3225,58 +3284,158 @@ def _handle_excel_upload(phone, sess, file_bytes):
             sess["assigned"][it["DO NUMBER"]] = _fpick
             _unassigned_reasons.pop(it["DO NUMBER"], None)
 
-        # ── Last-item overflow pass ───────────────────────────────────────────
-        # For any item still unassigned whose weight overshoots every available
-        # lorry's remaining capacity by ≤ 1T, allow the overflow rather than
-        # leaving the DO unassigned.  The lorry is simply loaded slightly over
-        # its nominal daily cap (still within the physical frame).
-        # Process items one at a time so each assignment updates _session_loads
-        # before the next item is evaluated.
-        for _last in items:
-            if _last.get("LORRY") not in (None, "NO_LORRY"):
-                continue
-            _lw        = _last["WEIGHT"]
-            _lroute    = _last.get("ROUTE", "")
-            _lstate    = _last.get("STATE", "").strip().upper()
-            _ldest     = _classify_dest_group(_lroute, _last.get("STATE", ""))
-            _l_is_urban = _ldest in _DEST_URBAN_GROUPS
-            _lstrict   = _strict_route_excl(_lroute)
+        # ── Last-resort overflow / split pass ────────────────────────────────
+        # Items still unassigned after force-assign:
+        #   • Groups of >1 item sharing the same city+state → try a bin-pack
+        #     split across two eligible lorries first; overflow only if that fails.
+        #   • Single remaining item → allow ≤1T overage directly.
+        # Process items one at a time so each assignment updates _session_loads.
 
-            _overflow_candidates = []
+        def _overflow_eligible_lorries(it_w, it_route, it_state, it_dest):
+            """Return [(remaining_cap, plate)] sorted by most-remaining-cap first."""
+            _it_is_urban = it_dest in _DEST_URBAN_GROUPS
+            _it_strict   = _strict_route_excl(it_route)
+            _cands = []
             for _op in _lorry_cap_map:
                 if _op in sess.get("unavailable", set()):
                     continue
-                _op_cap  = float(_lorry_cap_map.get(_op, 0))
-                _op_load = float(_session_loads.get(_op, 0))
-                _op_rem  = _op_cap - _op_load
-                if _op in _lstrict:
+                _oc = float(_lorry_cap_map.get(_op, 0))
+                _ol = float(_session_loads.get(_op, 0))
+                _or = _oc - _ol
+                if _op in _it_strict:
                     continue
-                if _l_is_urban and _op_cap >= 11.0:
+                if _it_is_urban and _oc >= 11.0:
                     continue
-                if (not _l_is_urban
+                if (not _it_is_urban
                         and _session_routes.get(_op, "")
                         and _classify_dest_group(_session_routes.get(_op, "")) in _DEST_URBAN_GROUPS):
                     continue
-                _op_states = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
-                if _lstate and _op_states and not any(_states_compatible(_lstate, s) for s in _op_states):
+                _op_sts = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
+                if it_state and _op_sts and not any(_states_compatible(it_state, s) for s in _op_sts):
                     continue
-                _overage = _lw - _op_rem   # negative means it fits normally
-                if _overage > 1.0:         # more than 1T short → skip
+                if _or - it_w < -1.0:   # more than 1T short → skip
                     continue
-                _overflow_candidates.append((_op_rem, _op))
+                _cands.append((_or, _op))
+            _cands.sort(reverse=True)
+            return _cands
 
-            if _overflow_candidates:
-                _overflow_candidates.sort(reverse=True)   # most remaining cap first
-                _opick = _overflow_candidates[0][1]
-                _last["LORRY"] = _opick
-                _session_loads[_opick] = float(_session_loads.get(_opick, 0)) + _lw
-                if _lstate:
-                    _consol_lorry_states.setdefault(_opick, set()).add(_lstate)
-                _record_lorry_state(_opick, _lstate)
-                if _opick not in _session_routes:
-                    _session_routes[_opick] = _lroute
-                sess["assigned"][_last["DO NUMBER"]] = _opick
-                _unassigned_reasons.pop(_last["DO NUMBER"], None)
+        def _do_overflow_assign(it, candidates):
+            """Commit item to first candidate; return True on success."""
+            if not candidates:
+                return False
+            _opick = candidates[0][1]
+            it["LORRY"] = _opick
+            _session_loads[_opick] = float(_session_loads.get(_opick, 0)) + it["WEIGHT"]
+            _st = it.get("STATE", "").strip().upper()
+            if _st:
+                _consol_lorry_states.setdefault(_opick, set()).add(_st)
+            _record_lorry_state(_opick, _st)
+            if _opick not in _session_routes:
+                _session_routes[_opick] = it.get("ROUTE", "")
+            sess["assigned"][it["DO NUMBER"]] = _opick
+            _unassigned_reasons.pop(it["DO NUMBER"], None)
+            return True
+
+        # Group still-unassigned items by (city, state) to decide split vs overflow
+        _of_groups: dict[tuple, list] = {}
+        for _it in items:
+            if _it.get("LORRY") not in (None, "NO_LORRY"):
+                continue
+            _gk = (
+                _it.get("CITY",  "").strip().upper(),
+                _it.get("STATE", "").strip().upper(),
+            )
+            _of_groups.setdefault(_gk, []).append(_it)
+
+        for _gk, _gits in _of_groups.items():
+            if len(_gits) == 1:
+                # Single remaining item → overflow directly
+                _it = _gits[0]
+                _cands = _overflow_eligible_lorries(
+                    _it["WEIGHT"], _it.get("ROUTE",""),
+                    _it.get("STATE","").strip().upper(),
+                    _classify_dest_group(_it.get("ROUTE",""), _it.get("STATE","")),
+                )
+                _do_overflow_assign(_it, _cands)
+            else:
+                # Multiple items — try bin-pack split across two lorries first
+                _g_total = sum(x["WEIGHT"] for x in _gits)
+                _g_state = _gits[0].get("STATE", "").strip().upper()
+                _g_route = _gits[0].get("ROUTE", "")
+                _g_dest  = _classify_dest_group(_g_route, _gits[0].get("STATE",""))
+                _g_urban = _g_dest in _DEST_URBAN_GROUPS
+                _g_strict= _strict_route_excl(_g_route)
+
+                # Find up to 2 eligible lorries (ignoring capacity floor, state OK)
+                _split_pool = []
+                for _op in _lorry_cap_map:
+                    if _op in sess.get("unavailable", set()):
+                        continue
+                    _oc = float(_lorry_cap_map.get(_op, 0))
+                    _ol = float(_session_loads.get(_op, 0))
+                    _or = _oc - _ol
+                    if _op in _g_strict:
+                        continue
+                    if _g_urban and _oc >= 11.0:
+                        continue
+                    _op_sts = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
+                    if _g_state and _op_sts and not any(_states_compatible(_g_state, s) for s in _op_sts):
+                        continue
+                    if _or <= 0:
+                        continue
+                    _split_pool.append((_or, _op))
+                _split_pool.sort(reverse=True)
+
+                _split_ok = False
+                if len(_split_pool) >= 2:
+                    _b1_rem, _b1 = _split_pool[0]
+                    _b2_rem, _b2 = _split_pool[1]
+                    # Greedy bin-pack: heaviest first
+                    _b1_items, _b2_items = [], []
+                    _b1_load = _b2_load = 0.0
+                    for _sit in sorted(_gits, key=lambda x: x["WEIGHT"], reverse=True):
+                        if _b1_load + _sit["WEIGHT"] <= _b1_rem + 1.0:
+                            _b1_items.append(_sit)
+                            _b1_load += _sit["WEIGHT"]
+                        elif _b2_load + _sit["WEIGHT"] <= _b2_rem + 1.0:
+                            _b2_items.append(_sit)
+                            _b2_load += _sit["WEIGHT"]
+                        else:
+                            break   # item doesn't fit either bin
+                    if len(_b1_items) + len(_b2_items) == len(_gits):
+                        # All items placed across two lorries
+                        for _sit in _b1_items:
+                            _sit["LORRY"] = _b1
+                            sess["assigned"][_sit["DO NUMBER"]] = _b1
+                            _unassigned_reasons.pop(_sit["DO NUMBER"], None)
+                        for _sit in _b2_items:
+                            _sit["LORRY"] = _b2
+                            sess["assigned"][_sit["DO NUMBER"]] = _b2
+                            _unassigned_reasons.pop(_sit["DO NUMBER"], None)
+                        _session_loads[_b1] = float(_session_loads.get(_b1, 0)) + _b1_load
+                        _session_loads[_b2] = float(_session_loads.get(_b2, 0)) + _b2_load
+                        if _g_state:
+                            _consol_lorry_states.setdefault(_b1, set()).add(_g_state)
+                            _consol_lorry_states.setdefault(_b2, set()).add(_g_state)
+                        _record_lorry_state(_b1, _g_state)
+                        _record_lorry_state(_b2, _g_state)
+                        if _b1 not in _session_routes:
+                            _session_routes[_b1] = _g_route
+                        if _b2 not in _session_routes:
+                            _session_routes[_b2] = _g_route
+                        _split_ok = True
+
+                if not _split_ok:
+                    # Split failed — overflow each item individually
+                    for _it in _gits:
+                        if _it.get("LORRY") not in (None, "NO_LORRY"):
+                            continue
+                        _cands = _overflow_eligible_lorries(
+                            _it["WEIGHT"], _it.get("ROUTE",""),
+                            _it.get("STATE","").strip().upper(),
+                            _classify_dest_group(_it.get("ROUTE",""), _it.get("STATE","")),
+                        )
+                        _do_overflow_assign(_it, _cands)
 
         # ── Lorry-swap optimisation ───────────────────────────────────────────
         # Reduce waste on large lorries (≥10T) by swapping them with a smaller
