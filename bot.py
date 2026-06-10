@@ -3156,6 +3156,50 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _session_routes[_pick] = it["ROUTE"]
             sess["assigned"][it["DO NUMBER"]] = _pick
 
+        # ── Force-assign pass ─────────────────────────────────────────────────
+        # Any item still NO_LORRY after the consolidation pass MUST ship today.
+        # Relax the daily-log exclusion (only the current sess["unavailable"] and
+        # physical size/state constraints still apply) so lorries that appear in
+        # today's log from a PREVIOUS session don't block scheduled DOs.
+        for it in items:
+            if it.get("LORRY") != "NO_LORRY":
+                continue
+            w         = it["WEIGHT"]
+            it_route  = it.get("ROUTE", "")
+            it_state  = it.get("STATE", "").strip().upper()
+            it_dest   = _classify_dest_group(it_route, it.get("STATE", ""))
+            _it_dest_min_t = _DEST_MIN_TON.get(it_dest, 0.0)
+
+            _force_candidates = sorted([
+                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
+                for p in _lorry_cap_map
+                if p not in sess.get("unavailable", set())        # only hard blocks
+                and float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
+                and float(_lorry_cap_map.get(p, 0)) >= _it_dest_min_t
+                and (not it_state or (
+                    lambda _lst: not _lst or it_state in _lst
+                )(_consol_lorry_states.get(p, set()) | _session_lorry_states.get(p, set())))
+                and p not in _strict_route_excl(it_route)
+                # Urban lorries must not carry outstation loads and vice versa
+                and not (it_dest in _DEST_URBAN_GROUPS and float(_lorry_cap_map.get(p, 0)) >= 11.0)
+                and not (it_dest not in _DEST_URBAN_GROUPS
+                         and _classify_dest_group(_session_routes.get(p, "")) in _DEST_URBAN_GROUPS
+                         and _session_routes.get(p, ""))
+            ])
+            if not _force_candidates:
+                continue
+
+            _fpick = _force_candidates[0][1]
+            it["LORRY"] = _fpick
+            _session_loads[_fpick] = float(_session_loads.get(_fpick, 0)) + w
+            if it_state:
+                _consol_lorry_states.setdefault(_fpick, set()).add(it_state)
+            _record_lorry_state(_fpick, it_state)
+            if _fpick not in _session_routes:
+                _session_routes[_fpick] = it_route
+            sess["assigned"][it["DO NUMBER"]] = _fpick
+            _unassigned_reasons.pop(it["DO NUMBER"], None)
+
         # ── Lorry-swap optimisation ───────────────────────────────────────────
         # Reduce waste on large lorries (≥10T) by swapping them with a smaller
         # lorry that is currently carrying a heavier load.  Conditions for a
@@ -3540,29 +3584,33 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "NO_LORRY", "OTHER_USER", "NOT_TODAY", "SPLIT", "SKIPPED", "", None
             }
         }
+        _today_log_plates = get_assigned_today()
         _idle_lorries = [
             p for p in _lorry_cap_map
             if p not in _assigned_plates
             and p not in sess.get("unavailable", set())
+            and p not in _today_log_plates
         ]
+        _log_blocked_lorries = [
+            p for p in _lorry_cap_map
+            if p not in _assigned_plates
+            and p not in sess.get("unavailable", set())
+            and p in _today_log_plates
+        ]
+
+        def _lorry_diag_label(p):
+            _ic = _lorry_cap_map.get(p, 0)
+            _ip_routes = [pfx for pfx, plates in _ROUTE_PREFERRED_LORRY.items() if p in plates]
+            if _ip_routes:
+                return f"{p} ({_ic:.1f}T, preferred for {'/'.join(_ip_routes[:3])})"
+            return f"{p} ({_ic:.1f}T, no preferred route)"
+
         if _idle_lorries:
-            _idle_parts = []
-            for _ip in sorted(_idle_lorries):
-                _ic = _lorry_cap_map.get(_ip, 0)
-                # Find which route prefixes list this lorry as preferred
-                _ip_routes = [
-                    pfx for pfx, plates in _ROUTE_PREFERRED_LORRY.items()
-                    if _ip in plates
-                ]
-                _ip_strict = [
-                    pfx for pfx, pls in _LORRY_STRICT_ROUTE.items()
-                    if pfx == _ip
-                ]
-                if _ip_routes:
-                    _idle_parts.append(f"{_ip} ({_ic:.1f}T, preferred for {'/'.join(_ip_routes[:3])})")
-                else:
-                    _idle_parts.append(f"{_ip} ({_ic:.1f}T, no preferred route)")
-            header += "\n🅿️ *Idle lorries:* " + ", ".join(_idle_parts)
+            header += "\n🅿️ *Idle lorries:* " + ", ".join(_lorry_diag_label(p) for p in sorted(_idle_lorries))
+        if _log_blocked_lorries:
+            header += "\n🔒 *Blocked by today's log (prev session):* " + ", ".join(
+                _lorry_diag_label(p) for p in sorted(_log_blocked_lorries)
+            )
 
         _summ = _build_summary(sess)
         if isinstance(_summ, list):
