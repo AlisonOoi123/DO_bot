@@ -3055,7 +3055,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _consol_lorry_states.setdefault(_cpl, set()).add(_cst)
 
         for it in items:
-            if it.get("LORRY") != "NO_LORRY":
+            if it.get("LORRY") not in (None, "NO_LORRY"):
                 continue
             w = it["WEIGHT"]
             it_dest = _classify_dest_group(it.get("ROUTE", ""), it.get("STATE", ""))
@@ -3155,7 +3155,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # physical size/state constraints still apply) so lorries that appear in
         # today's log from a PREVIOUS session don't block scheduled DOs.
         for it in items:
-            if it.get("LORRY") != "NO_LORRY":
+            if it.get("LORRY") not in (None, "NO_LORRY"):
                 continue
             w         = it["WEIGHT"]
             it_route  = it.get("ROUTE", "")
