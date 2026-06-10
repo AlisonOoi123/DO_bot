@@ -166,6 +166,127 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
         if re.search(r'\b' + re.escape(kw) + r'\b', txt):
             days.add(wd)
     return days if days else None
+
+
+# ── LLM-assisted REMARKS parsing (Claude API) ────────────────────────────────
+# Free-text remarks vary a lot ("HANTAR SELASA SAHAJA", "x hantar hari jumaat",
+# "deliver only on Mon & Thu", typos, mixed BM/English). The keyword regex
+# above catches the common patterns; for anything else we ask Claude Haiku to
+# normalize the remark into a weekday set. Results are cached on disk so each
+# unique remark is only ever sent to the API once.
+REMARKS_LLM_CACHE_PATH = os.path.join(_DATA_DIR, "remarks_day_cache.json")
+_remarks_llm_cache: dict[str, list | None] | None = None
+_remarks_llm_lock = threading.Lock()
+
+def _load_remarks_llm_cache() -> dict:
+    global _remarks_llm_cache
+    if _remarks_llm_cache is None:
+        try:
+            with open(REMARKS_LLM_CACHE_PATH, encoding="utf-8") as f:
+                _remarks_llm_cache = json.load(f)
+        except Exception:
+            _remarks_llm_cache = {}
+    return _remarks_llm_cache
+
+def _save_remarks_llm_cache() -> None:
+    try:
+        with open(REMARKS_LLM_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_remarks_llm_cache, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+def _llm_parse_remarks_batch(remarks_list: list[str]) -> None:
+    """Send un-cached remarks to Claude Haiku in ONE batch call and cache results.
+
+    Cache value per remark: list of weekday ints (Mon=0…Sun=6), or None when
+    the remark carries no day restriction. Silently does nothing when no
+    ANTHROPIC_API_KEY is configured or the API call fails — the regex parser
+    remains the fallback.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    cache = _load_remarks_llm_cache()
+    todo = sorted({
+        r.strip() for r in remarks_list
+        if r and r.strip() and r.strip().lower() not in ("nan", "none")
+        and r.strip() not in cache
+    })
+    if not todo:
+        return
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        numbered = "\n".join(f"{i}: {r}" for i, r in enumerate(todo))
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2048,
+            system=(
+                "You normalize Malaysian delivery remarks (mixed Malay/English, "
+                "often with typos) into delivery-day constraints.\n"
+                "Weekday numbers: Monday=0 Tuesday=1 Wednesday=2 Thursday=3 "
+                "Friday=4 Saturday=5 Sunday=6.\n"
+                "Malay days: ISNIN=0 SELASA=1 RABU=2 KHAMIS=3 JUMAAT=4 SABTU=5 AHAD=6.\n"
+                "For each numbered remark, output the list of weekdays the "
+                "customer accepts delivery, or null if the remark contains no "
+                "day restriction (e.g. it's about packaging, payment, location, "
+                "'setiap hari'/daily, or is unintelligible)."
+            ),
+            messages=[{"role": "user", "content": numbered}],
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "results": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "index": {"type": "integer"},
+                                        "days": {
+                                            "anyOf": [
+                                                {"type": "array",
+                                                 "items": {"type": "integer",
+                                                           "enum": [0, 1, 2, 3, 4, 5, 6]}},
+                                                {"type": "null"},
+                                            ]
+                                        },
+                                    },
+                                    "required": ["index", "days"],
+                                    "additionalProperties": False,
+                                },
+                            }
+                        },
+                        "required": ["results"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+        )
+        text = next(b.text for b in response.content if b.type == "text")
+        parsed = json.loads(text)
+        with _remarks_llm_lock:
+            for entry in parsed.get("results", []):
+                idx = entry.get("index")
+                if isinstance(idx, int) and 0 <= idx < len(todo):
+                    cache[todo[idx]] = entry.get("days")
+            _save_remarks_llm_cache()
+    except Exception as e:
+        print(f"⚠️ LLM remarks parsing skipped: {e}")
+
+def _remarks_days_for(remarks: str) -> set[int] | None:
+    """Delivery-day set for a remark: LLM cache first, regex fallback."""
+    key = str(remarks).strip() if remarks else ""
+    if key and key.lower() not in ("nan", "none"):
+        cache = _load_remarks_llm_cache()
+        if key in cache:
+            val = cache[key]
+            return set(val) if val is not None else None
+    return _parse_remarks_days(remarks)
+
+
+def _load_schedule(user: str) -> dict[int, set[str]]:
     """Return {weekday_int: set_of_route_prefixes} from the SCHD sheet.
     weekday_int follows Python's datetime.weekday(): Mon=0 … Sun=6.
     Returns empty dict if the sheet doesn't exist (no schedule filtering).
@@ -1968,6 +2089,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _trip_day       = sess.get("trip_day", "today")
         _sched_prefixes = _scheduled_prefixes_for_upload(sess.get("user_id", ""), trip_day=_trip_day)
 
+        # Batch-parse all unique REMARKS via Claude (one API call, disk-cached).
+        # Falls back silently to the keyword regex when no API key is set.
+        if "REMARKS" in raw.columns:
+            _llm_parse_remarks_batch(
+                [str(v) for v in raw["REMARKS"].dropna().unique()]
+            )
+
         items = []
         _other_user_count  = 0
         _not_today_count   = 0
@@ -1992,7 +2120,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # and today's trip-day weekday is not in that set, defer the item.
             _remarks_raw = str(row.get("REMARKS", "")).strip()
             if _is_mine and _is_today:
-                _remarks_days = _parse_remarks_days(_remarks_raw)
+                _remarks_days = _remarks_days_for(_remarks_raw)
                 if _remarks_days is not None:
                     # Determine the effective weekday for this trip
                     from datetime import timedelta as _td
