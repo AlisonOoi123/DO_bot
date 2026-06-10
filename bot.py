@@ -3162,26 +3162,39 @@ def _handle_excel_upload(phone, sess, file_bytes):
             it_state  = it.get("STATE", "").strip().upper()
             it_dest   = _classify_dest_group(it_route, it.get("STATE", ""))
             _it_dest_min_t = _DEST_MIN_TON.get(it_dest, 0.0)
+            _it_strict = _strict_route_excl(it_route)
+            _it_is_urban = it_dest in _DEST_URBAN_GROUPS
 
-            _force_candidates = sorted([
-                (float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
-                for p in _lorry_cap_map
-                if p not in sess.get("unavailable", set())        # only hard blocks
-                and float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) >= w
-                and float(_lorry_cap_map.get(p, 0)) >= _it_dest_min_t
-                and (not it_state or (
-                    lambda _lst: not _lst or it_state in _lst
-                )(_consol_lorry_states.get(p, set()) | _session_lorry_states.get(p, set())))
-                and p not in _strict_route_excl(it_route)
-                # Urban lorries must not carry outstation loads and vice versa
-                and not (it_dest in _DEST_URBAN_GROUPS and float(_lorry_cap_map.get(p, 0)) >= 11.0)
-                and not (it_dest not in _DEST_URBAN_GROUPS
-                         and _classify_dest_group(_session_routes.get(p, "")) in _DEST_URBAN_GROUPS
-                         and _session_routes.get(p, ""))
-            ])
+            _force_candidates = []
+            for _fp in _lorry_cap_map:
+                if _fp in sess.get("unavailable", set()):
+                    continue
+                _fp_cap  = float(_lorry_cap_map.get(_fp, 0))
+                _fp_load = float(_session_loads.get(_fp, 0))
+                _fp_rem  = _fp_cap - _fp_load
+                if _fp_rem < w:
+                    continue
+                if _fp_cap < _it_dest_min_t:
+                    continue
+                if _fp in _it_strict:
+                    continue
+                # Urban↔outstation guard
+                if _it_is_urban and _fp_cap >= 11.0:
+                    continue
+                if (not _it_is_urban
+                        and _session_routes.get(_fp, "")
+                        and _classify_dest_group(_session_routes.get(_fp, "")) in _DEST_URBAN_GROUPS):
+                    continue
+                # State boundary — only block if lorry already committed to a DIFFERENT state
+                _fp_states = _consol_lorry_states.get(_fp, set()) | _session_lorry_states.get(_fp, set())
+                if it_state and _fp_states and it_state not in _fp_states:
+                    continue
+                _force_candidates.append((_fp_rem, _fp))
+
             if not _force_candidates:
                 continue
 
+            _force_candidates.sort()    # smallest remaining capacity first → tightest fit
             _fpick = _force_candidates[0][1]
             it["LORRY"] = _fpick
             _session_loads[_fpick] = float(_session_loads.get(_fpick, 0)) + w
