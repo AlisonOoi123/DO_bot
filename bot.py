@@ -3655,6 +3655,37 @@ def _handle_excel_upload(phone, sess, file_bytes):
             ]
             header += f"\n❌ *Unassigned reasons:* " + ", ".join(_reason_parts)
 
+        # ── DEBUG: show why each NO_LORRY item couldn't be assigned ──────────
+        _debug_lines = []
+        for _dbg_it in _no_lorry_items:
+            _dbg_w     = _dbg_it["WEIGHT"]
+            _dbg_route = _dbg_it.get("ROUTE", "")
+            _dbg_state = _dbg_it.get("STATE", "").strip().upper()
+            _dbg_dest  = _classify_dest_group(_dbg_route, _dbg_it.get("STATE", ""))
+            _dbg_urban = _dbg_dest in _DEST_URBAN_GROUPS
+            _dbg_strict = _strict_route_excl(_dbg_route)
+            _rejections = []
+            for _dp, _dc in _lorry_cap_map.items():
+                _dl = float(_session_loads.get(_dp, 0))
+                _dr = _dc - _dl
+                if _dp in sess.get("unavailable", set()):
+                    _rejections.append(f"{_dp}:UNAVAIL")
+                elif _dbg_urban and _dc >= 11.0:
+                    _rejections.append(f"{_dp}:TOO_LARGE")
+                elif _dp in _dbg_strict:
+                    _rejections.append(f"{_dp}:STRICT")
+                elif _dr < _dbg_w and (_dr + 1.0) < _dbg_w:
+                    _rejections.append(f"{_dp}:CAP({_dr:.2f}T)")
+                else:
+                    _rejections.append(f"{_dp}:OK(rem={_dr:.2f}T)")
+            _debug_lines.append(
+                f"🔍 DO {_dbg_it['DO NUMBER'][-5:]} {_dbg_w}T {_dbg_dest}\n"
+                + "  unavail=" + str(sorted(sess.get("unavailable", set()))) + "\n"
+                + "  " + " | ".join(_rejections)
+            )
+        if _debug_lines:
+            header += "\n\n🛠 *DEBUG*\n" + "\n".join(_debug_lines)
+
         # ── Idle lorry diagnostic ─────────────────────────────────────────────
         _assigned_plates = {
             it.get("LORRY") for it in my_items
