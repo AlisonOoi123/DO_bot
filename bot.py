@@ -3226,16 +3226,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _unassigned_reasons.pop(it["DO NUMBER"], None)
 
         # ── Last-item overflow pass ───────────────────────────────────────────
-        # If exactly ONE item remains unassigned and its weight overshoots the
-        # best available lorry's remaining capacity by ≤ 1T, allow the overflow
-        # rather than leaving the DO unassigned.  The lorry is simply loaded
-        # slightly over its nominal daily cap (still within the physical frame).
-        _still_unassigned = [
-            it for it in items
-            if it.get("LORRY") in (None, "NO_LORRY")
-        ]
-        if len(_still_unassigned) == 1:
-            _last = _still_unassigned[0]
+        # For any item still unassigned whose weight overshoots every available
+        # lorry's remaining capacity by ≤ 1T, allow the overflow rather than
+        # leaving the DO unassigned.  The lorry is simply loaded slightly over
+        # its nominal daily cap (still within the physical frame).
+        # Process items one at a time so each assignment updates _session_loads
+        # before the next item is evaluated.
+        for _last in items:
+            if _last.get("LORRY") not in (None, "NO_LORRY"):
+                continue
             _lw        = _last["WEIGHT"]
             _lroute    = _last.get("ROUTE", "")
             _lstate    = _last.get("STATE", "").strip().upper()
