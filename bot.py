@@ -3225,6 +3225,60 @@ def _handle_excel_upload(phone, sess, file_bytes):
             sess["assigned"][it["DO NUMBER"]] = _fpick
             _unassigned_reasons.pop(it["DO NUMBER"], None)
 
+        # ── Last-item overflow pass ───────────────────────────────────────────
+        # If exactly ONE item remains unassigned and its weight overshoots the
+        # best available lorry's remaining capacity by ≤ 1T, allow the overflow
+        # rather than leaving the DO unassigned.  The lorry is simply loaded
+        # slightly over its nominal daily cap (still within the physical frame).
+        _still_unassigned = [
+            it for it in items
+            if it.get("LORRY") in (None, "NO_LORRY")
+        ]
+        if len(_still_unassigned) == 1:
+            _last = _still_unassigned[0]
+            _lw        = _last["WEIGHT"]
+            _lroute    = _last.get("ROUTE", "")
+            _lstate    = _last.get("STATE", "").strip().upper()
+            _ldest     = _classify_dest_group(_lroute, _last.get("STATE", ""))
+            _l_is_urban = _ldest in _DEST_URBAN_GROUPS
+            _lstrict   = _strict_route_excl(_lroute)
+
+            _overflow_candidates = []
+            for _op in _lorry_cap_map:
+                if _op in sess.get("unavailable", set()):
+                    continue
+                _op_cap  = float(_lorry_cap_map.get(_op, 0))
+                _op_load = float(_session_loads.get(_op, 0))
+                _op_rem  = _op_cap - _op_load
+                if _op in _lstrict:
+                    continue
+                if _l_is_urban and _op_cap >= 11.0:
+                    continue
+                if (not _l_is_urban
+                        and _session_routes.get(_op, "")
+                        and _classify_dest_group(_session_routes.get(_op, "")) in _DEST_URBAN_GROUPS):
+                    continue
+                _op_states = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
+                if _lstate and _op_states and not any(_states_compatible(_lstate, s) for s in _op_states):
+                    continue
+                _overage = _lw - _op_rem   # negative means it fits normally
+                if _overage > 1.0:         # more than 1T short → skip
+                    continue
+                _overflow_candidates.append((_op_rem, _op))
+
+            if _overflow_candidates:
+                _overflow_candidates.sort(reverse=True)   # most remaining cap first
+                _opick = _overflow_candidates[0][1]
+                _last["LORRY"] = _opick
+                _session_loads[_opick] = float(_session_loads.get(_opick, 0)) + _lw
+                if _lstate:
+                    _consol_lorry_states.setdefault(_opick, set()).add(_lstate)
+                _record_lorry_state(_opick, _lstate)
+                if _opick not in _session_routes:
+                    _session_routes[_opick] = _lroute
+                sess["assigned"][_last["DO NUMBER"]] = _opick
+                _unassigned_reasons.pop(_last["DO NUMBER"], None)
+
         # ── Lorry-swap optimisation ───────────────────────────────────────────
         # Reduce waste on large lorries (≥10T) by swapping them with a smaller
         # lorry that is currently carrying a heavier load.  Conditions for a
