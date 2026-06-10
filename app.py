@@ -8,11 +8,31 @@ Requires: pip install -r requirements.txt
 import os
 import io
 import json
+import time
+import threading
 import requests
 from flask import Flask, request, Response
 import bot
 
 app = Flask(__name__)
+
+# Deduplicate Meta webhook retries — same message_id arrives multiple times
+# when processing takes >20 s. Keep IDs for 5 minutes then evict.
+_seen_msg_ids: dict[str, float] = {}
+_seen_lock = threading.Lock()
+_SEEN_TTL = 300  # seconds
+
+def _is_duplicate(msg_id: str) -> bool:
+    now = time.time()
+    with _seen_lock:
+        # evict stale entries
+        stale = [k for k, t in _seen_msg_ids.items() if now - t > _SEEN_TTL]
+        for k in stale:
+            del _seen_msg_ids[k]
+        if msg_id in _seen_msg_ids:
+            return True
+        _seen_msg_ids[msg_id] = now
+        return False
 
 # ── Load config from config.txt ───────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -73,6 +93,10 @@ def webhook():
         msg    = messages[0]
         phone  = msg["from"]  # e.g. "601155003102"
         msg_type = msg.get("type", "text")
+
+        # Skip if we've already processed this exact message (Meta retry)
+        if _is_duplicate(msg.get("id", "")):
+            return Response("OK", status=200)
 
         text       = None
         file_bytes = None
