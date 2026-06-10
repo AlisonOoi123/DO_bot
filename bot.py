@@ -2199,41 +2199,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _is_mine = False
                 _other_user_count += 1
 
-            # Compute the effective trip date once (used by both checks below)
-            from datetime import timedelta as _td
-            _trip_target = datetime.now().date()
-            if sess.get("trip_day") == "tomorrow":
-                _trip_target += _td(days=1)
-                while _trip_target.weekday() >= 5:
-                    _trip_target += _td(days=1)
-
-            # REMARKS delivery-day check — parse first so it can override the
-            # schedule check below when the remark explicitly names today.
-            _remarks_raw = str(row.get("REMARKS", "")).strip()
-            _remarks_days = _remarks_days_for(_remarks_raw) if _is_mine else None
-
-            # Schedule check — only for this user's routes.
-            # Exception: if REMARKS explicitly include today's weekday (e.g. a
-            # customer's remark says "RABU DAN SABTU" and today is Wednesday),
-            # include the item even if the route isn't in today's schedule —
-            # the customer constraint takes priority over the route plan.
+            # Schedule check — the ONLY filter for whether a DO ships today.
+            # Assignment is based purely on whether the route prefix is in
+            # today's SCHD sheet. The DATE column and REMARKS day keywords
+            # do NOT gate inclusion. All DOs on scheduled routes are assigned
+            # regardless of how old they are; older DOs are prioritised by the
+            # date-sort applied to `items` after this loop.
             if _is_mine and _sched_prefixes is not None:
                 if pfx not in _sched_prefixes:
-                    _remarks_override = (
-                        _remarks_days is not None
-                        and _trip_target.weekday() in _remarks_days
-                    )
-                    if not _remarks_override:
-                        _is_today = False
-                        _not_today_count += 1
-
-            # REMARKS delivery-day exclusion — if the route IS scheduled but
-            # REMARKS say not to deliver today, defer the item.
-            if _is_mine and _is_today and _remarks_days is not None:
-                if _trip_target.weekday() not in _remarks_days:
                     _is_today = False
                     _not_today_count += 1
 
+            _remarks_raw = str(row.get("REMARKS", "")).strip()
             _lorry_init = None
             if not _is_mine:
                 _lorry_init = "OTHER_USER"
@@ -2276,6 +2253,23 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "LORRY":         _lorry_init,
                 "SPLIT_LORRIES": None,
             })
+
+        # Sort eligible items by DATE ascending so oldest pending DOs are
+        # assigned lorries first. Items already settled (NOT_TODAY/OTHER_USER/
+        # pre-filled plate) sort last so they don't displace pending DOs.
+        def _early_date_key(it):
+            lorry = it.get("LORRY")
+            if lorry not in (None, "NO_LORRY"):
+                return "9999-99-99"
+            raw_d = str(it.get("DATE", "")).strip()
+            try:
+                _ts = pd.to_datetime(raw_d, dayfirst=True, errors="coerce")
+                if pd.notna(_ts):
+                    return _ts.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            return "9999-12-31"
+        items.sort(key=_early_date_key)
 
         # Build schedule notice for the user
         _sched_notice = []
