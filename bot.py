@@ -326,8 +326,10 @@ def _same_corridor_group(route1: str, route2: str) -> bool:
 # within the same corridor before falling to general assignment.
 _ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     # North KL corridor (outstation Rawang / T.Malim direction)
-    "KV01A": ["BQY7823"],
-    "KV02A": ["BQY7823"],
+    # BQY7823 primary; BMN3682 is fallback when BQY7823 is committed to Pahang runs.
+    # This matches manual: BQY7823→PH09, BMN3682→KV01A+KV02A.
+    "KV01A": ["BQY7823", "BMN3682"],
+    "KV02A": ["BQY7823", "BMN3682"],
     # Inner-KL tight streets (4.2T lorries only — can't park 14T there)
     "KV06A": ["W3618U", "W3826C"],
     "KV07A": ["W3618U", "W3826C"],
@@ -339,10 +341,11 @@ _ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     "KV18A": ["BPE9788", "VJN9910", "VEA2818"],
     "KV19A": ["BPE9788", "VJN9910", "VEA2818"],
     "KV20A": ["BPE9788", "VJN9910", "VEA2818"],
-    # NS (Negeri Sembilan) corridor — BMN3682 is the designated NS lorry
-    "NS04":  ["BMN3682"],
-    "NS05":  ["BMN3682"],
-    "NS06":  ["BMN3682"],
+    # NS (Negeri Sembilan) corridor — BQX9983 primary, BMN3682 backup.
+    # Manual assigns BQX9983 to NS05+NS06, BMN3682 to KV01A+KV02A.
+    "NS04":  ["BQX9983", "BMN3682"],
+    "NS05":  ["BQX9983", "BMN3682"],
+    "NS06":  ["BQX9983", "BMN3682"],
     # Pahang interior corridor — BPE9788 primary, WA6899M spare (only if BPE9788 full)
     "PH01":  ["BPE9788", "WA6899M"],
     "PH02":  ["BPE9788", "WA6899M"],
@@ -362,7 +365,9 @@ _CROSS_BEARING_LIMIT     = 90.0   # max bearing diff (°) for same-direction mer
 # Max GPS distance (km) allowed when merging two city clusters on the SAME lorry.
 # Within a state, cities within this radius can share; farther cities get their own lorry.
 # Urban KL/Selangor routes: unlimited (already bucketed by city, proximity via bearing).
-_MAX_CITY_MERGE_KM_OUTSTATION = 80.0   # e.g. Bahau↔Kuala Pilah ~30 km ✓, PD↔Bahau ~120 km ✗
+_MAX_CITY_MERGE_KM_OUTSTATION = 60.0   # Bahau↔Kuala Pilah ~30 km ✓; Raub-town↔Jerantut ~70 km ✗
+# Tightened from 80→60 km: prevents near-border Raub (3.81, 101.87) merging with
+# far-cluster "Raub" (3.24, 102.41) which is actually near Jerantut (~70 km away).
 
 
 def _preferred_lorries_for_route(route_text: str) -> list[str]:
