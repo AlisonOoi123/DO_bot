@@ -3,7 +3,7 @@ WhatsApp Bot State Machine (Twilio or Meta Cloud API compatible)
 Handles the full conversation flow for lorry assignment.
 
 State flow:
-  IDLE -> AWAIT_USER_ID -> AWAIT_EXCEL -> CONFIRMING -> DONE
+  IDLE -> AWAIT_USER_ID -> AWAIT_TRIP_DAY -> AWAIT_EXCEL -> CONFIRMING -> DONE
   (Auto-assigns best lorry for all DOs silently, shows summary for confirmation)
 """
 
@@ -178,25 +178,20 @@ def _load_schedule(user: str) -> dict[int, set[str]]:
     return schedule
 
 
-def _scheduled_prefixes_for_upload(user: str, upload_dt: datetime | None = None) -> set[str] | None:
+def _scheduled_prefixes_for_upload(user: str, trip_day: str = "today") -> set[str] | None:
     """Return the set of route prefixes that should be assigned for this upload.
 
-    Logic:
-      • Upload before 12:00 → assign TODAY's scheduled routes
-        (these are the afternoon-trip DOs for today)
-      • Upload at/after 12:00 → assign NEXT WORKING DAY's morning routes
+    trip_day: "today" or "tomorrow" — set explicitly by the user at login.
     Returns None if no schedule found (skip filtering entirely).
     """
     schedule = _load_schedule(user)
     if not schedule:
         return None
 
-    now = upload_dt or datetime.now()
-    if now.hour < 12:
-        target_date = now.date()
-    else:
-        from datetime import timedelta as _timedelta
-        target_date = now.date() + _timedelta(days=1)
+    from datetime import timedelta as _timedelta
+    target_date = datetime.now().date()
+    if trip_day == "tomorrow":
+        target_date += _timedelta(days=1)
         # Skip weekends
         while target_date.weekday() >= 5:
             target_date += _timedelta(days=1)
@@ -1477,6 +1472,8 @@ def handle_message(phone: str, text: str = None,
         return _start(phone, sess)
     elif state == "AWAIT_USER_ID":
         return _handle_user_id(phone, sess, text)
+    elif state == "AWAIT_TRIP_DAY":
+        return _handle_trip_day(phone, sess, text)
     elif state == "AWAIT_EXCEL":
         if file_bytes:
             return _handle_excel_upload(phone, sess, file_bytes)
@@ -1565,7 +1562,7 @@ def _handle_user_id(phone, sess, text):
     # Use new-format history if it exists, else fall back to old format
     _hist = _resolve_history_path()
     sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user)
-    sess["state"] = "AWAIT_EXCEL"
+    sess["state"] = "AWAIT_TRIP_DAY"
 
     lorries = sess["engine"].get_eligible_lorry_list()
 
@@ -1585,24 +1582,83 @@ def _handle_user_id(phone, sess, text):
             tag = " ✅ Available"
         lines.append(f"  • {plate} — {ton}T ({lorry_user}){tag}")
 
+    from datetime import timedelta as _td
+    _today_name    = datetime.now().strftime("%A")
+    _tomorrow_date = datetime.now().date() + _td(days=1)
+    while _tomorrow_date.weekday() >= 5:
+        _tomorrow_date += _td(days=1)
+    _tomorrow_name = _tomorrow_date.strftime("%A")
+
     lorry_text = (
         f"✅ Logged in as *{user}*\n\n"
-        f"Your lorries:\n" + "\n".join(lines) + "\n\n"
-        "📎 Now please upload your DO Excel file (.xlsx).\n\n"
-        "_Tip: you can also upload the master lorry file (with a_ *Status* _column) to block/release lorries in bulk._"
+        f"Your lorries:\n" + "\n".join(lines)
     )
-    # Quick-action buttons (max 3 for WhatsApp)
-    buttons_msg = {
+    trip_day_msg = {
         "_type": "buttons",
-        "body": "Quick actions:",
+        "body": (
+            f"📅 Which day's DOs are you planning now?\n\n"
+            f"• *Today* = {_today_name}'s routes\n"
+            f"• *Tomorrow* = {_tomorrow_name}'s routes"
+        ),
         "buttons": [
-            {"id": "clear daily log",     "title": "🗑️ Clear Today Log"},
-            {"id": "show assigned today", "title": "📋 Show Assigned"},
-            {"id": "show blocked",        "title": "🚫 Show Blocked"},
+            {"id": "trip_day_today",    "title": f"Today ({_today_name[:3]})"},
+            {"id": "trip_day_tomorrow", "title": f"Tomorrow ({_tomorrow_name[:3]})"},
         ],
     }
 
-    return [lorry_text, buttons_msg]
+    return [lorry_text, trip_day_msg]
+
+
+def _handle_trip_day(phone, sess, text):
+    """Handle Today / Tomorrow selection after login."""
+    cmd = text.lower().strip()
+    if cmd in ("trip_day_today", "today"):
+        trip_day = "today"
+    elif cmd in ("trip_day_tomorrow", "tomorrow"):
+        trip_day = "tomorrow"
+    else:
+        from datetime import timedelta as _td
+        _today_name    = datetime.now().strftime("%A")
+        _tomorrow_date = datetime.now().date() + _td(days=1)
+        while _tomorrow_date.weekday() >= 5:
+            _tomorrow_date += _td(days=1)
+        _tomorrow_name = _tomorrow_date.strftime("%A")
+        return [{
+            "_type": "buttons",
+            "body": "Please select which day's DOs to plan:",
+            "buttons": [
+                {"id": "trip_day_today",    "title": f"Today ({_today_name[:3]})"},
+                {"id": "trip_day_tomorrow", "title": f"Tomorrow ({_tomorrow_name[:3]})"},
+            ],
+        }]
+
+    sess["trip_day"] = trip_day
+    sess["state"]   = "AWAIT_EXCEL"
+
+    from datetime import timedelta as _td
+    if trip_day == "today":
+        _day_label = datetime.now().strftime("%A, %d %b")
+    else:
+        _d = datetime.now().date() + _td(days=1)
+        while _d.weekday() >= 5:
+            _d += _td(days=1)
+        _day_label = _d.strftime("%A, %d %b")
+
+    return [
+        f"✅ Planning for *{_day_label}*.\n\n"
+        "📎 Please upload your DO Excel file (.xlsx) now.\n\n"
+        "_Tip: you can also upload the master lorry file (with a_ *Status* _column) "
+        "to block/release lorries in bulk._",
+        {
+            "_type": "buttons",
+            "body": "Quick actions:",
+            "buttons": [
+                {"id": "clear daily log",     "title": "🗑️ Clear Today Log"},
+                {"id": "show assigned today", "title": "📋 Show Assigned"},
+                {"id": "show blocked",        "title": "🚫 Show Blocked"},
+            ],
+        },
+    ]
 
 
 
@@ -1855,12 +1911,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _user_prefixes = _load_user_route_prefixes(sess.get("user_id", ""))
 
         # ── Schedule filter ──────────────────────────────────────────────────
-        # Before 12:00 → assign routes scheduled for TODAY (afternoon DOs).
-        # At/after 12:00 → assign routes scheduled for NEXT WORKING DAY (morning DOs).
-        # Routes not on today's/tomorrow's schedule are left blank (NOT_TODAY).
-        _sched_prefixes = _scheduled_prefixes_for_upload(sess.get("user_id", ""))
-        _upload_hour    = datetime.now().hour
-        _sched_target   = "today (afternoon trip)" if _upload_hour < 12 else "tomorrow (morning trip)"
+        # User explicitly chose "Today" or "Tomorrow" at login.
+        # Routes not on the chosen day's schedule are left blank (NOT_TODAY).
+        _trip_day       = sess.get("trip_day", "today")
+        _sched_prefixes = _scheduled_prefixes_for_upload(sess.get("user_id", ""), trip_day=_trip_day)
 
         items = []
         _other_user_count  = 0
@@ -1926,18 +1980,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Build schedule notice for the user
         _sched_notice = []
         if _sched_prefixes is not None:
-            _day_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
             from datetime import timedelta as _td
-            _now_dt = datetime.now()
-            if _upload_hour < 12:
-                _tgt_date = _now_dt.date()
+            _day_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+            if _trip_day == "today":
+                _tgt_date = datetime.now().date()
             else:
-                _tgt_date = _now_dt.date() + _td(days=1)
+                _tgt_date = datetime.now().date() + _td(days=1)
                 while _tgt_date.weekday() >= 5:
                     _tgt_date += _td(days=1)
             _tgt_wd = _tgt_date.weekday()
             _sched_notice.append(
-                f"📅 Schedule filter — assigning *{_sched_target}* ({_day_names[_tgt_wd]}). "
+                f"📅 Schedule filter — assigning *{_trip_day}* ({_day_names[_tgt_wd]}). "
                 f"Routes: {', '.join(sorted(_sched_prefixes)) if _sched_prefixes else 'none scheduled'}."
             )
             if _not_today_count:
