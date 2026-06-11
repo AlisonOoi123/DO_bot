@@ -2970,7 +2970,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     float(row["TON"]) for _, row in engine.eligible_lorries.iterrows()
                     if row["LORRY"] not in _excl_check
                 )
-                if not any(c >= _pre_total_w for c in _avail_caps):
+                if not any(c * 1.05 >= _pre_total_w for c in _avail_caps):
                     # Too heavy for any single lorry — split by DATE (earliest
                     # DOs get the first lorry so older orders always ship first).
                     # group_items is already date-sorted from the pre-sort above.
@@ -3995,6 +3995,85 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if not _pit[_best_src]:
                     del _pit[_best_src]
                 _rebal_ok = True
+
+        # ── Fill-to-80% pass ──────────────────────────────────────────────────
+        # After all rebalance passes, lorries still below 80% utilisation may
+        # absorb unassigned items from the SAME route+city+state bucket sorted
+        # by GPS proximity to the lorry's route centroid.  This prevents leaving
+        # items unassigned when a compatible lorry still has headroom.
+        _FILL_TARGET = 0.80
+        _NAIK_FACTOR = 1.05
+        # Rebuild load map from _pit
+        _fill_ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
+        # Collect all currently unassigned items (NO_LORRY or None/blank)
+        _unassigned_pool = [
+            it for it in items
+            if it.get("LORRY") in (None, "", "NO_LORRY")
+            and it.get("WEIGHT", 0) > 0
+        ]
+        # Sort pool by date ascending so earlier DOs get priority
+        _unassigned_pool.sort(key=lambda it: _parse_date_sortkey(it.get("DATE", "")))
+
+        for _fp in list(_pit.keys()):
+            _cap = float(_lorry_cap_map.get(_fp, 0))
+            if _cap <= 0:
+                continue
+            _load = _fill_ploads.get(_fp, 0.0)
+            if _load / _cap >= _FILL_TARGET:
+                continue  # already at target
+            _fp_route = _session_routes.get(_fp, "")
+            _fp_dest  = _classify_dest_group(_fp_route)
+            _fp_states_set = {it.get("STATE", "").strip().upper()
+                              for it in _pit.get(_fp, []) if it.get("STATE")}
+            # Find candidates from the pool that match this lorry's route/state
+            _candidates = []
+            for _cu in _unassigned_pool:
+                _cu_route = _cu.get("ROUTE", "")
+                _cu_state = _cu.get("STATE", "").strip().upper()
+                _cu_dest  = _classify_dest_group(_cu_route)
+                # Must be same destination class (urban stays urban, outstation stays outstation)
+                if _cu_dest != _fp_dest:
+                    continue
+                # Route must match lorry's route or be on the same way
+                if _fp_route and _cu_route != _fp_route:
+                    if (not _same_corridor_group(_cu_route, _fp_route)
+                            and not _routes_on_same_way(_cu_route, _fp_route)):
+                        continue
+                # State boundary
+                if _fp_states_set and _cu_state and _cu_state not in _fp_states_set:
+                    continue
+                # Strict route exclusion
+                if _fp in _strict_route_excl(_cu_route):
+                    continue
+                # Lorry size vs outstation min tonnage
+                if _cap < _DEST_MIN_TON.get(_cu_dest, 0.0):
+                    continue
+                _candidates.append(_cu)
+            if not _candidates:
+                continue
+            # Sort candidates by GPS proximity to lorry's route centroid
+            _fp_centroid = _route_centroid(_fp_route) if _fp_route else None
+            def _dist_to_lorry(it, _fc=_fp_centroid):
+                c = _route_centroid(it.get("ROUTE", ""))
+                if c is None or _fc is None:
+                    return float("inf")
+                return _haversine_km(_fc[0], _fc[1], c[0], c[1])
+            _candidates.sort(key=_dist_to_lorry)
+            # Fill up to NAIK capacity
+            _naik_cap = _cap * _NAIK_FACTOR
+            for _cu in _candidates:
+                if _load + _cu["WEIGHT"] > _naik_cap:
+                    continue
+                # Assign
+                _cu["LORRY"] = _fp
+                sess["assigned"][_cu["DO NUMBER"]] = _fp
+                _pit.setdefault(_fp, []).append(_cu)
+                _fill_ploads[_fp] = _fill_ploads.get(_fp, 0.0) + _cu["WEIGHT"]
+                _load = _fill_ploads[_fp]
+                _unassigned_pool.remove(_cu)
+                if not _fp_route and _cu.get("ROUTE"):
+                    _fp_route = _cu["ROUTE"]
+                    _session_routes[_fp] = _fp_route
 
         # ── Hard capacity guard ───────────────────────────────────────────────
         # After all passes, any lorry whose assigned weight still exceeds its
