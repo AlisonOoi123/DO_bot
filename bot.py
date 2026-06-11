@@ -486,6 +486,10 @@ _DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
 # KV routes that go outstation (Rawang / Tanjung Malim direction):
 _DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
 
+# KL and Selangor urban routes: lorries must be STRICTLY < 5T (SMALL lorry only).
+# Medium (5–11T) and Large (≥11T) lorries cannot enter tight city streets.
+_URBAN_MAX_TON = 5.0
+
 # Minimum lorry tonnage per destination group.
 # These are soft floors — lorries at or above this tonnage are eligible.
 # The engine further PREFERS the largest lorries for long-haul routes
@@ -3090,7 +3094,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and p not in _hard_excl
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                     and float(_lorry_cap_map.get(p, 0)) >= _pref_dest_min
-                    and not (_pref_urban and float(_lorry_cap_map.get(p, 0)) >= 11.0)
+                    and not (_pref_urban and float(_lorry_cap_map.get(p, 0)) >= _URBAN_MAX_TON)
                 ]
                 if _pref_avail:
                     # Among available preferred lorries pick the tightest fit.
@@ -3110,7 +3114,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if str(r["LORRY"]).strip().upper() not in (sess["unavailable"] | get_assigned_today() | _strict_excl | _state_excl)
                         and _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp) - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0)) >= total_w
                         and float(r["TON"]) >= _pref_dest_min
-                        and not (_pref_urban and float(r["TON"]) >= 11.0)
+                        and not (_pref_urban and float(r["TON"]) >= _URBAN_MAX_TON)
                     ]
                     _best_fleet_surplus = min(_all_eligible_surplus) if _all_eligible_surplus else _pref_surplus
 
@@ -3151,7 +3155,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 excluded = excluded | {
                     str(r["LORRY"]).strip().upper()
                     for _, r in engine.eligible_lorries.iterrows()
-                    if float(r["TON"]) >= 11.0
+                    if float(r["TON"]) >= _URBAN_MAX_TON
                 }
 
             # ── Tiny-item route guard ─────────────────────────────────────────
@@ -3546,7 +3550,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if _fp in _it_strict:
                     continue
                 # Urban↔outstation guard
-                if _it_is_urban and _fp_cap >= 11.0:
+                if _it_is_urban and _fp_cap >= _URBAN_MAX_TON:
                     continue
                 if (not _it_is_urban
                         and _session_routes.get(_fp, "")
@@ -3593,7 +3597,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _or = _oc - _ol
                 if _op in _it_strict:
                     continue
-                if _it_is_urban and _oc >= 11.0:
+                if _it_is_urban and _oc >= _URBAN_MAX_TON:
                     continue
                 if (not _it_is_urban
                         and _session_routes.get(_op, "")
@@ -3665,7 +3669,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _or = _oc - _ol
                     if _op in _g_strict:
                         continue
-                    if _g_urban and _oc >= 11.0:
+                    if _g_urban and _oc >= _URBAN_MAX_TON:
                         continue
                     _op_sts = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
                     if _g_state and _op_sts and not any(_states_compatible(_g_state, s) for s in _op_sts):
@@ -4123,7 +4127,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _dr = _dc - _dl
                 if _dp in sess.get("unavailable", set()):
                     _rejections.append(f"{_dp}:UNAVAIL")
-                elif _dbg_urban and _dc >= 11.0:
+                elif _dbg_urban and _dc >= _URBAN_MAX_TON:
                     _rejections.append(f"{_dp}:TOO_LARGE")
                 elif _dp in _dbg_strict:
                     _rejections.append(f"{_dp}:STRICT")
@@ -4209,7 +4213,7 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
         for it in not_today_items:
             it["LORRY"] = None
 
-        # Seed session loads from already-assigned items
+        # Seed session loads AND lorry-state map from already-assigned items
         engine: LorryEngine = sess["engine"]
         _lorry_cap_map = {
             str(r["LORRY"]).strip().upper(): float(r["TON"])
@@ -4217,6 +4221,7 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
         }
         _session_loads: dict = {}
         _session_routes: dict = {}
+        _lorry_states: dict = {}   # plate → set of destination states (for boundary check)
         for _it in items:
             _pl = _it.get("LORRY")
             if _pl and _pl not in (None, "NO_LORRY", "NOT_TODAY", "OTHER_USER",
@@ -4224,8 +4229,11 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 _session_loads[_pl] = _session_loads.get(_pl, 0.0) + _it.get("WEIGHT", 0.0)
                 if _pl not in _session_routes:
                     _session_routes[_pl] = _it.get("ROUTE", "")
+                _it_state = _it.get("STATE", "").strip().upper()
+                if _it_state:
+                    _lorry_states.setdefault(_pl, set()).add(_it_state)
 
-        # Assign grouped by route — use tightest-fit from engine.suggest()
+        # Assign grouped by route — apply same size and state-boundary rules as main assignment
         from collections import defaultdict as _dd
         _by_route: dict = _dd(list)
         for it in not_today_items:
@@ -4233,10 +4241,32 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
 
         for _route, _grp in _by_route.items():
             _total_w = sum(x["WEIGHT"] for x in _grp)
-            _excl = sess.get("unavailable", set()) | {
-                p for p, cap in _lorry_cap_map.items()
-                if cap - float(_session_loads.get(p, 0)) < _total_w
+            _grp_state = _grp[0].get("STATE", "").strip().upper()
+            _dest_grp_r = _classify_dest_group(_route, _grp_state)
+            _is_urban_r = _dest_grp_r in _DEST_URBAN_GROUPS
+
+            # State-boundary exclusion: don't assign a lorry already committed to a
+            # different (incompatible) state — e.g. W3826C on KL routes can't also do Pahang
+            _state_excl = {
+                p for p, sts in _lorry_states.items()
+                if sts and _grp_state
+                and _grp_state not in sts
+                and not _states_compatible(_grp_state, next(iter(sts)))
             }
+
+            # Size exclusion: urban (KL/Selangor) → <5T only; outstation → exclude vans
+            _size_excl = {
+                str(r["LORRY"]).strip().upper()
+                for _, r in engine.eligible_lorries.iterrows()
+                if (_is_urban_r and float(r["TON"]) >= _URBAN_MAX_TON)
+                or (not _is_urban_r and float(r["TON"]) < _DEST_MIN_TON.get(_dest_grp_r, 0.0))
+            }
+
+            _excl = (sess.get("unavailable", set())
+                     | _state_excl | _size_excl
+                     | {p for p, cap in _lorry_cap_map.items()
+                        if cap - float(_session_loads.get(p, 0)) < _total_w})
+
             _suggs = engine.suggest(route=_route, total_ton=_total_w,
                                     unavailable=_excl, top_n=1,
                                     today_date_str="")
@@ -4247,6 +4277,8 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + _total_w
                 if _chosen not in _session_routes:
                     _session_routes[_chosen] = _route
+                if _grp_state:
+                    _lorry_states.setdefault(_chosen, set()).add(_grp_state)
             else:
                 for _it in _grp:
                     _it["LORRY"] = "NO_LORRY"
