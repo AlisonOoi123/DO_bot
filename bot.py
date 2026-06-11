@@ -486,9 +486,11 @@ _DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
 # KV routes that go outstation (Rawang / Tanjung Malim direction):
 _DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
 
-# KL and Selangor urban routes: lorries must be STRICTLY < 5T (SMALL lorry only).
-# Medium (5–11T) and Large (≥11T) lorries cannot enter tight city streets.
-_URBAN_MAX_TON = 5.0
+# Rule: small lorries (≤5T) can ONLY serve KL/Selangor urban routes.
+# Outstation routes (PH, TR, NS, JH, PK…) require lorries >5T (medium or large).
+# Urban routes (KL/Selangor) accept any lorry size — weight-based best-fit selects
+# the right size based on gross weight.
+_OUTSTATION_MIN_TON = 5.001   # lorries with TON ≤ 5T excluded from outstation
 
 # Minimum lorry tonnage per destination group.
 # These are soft floors — lorries at or above this tonnage are eligible.
@@ -497,11 +499,11 @@ _URBAN_MAX_TON = 5.0
 # lorries will be chosen first for Kuantan/Pahang; BPE9788 (13.3T) only
 # gets used as fallback when all ≥14T lorries are full or excluded.
 _DEST_MIN_TON = {
-    "LARGE_LONG":  2.0,   # Outstation (Pahang/TR/JH/PK…): exclude vans only — weight-based sort handles lorry size
-    "MEDIUM_LONG": 2.0,   # NS/Seremban/regional: exclude vans only — weight-based sort handles lorry size
-    "KL":          0.0,   # Kuala Lumpur urban — no lower bound
-    "SELANGOR":    0.0,   # Selangor — no lower bound
-    "KL_SELANGOR": 0.0,   # fallback urban — no lower bound
+    "LARGE_LONG":  5.001, # Outstation (Pahang/TR/JH/PK…): small lorries (≤5T) forbidden
+    "MEDIUM_LONG": 5.001, # NS/Seremban/regional: small lorries (≤5T) forbidden
+    "KL":          0.0,   # Kuala Lumpur urban — no lower bound (any size allowed)
+    "SELANGOR":    0.0,   # Selangor — no lower bound (any size allowed)
+    "KL_SELANGOR": 0.0,   # fallback urban — no lower bound (any size allowed)
 }
 # Groups that use urban (<11T) lorries only
 _DEST_URBAN_GROUPS = {"KL", "SELANGOR", "KL_SELANGOR"}
@@ -3087,14 +3089,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # Also build destination-group rules here so preferred check is consistent
                 # with open assignment: urban routes (KL/Selangor) must use <11T lorries.
                 _pref_dest_min = _DEST_MIN_TON.get(_dest_grp, 0.0)
-                _pref_urban    = _dest_grp in _DEST_URBAN_GROUPS
                 _pref_avail = [
                     p for p in _preferred
                     if p in _lorry_cap_map
                     and p not in _hard_excl
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                     and float(_lorry_cap_map.get(p, 0)) >= _pref_dest_min
-                    and not (_pref_urban and float(_lorry_cap_map.get(p, 0)) >= _URBAN_MAX_TON)
                 ]
                 if _pref_avail:
                     # Among available preferred lorries pick the tightest fit.
@@ -3114,7 +3114,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if str(r["LORRY"]).strip().upper() not in (sess["unavailable"] | get_assigned_today() | _strict_excl | _state_excl)
                         and _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp) - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0)) >= total_w
                         and float(r["TON"]) >= _pref_dest_min
-                        and not (_pref_urban and float(r["TON"]) >= _URBAN_MAX_TON)
                     ]
                     _best_fleet_surplus = min(_all_eligible_surplus) if _all_eligible_surplus else _pref_surplus
 
@@ -3142,22 +3141,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) < _dest_min_t
                 }
-            # Exclude oversized lorries (≥11T) for KL/Selangor urban routes —
-            # UNLESS the route's designated preferred lorries are all large
-            # (e.g. KV20A→BPE9788 13T handles a heavy SE corridor run, not a
-            # tight-street shophouse route — must not be blocked by urban cap).
-            _pref_all_large = (
-                bool(_preferred)
-                and all(_lorry_cap_map.get(p, 0) >= 11.0
-                        for p in _preferred if p in _lorry_cap_map)
-            )
-            if _dest_grp in _DEST_URBAN_GROUPS and not _pref_all_large:
-                excluded = excluded | {
-                    str(r["LORRY"]).strip().upper()
-                    for _, r in engine.eligible_lorries.iterrows()
-                    if float(r["TON"]) >= _URBAN_MAX_TON
-                }
-
             # ── Tiny-item route guard ─────────────────────────────────────────
             # Routes with very small average DO weight (e.g. KV11A ~46 kg each)
             # must use a van or small lorry — a 14T truck cannot park in those
@@ -3549,9 +3532,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 if _fp in _it_strict:
                     continue
-                # Urban↔outstation guard
-                if _it_is_urban and _fp_cap >= _URBAN_MAX_TON:
-                    continue
+                # Urban↔outstation guard: outstation lorries must not serve urban and vice versa
                 if (not _it_is_urban
                         and _session_routes.get(_fp, "")
                         and _classify_dest_group(_session_routes.get(_fp, "")) in _DEST_URBAN_GROUPS):
@@ -3596,8 +3577,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _ol = float(_session_loads.get(_op, 0))
                 _or = _oc - _ol
                 if _op in _it_strict:
-                    continue
-                if _it_is_urban and _oc >= _URBAN_MAX_TON:
                     continue
                 if (not _it_is_urban
                         and _session_routes.get(_op, "")
@@ -3668,8 +3647,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _ol = float(_session_loads.get(_op, 0))
                     _or = _oc - _ol
                     if _op in _g_strict:
-                        continue
-                    if _g_urban and _oc >= _URBAN_MAX_TON:
                         continue
                     _op_sts = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
                     if _g_state and _op_sts and not any(_states_compatible(_g_state, s) for s in _op_sts):
@@ -4127,8 +4104,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _dr = _dc - _dl
                 if _dp in sess.get("unavailable", set()):
                     _rejections.append(f"{_dp}:UNAVAIL")
-                elif _dbg_urban and _dc >= _URBAN_MAX_TON:
-                    _rejections.append(f"{_dp}:TOO_LARGE")
+                elif not _dbg_urban and _dc < _DEST_MIN_TON.get(_classify_dest_group(_dbg_route), 0.0):
+                    _rejections.append(f"{_dp}:TOO_SMALL_OUTSTATION")
                 elif _dp in _dbg_strict:
                     _rejections.append(f"{_dp}:STRICT")
                 elif _dr < _dbg_w and (_dr + 1.0) < _dbg_w:
@@ -4254,12 +4231,11 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 and not _states_compatible(_grp_state, next(iter(sts)))
             }
 
-            # Size exclusion: urban (KL/Selangor) → <5T only; outstation → exclude vans
+            # Size exclusion: outstation → exclude small lorries (≤5T); urban → no upper cap
             _size_excl = {
                 str(r["LORRY"]).strip().upper()
                 for _, r in engine.eligible_lorries.iterrows()
-                if (_is_urban_r and float(r["TON"]) >= _URBAN_MAX_TON)
-                or (not _is_urban_r and float(r["TON"]) < _DEST_MIN_TON.get(_dest_grp_r, 0.0))
+                if (not _is_urban_r and float(r["TON"]) < _DEST_MIN_TON.get(_dest_grp_r, 0.0))
             }
 
             _excl = (sess.get("unavailable", set())

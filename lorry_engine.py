@@ -852,16 +852,14 @@ class LorryEngine:
             _haversine_km(_DEPOT[0], _DEPOT[1], _centroid[0], _centroid[1])
             if _centroid else 0.0
         )
-        # Exclude vans (<2T) for any route >50 km — vans are city-only.
-        # No other size minimum: weight-based sort (SURPLUS ascending) picks the
-        # smallest lorry whose LORRY NAIK (5%) fits the load — maximises utilization.
-        # Formerly had 11T/14T minimums for long-haul but those forced small loads
-        # (e.g. 1.6T to Terengganu) onto 14T lorries at <12% utilization.
-        _VAN_MAX_TON = 2.0
+        # Outstation routes (>50 km): exclude small lorries (≤5T) and vans.
+        # Small lorries (≤5T) can ONLY serve KL/Selangor urban routes.
+        # Urban routes (<50 km): no size cap — weight-based sort picks smallest fit.
+        _OUTSTATION_MIN_TON = 5.001
         if _route_dist_km >= 50.0:
-            _no_van = merged[merged["TON"] >= _VAN_MAX_TON]
-            if not _no_van.empty:
-                merged = _no_van
+            _no_small = merged[merged["TON"] >= _OUTSTATION_MIN_TON]
+            if not _no_small.empty:
+                merged = _no_small
 
         # Weight-based best-fit: smallest lorry that fits = highest utilization.
         # SURPLUS ascending = tightest fit. History/owner are tiebreakers only.
