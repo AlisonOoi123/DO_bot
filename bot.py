@@ -94,7 +94,7 @@ def _resolve_state(state_raw: str, city_raw: str) -> str:
 def _load_user_route_prefixes(user: str) -> set | None:
     """Return the set of route-code prefixes assigned to *user* by reading
     the '{USER} ROUTE' sheet from LORRY_DAILY_PLANNING.xlsx.
-    The sheet's third column (Unnamed: 2) holds the full route string.
+    Scans all columns for route-like strings (robust to column layout changes).
     Returns None if the file/sheet doesn't exist (no filtering applied).
     """
     if not os.path.exists(PLANNING_PATH):
@@ -103,13 +103,14 @@ def _load_user_route_prefixes(user: str) -> set | None:
         u = user.strip().upper()
         sheet_name = f"{u} ROUTE"   # e.g. "ABI ROUTE" or "VIVIAN ROUTE"
         df = pd.read_excel(PLANNING_PATH, sheet_name=sheet_name, header=None)
-        # Route strings are in the 3rd column (index 2); skip header rows
-        route_col = df.iloc[:, 2].dropna().astype(str)
         prefixes: set[str] = set()
-        for route in route_col:
-            m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', route.strip())
-            if m:
-                prefixes.add(m.group(1).upper())
+        # Scan every cell — route strings start with a code like KV01A, PH09, NS04
+        _route_pat = re.compile(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)')
+        for col_idx in range(df.shape[1]):
+            for val in df.iloc[:, col_idx].dropna().astype(str):
+                m = _route_pat.match(val.strip())
+                if m:
+                    prefixes.add(m.group(1).upper())
         return prefixes if prefixes else None
     except Exception:
         return None
