@@ -852,24 +852,19 @@ class LorryEngine:
             _haversine_km(_DEPOT[0], _DEPOT[1], _centroid[0], _centroid[1])
             if _centroid else 0.0
         )
-        ULTRA_LONG_HAUL_KM       = 200.0
-        LONG_HAUL_KM             = 100.0
-        _ULTRA_LONG_HAUL_MIN_TON = 14.0  # ≥14T (large) for cross-state runs (>200 km, e.g. Kuantan/Pahang)
-        _LONG_HAUL_MIN_TON       = 11.0  # ≥11T (medium+) for regional runs (100–200 km, e.g. Seremban/T.Malim)
-
-        if _route_dist_km >= ULTRA_LONG_HAUL_KM:
-            _lh_big = merged[merged["TON"] >= _ULTRA_LONG_HAUL_MIN_TON]
-            if not _lh_big.empty:
-                merged = _lh_big
-        elif _route_dist_km >= LONG_HAUL_KM:
-            _lh_big = merged[merged["TON"] >= _LONG_HAUL_MIN_TON]
-            if not _lh_big.empty:
-                merged = _lh_big
+        # Exclude vans (<2T) for any route >50 km — vans are city-only.
+        # No other size minimum: weight-based sort (SURPLUS ascending) picks the
+        # smallest lorry whose LORRY NAIK (5%) fits the load — maximises utilization.
+        # Formerly had 11T/14T minimums for long-haul but those forced small loads
+        # (e.g. 1.6T to Terengganu) onto 14T lorries at <12% utilization.
+        _VAN_MAX_TON = 2.0
+        if _route_dist_km >= 50.0:
+            _no_van = merged[merged["TON"] >= _VAN_MAX_TON]
+            if not _no_van.empty:
+                merged = _no_van
 
         # Weight-based best-fit: smallest lorry that fits = highest utilization.
         # SURPLUS ascending = tightest fit. History/owner are tiebreakers only.
-        # No tiering — tiering previously selected already-busy (oversized) lorries
-        # over a smaller lorry that would achieve higher utilization for this load.
         _sort_cols = ["SURPLUS", "IS_OWNER", "CUST_FREQ", "CLUSTER_FREQ", "ROUTE_FREQ"]
         _sort_asc  = [True,      False,      False,       False,          False]
         merged = merged.sort_values(_sort_cols, ascending=_sort_asc).reset_index(drop=True)

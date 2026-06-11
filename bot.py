@@ -480,11 +480,11 @@ _DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
 # lorries will be chosen first for Kuantan/Pahang; BPE9788 (13.3T) only
 # gets used as fallback when all ≥14T lorries are full or excluded.
 _DEST_MIN_TON = {
-    "LARGE_LONG":  11.0,   # ≥11T; engine prefers ≥14T for >200km routes
-    "MEDIUM_LONG": 10.5,   # ≥10.5T; covers BQX9983 (10.8T) for NS/Seremban
-    "KL":           0.0,   # Kuala Lumpur urban — <11T, no lower bound
-    "SELANGOR":     0.0,   # Selangor — <11T, no lower bound
-    "KL_SELANGOR":  0.0,   # fallback urban — <11T
+    "LARGE_LONG":  2.0,   # Outstation (Pahang/TR/JH/PK…): exclude vans only — weight-based sort handles lorry size
+    "MEDIUM_LONG": 2.0,   # NS/Seremban/regional: exclude vans only — weight-based sort handles lorry size
+    "KL":          0.0,   # Kuala Lumpur urban — no lower bound
+    "SELANGOR":    0.0,   # Selangor — no lower bound
+    "KL_SELANGOR": 0.0,   # fallback urban — no lower bound
 }
 # Groups that use urban (<11T) lorries only
 _DEST_URBAN_GROUPS = {"KL", "SELANGOR", "KL_SELANGOR"}
