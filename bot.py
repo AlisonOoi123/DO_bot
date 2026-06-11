@@ -445,10 +445,14 @@ def _load_schedule(user: str) -> dict[int, set[str]]:
 
 
 def _scheduled_prefixes_for_upload(user: str, trip_day: str = "today") -> set[str] | None:
-    """Return the set of route prefixes that should be assigned for this upload.
+    """Return route prefixes scheduled for the target day (today or tomorrow).
 
-    trip_day: "today" or "tomorrow" — set explicitly by the user at login.
-    Returns None if no schedule found (skip filtering entirely).
+    These come from the SCHD(abi/vivian) sheet's day column — only routes
+    explicitly scheduled for that weekday are returned.  Routes that belong
+    to the user but are on a different day are left for the YES/NO prompt
+    (_not_today_count in the upload handler).
+
+    Returns None if no schedule found (skip day-filtering entirely).
     """
     schedule = _load_schedule(user)
     if not schedule:
@@ -458,18 +462,11 @@ def _scheduled_prefixes_for_upload(user: str, trip_day: str = "today") -> set[st
     target_date = datetime.now().date()
     if trip_day == "tomorrow":
         target_date += _timedelta(days=1)
-        # Skip weekends
         while target_date.weekday() >= 5:
             target_date += _timedelta(days=1)
 
-    # Return ALL routes the user owns (union across every day column).
-    # The SCHD sheet defines which routes belong to this user; the day columns
-    # are informational (weekly cadence). Every uploaded item on any of the
-    # user's routes gets assigned — backlog from previous days is included.
-    all_prefixes: set[str] = set()
-    for day_set in schedule.values():
-        all_prefixes |= day_set
-    return all_prefixes if all_prefixes else set()
+    target_wd = target_date.weekday()   # 0=Mon … 6=Sun
+    return schedule.get(target_wd, set())
 
 
 def _extract_route_prefix(route: str) -> str:
