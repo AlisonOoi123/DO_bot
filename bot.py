@@ -465,8 +465,8 @@ def _extract_route_prefix(route: str) -> str:
 # ── Destination state classification ─────────────────────────────────────────
 # Maps route-code prefix (2-char cluster) to destination group.
 # Groups drive minimum lorry size:
-#   LARGE_LONG  (≥14T) — Pahang, Kuantan, Terengganu, Kelantan, Johor, Perak, etc.
-#   MEDIUM_LONG (≥11T) — Rawang, Tanjung Malim, Kemaman, Port Dickson, Seremban/NS
+#   LARGE_LONG  — Pahang, Kuantan, Terengganu, Kelantan, Johor, Perak, etc. (LARGE lorry preferred)
+#   MEDIUM_LONG — Rawang, Tanjung Malim, Kemaman, Port Dickson, Seremban/NS
 #   KL_SELANGOR (<11T) — All KV routes (Klang Valley urban)
 _DEST_LARGE_LONG_CLUSTERS  = {"PH", "TR", "KB", "JH", "PK", "KD", "PN", "MC", "SB", "SR"}
 _DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
@@ -2967,13 +2967,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
             sess["unavailable"].update(broken_map.keys())
 
             # ── Effective-capacity helper (accounts for 2-trip local runs) ─────
-            # LARGE lorries (≥14T): hard cap — outstation runs take the full day.
-            # MEDIUM lorries (11–14T) on LOCAL routes: 2 trips (morning + afternoon).
-            # SMALL lorries (<11T) on LOCAL routes: 2 trips.
+            # LARGE lorries (≥11T): hard cap — outstation runs take the full day.
+            # MEDIUM/SMALL lorries on LOCAL routes: 2 trips (morning + afternoon).
             # Any lorry on OUTSTATION routes: hard cap (1 trip).
             def _eff_cap_for(plate: str, grp_dest: str) -> float:
                 cap = float(_lorry_cap_map.get(plate, 0.0))
-                if cap >= 14.0:
+                if cap >= 11.0:
                     return cap   # large lorries never double-trip
                 lorry_dest = _classify_dest_group(
                     _session_routes.get(plate, ""))
@@ -3711,7 +3710,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # heavier than A's (so A's utilisation improves after taking B's items).
         # Pick the swap with the biggest waste reduction each round; repeat
         # until no improving swap remains.
-        _LARGE_T = 10.0
+        _LARGE_T = 11.0
         _pit: dict[str, list] = {}
         for _it in items:
             _pl = _it.get("LORRY")
@@ -4688,23 +4687,23 @@ def _build_summary(sess) -> str:
         cap     = cap_map.get(plate)
 
         if cap and cap > 0:
-            # Lorry size class label
-            if cap >= 14.0:
+            # Lorry size class label (LARGE ≥11T, MEDIUM 5–11T, SMALL 2–5T, VAN <2T)
+            if cap >= 11.0:
                 _size_tag = "LARGE"
-            elif cap >= 11.0:
+            elif cap >= 5.0:
                 _size_tag = "MEDIUM"
             elif cap >= 2.0:
                 _size_tag = "SMALL"
             else:
                 _size_tag = "VAN"
 
-            # Trip display: LARGE (≥14T) never splits; MEDIUM/SMALL on LOCAL routes may split.
+            # Trip display: LARGE (≥11T) never splits; MEDIUM/SMALL on LOCAL routes may split.
             _trip_info = ""
             _all_local_its = all(
                 _classify_dest_group(i.get("ROUTE", "")) in _DEST_URBAN_GROUPS
                 for i in its
             )
-            if cap < 14.0 and _all_local_its and total_w > cap * 1.02:
+            if cap < 11.0 and _all_local_its and total_w > cap * 1.02:
                 _t1w = round(cap, 1)
                 _t2w = round(total_w - cap, 3)
                 _trip_info = (f"  🌅Morning(T1):{_t1w}T"
@@ -5369,11 +5368,11 @@ def _export_result_inner(sess) -> list[str]:
                        if "GROSS WEIGHT" in out_df.columns and "WEIGHT(T)" not in out_df.columns
                        else float(_wt_raw or 0))
 
-                # LARGE lorries (≥14T): always TRIP 1 regardless of route
+                # LARGE lorries (≥11T): always TRIP 1 regardless of route
                 # MEDIUM/SMALL on LOCAL routes: allow TRIP 2 when capacity overflows
                 _can_trip2 = (
                     _cap_val > 0
-                    and _cap_val < 14.0       # not a large lorry
+                    and _cap_val < 11.0       # not a large lorry
                     and _lorry_all_local      # only local (KV) routes
                     and _cum_w + _wt > _cap_val * 1.02
                 )
