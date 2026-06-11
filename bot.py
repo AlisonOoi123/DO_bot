@@ -2325,7 +2325,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             )
             if _not_today_count:
                 _sched_notice.append(
-                    f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s route list — left unassigned (different user's routes)."
+                    f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s route list — left unassigned."
                 )
 
         sess["items"]      = items          # row-level item list
@@ -4053,8 +4053,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
         total_items = len(my_items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
         if _other_user_count:
-            # Store info for the follow-up prompt; ask user whether to assign those too
-            sess["other_user_pending_count"] = _other_user_count
+            # Cross-user DOs: always blank, no prompt, just inform
+            header += f"\n📌 _{_other_user_count} DO(s) from another user's routes — left blank (cross-user assignment not allowed)._"
+        if _not_today_count:
+            # User's own DOs not on today's schedule — ask if they want to assign anyway
+            sess["not_today_pending_count"] = _not_today_count
             sess["state"] = "AWAIT_OTHER_USER_REPLY"
         if _sched_notice:
             header += "\n" + "\n".join(_sched_notice)
@@ -4177,12 +4180,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
         result_msgs = ([header + "\n\n" + _summ[0]] + _summ[1:]
                        if isinstance(_summ, list) else [header + "\n\n" + _summ])
 
-        # If other-user DOs were found, append a question asking what to do with them
+        # If user's own off-schedule DOs were found, ask if they want to assign them
         if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
-            _ou_count = sess.get("other_user_pending_count", 0)
+            _nt_count = sess.get("not_today_pending_count", 0)
             result_msgs.append(
-                f"📌 *{_ou_count} DO(s) from another user's routes* were found in this file and left blank.\n"
-                f"Do you want to assign those too? Reply *YES* to assign them, or *NO* to leave them blank."
+                f"⏭ *{_nt_count} of your DO(s) are not on today's route schedule* and were left blank.\n"
+                f"Do you want to assign them anyway? Reply *YES* to assign, or *NO* to leave them blank."
             )
         return result_msgs
 
@@ -4191,68 +4194,78 @@ def _handle_excel_upload(phone, sess, file_bytes):
         return [f"❌ Failed to read the Excel file: {e}\nPlease re-upload."]
 
 def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
-    """Handle user's YES/NO reply about assigning other-user DOs."""
+    """Handle user's YES/NO reply about assigning their own off-schedule DOs.
+
+    These are the user's OWN routes (correct user) but not on today's schedule.
+    Cross-user assignment (another user's routes) is never allowed here.
+    """
     reply = text.strip().upper()
     if reply in ("YES", "YA", "Y", "OK", "OKAY"):
-        # Re-assign OTHER_USER items using the full fleet (all_lorries, not just owner's)
         items = sess.get("items", [])
-        other_items = [it for it in items if it.get("LORRY") == "OTHER_USER"]
-        if not other_items:
+        # Only touch NOT_TODAY items — these are the logged-in user's own routes
+        not_today_items = [it for it in items if it.get("LORRY") == "NOT_TODAY"]
+        if not not_today_items:
             sess["state"] = "CONFIRMING"
-            return ["No other-user items found. Proceeding to assignment summary."] + [_build_summary(sess)]
+            return ["No off-schedule items found."] + [_build_summary(sess)]
 
-        engine: LorryEngine = sess["engine"]
-        # Temporarily expand eligible lorries to include ALL lorries (both users)
-        _orig_eligible = engine.eligible_lorries
-        engine.eligible_lorries = engine.all_lorries.copy()
-
-        # Clear OTHER_USER marker so items are treated as unassigned
-        for it in other_items:
+        # Clear NOT_TODAY so they participate in normal assignment
+        for it in not_today_items:
             it["LORRY"] = None
 
-        # Re-run assignment for just these items
-        _assign_group = sess.get("_assign_group_fn")
-        if _assign_group:
-            try:
-                _assign_group(other_items)
-            except Exception:
-                pass
-        else:
-            # Fallback: use engine.suggest for each group by route
-            _session_loads: dict  = sess.get("session_loads", {})
-            _session_routes: dict = sess.get("session_routes", {})
-            from collections import defaultdict as _dd
-            _by_route: dict = _dd(list)
-            for it in other_items:
-                _by_route[it.get("ROUTE", "")].append(it)
-            for _route, _grp in _by_route.items():
-                _total_w = sum(x["WEIGHT"] for x in _grp)
-                _excl = sess.get("unavailable", set())
-                _suggs = engine.suggest(route=_route, total_ton=_total_w,
-                                        unavailable=_excl, top_n=1,
-                                        today_date_str="")
-                if _suggs:
-                    _chosen = _suggs[0]["LORRY"]
-                    for _it in _grp:
-                        _it["LORRY"] = _chosen
-                    _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + _total_w
-                    if _chosen not in _session_routes:
-                        _session_routes[_chosen] = _route
+        # Re-run assignment using the existing session engine (same user's lorries)
+        engine: LorryEngine = sess["engine"]
+        _session_loads:  dict = {}
+        _session_routes: dict = {}
+        # Seed session loads from already-assigned items so lorries don't overflow
+        for _it in items:
+            _pl = _it.get("LORRY")
+            if _pl and _pl not in (None, "NO_LORRY", "NOT_TODAY", "OTHER_USER",
+                                   "SPLIT", "SKIPPED", "", "LOAD_BELOW_MIN_UTIL"):
+                _session_loads[_pl] = _session_loads.get(_pl, 0.0) + _it.get("WEIGHT", 0.0)
+                if _pl not in _session_routes:
+                    _session_routes[_pl] = _it.get("ROUTE", "")
 
-        # Restore original eligible lorries
-        engine.eligible_lorries = _orig_eligible
+        from collections import defaultdict as _dd
+        _by_route: dict = _dd(list)
+        for it in not_today_items:
+            _by_route[it.get("ROUTE", "")].append(it)
+
+        _lorry_cap_map = {
+            str(r["LORRY"]).strip().upper(): float(r["TON"])
+            for _, r in engine.eligible_lorries.iterrows()
+        }
+        _newly = 0
+        for _route, _grp in _by_route.items():
+            _total_w = sum(x["WEIGHT"] for x in _grp)
+            _excl = sess.get("unavailable", set()) | {
+                p for p, cap in _lorry_cap_map.items()
+                if cap - float(_session_loads.get(p, 0)) < _total_w
+            }
+            _suggs = engine.suggest(route=_route, total_ton=_total_w,
+                                    unavailable=_excl, top_n=1,
+                                    today_date_str="")
+            if _suggs:
+                _chosen = _suggs[0]["LORRY"]
+                for _it in _grp:
+                    _it["LORRY"] = _chosen
+                _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + _total_w
+                if _chosen not in _session_routes:
+                    _session_routes[_chosen] = _route
+                _newly += len(_grp)
+            else:
+                for _it in _grp:
+                    _it["LORRY"] = "NO_LORRY"
 
         sess["state"] = "CONFIRMING"
-        _newly = sum(1 for it in other_items if it.get("LORRY") not in (None, "NO_LORRY", "OTHER_USER", ""))
-        return [f"✅ Assigned {_newly} of {len(other_items)} other-user DO(s)."] + [_build_summary(sess)]
+        return [f"✅ Assigned {_newly} of {len(not_today_items)} off-schedule DO(s)."] + [_build_summary(sess)]
 
     elif reply in ("NO", "TIDAK", "SKIP", "N"):
         sess["state"] = "CONFIRMING"
-        _ou_count = sess.get("other_user_pending_count", 0)
-        return [f"OK, {_ou_count} DO(s) from other user's routes will be left blank."] + [_build_summary(sess)]
+        _nt_count = sess.get("not_today_pending_count", 0)
+        return [f"OK, {_nt_count} off-schedule DO(s) will be left blank."] + [_build_summary(sess)]
 
     return [
-        "Please reply *YES* to assign the other-user DOs, or *NO* to leave them blank."
+        "Please reply *YES* to assign the off-schedule DOs, or *NO* to leave them blank."
     ]
 
 
