@@ -4177,13 +4177,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
         result_msgs = ([header + "\n\n" + _summ[0]] + _summ[1:]
                        if isinstance(_summ, list) else [header + "\n\n" + _summ])
 
-        # If user's own off-schedule DOs were found, ask if they want to assign them
+        # If user's own off-schedule DOs were found:
+        # → ask the YES/NO question FIRST, WITHOUT the full summary.
+        # The summary + confirm buttons are shown AFTER the user answers.
         if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
             _nt_count = sess.get("not_today_pending_count", 0)
-            result_msgs.append(
+            return [
+                header,   # just the "X items assigned" line + schedule notice
                 f"⏭ *{_nt_count} of your DO(s) are not on today's route schedule* and were left blank.\n"
-                f"Do you want to assign them anyway? Reply *YES* to assign, or *NO* to leave them blank."
-            )
+                f"Do you want to assign them anyway? Reply *YES* to assign, or *NO* to leave them blank.",
+            ]
+
         return result_msgs
 
     except Exception as e:
@@ -4254,12 +4258,12 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                     _it["LORRY"] = "NO_LORRY"
 
         sess["state"] = "CONFIRMING"
-        return [f"✅ Assigned {_newly} of {len(not_today_items)} off-schedule DO(s)."] + [_build_summary(sess)]
+        # Show the full assignment summary + Confirm/Cancel buttons (no separate prefix message)
+        return _build_summary(sess)
 
     elif reply in ("NO", "TIDAK", "SKIP", "N"):
         sess["state"] = "CONFIRMING"
-        _nt_count = sess.get("not_today_pending_count", 0)
-        return [f"OK, {_nt_count} off-schedule DO(s) will be left blank."] + [_build_summary(sess)]
+        return _build_summary(sess)
 
     return [
         "Please reply *YES* to assign the off-schedule DOs, or *NO* to leave them blank."
@@ -4886,51 +4890,7 @@ def _build_summary(sess) -> str:
         ],
     })
 
-    # ── Change Assignment: DO picker ──────────────────────────────────────
-    do_items = []
-    for do in sess.get("pending_dos", []):
-        do_num     = do.get("DO NUMBER", "")
-        first_item = do.get("ITEMS", [{}])[0] if do.get("ITEMS") else {}
-        lorry      = first_item.get("LORRY", "")
-        if lorry == "SPLIT" and first_item.get("SPLIT_LORRIES"):
-            lorry = "+".join(b["lorry"] for b in (first_item.get("SPLIT_LORRIES") or []))
-        route = first_item.get("ROUTE", "")[:25]
-        if do_num:
-            status = "No lorry" if lorry in ("NO_LORRY", "", None) else lorry
-            do_items.append({
-                "id":          f"select_do {do_num}",
-                "title":       do_num[:24],
-                "description": f"{status} | {route}"[:72],
-            })
-    if do_items:
-        # Paginate: WhatsApp only supports 9 rows reliably in a single-section list.
-        # Show page from session; add "Next Page" row if more items exist.
-        PAGE       = 9
-        page       = sess.get("change_do_page", 0)
-        start      = page * PAGE
-        chunk      = do_items[start:start + PAGE]
-        has_more   = (start + PAGE) < len(do_items)
-        has_prev   = page > 0
-        if has_more:
-            chunk.append({
-                "id":          f"change_do_page {page + 1}",
-                "title":       "Next page...",
-                "description": f"Showing {start+1}-{start+PAGE} of {len(do_items)}",
-            })
-        elif has_prev:
-            chunk.append({
-                "id":          "change_do_page 0",
-                "title":       "Back to start",
-                "description": f"Page {page+1} of {((len(do_items)-1)//PAGE)+1}",
-            })
-        result.append({
-            "_type":  "do_list",
-            "header": "Change Assignment",
-            "body":   "Tap a DO# to pick a different lorry:",
-            "button": "Change DO",
-            "items":  chunk,
-        })
-
+    # Change Assignment (DO picker) is hidden for now.
     return result
 
 def _handle_confirming(phone, sess, text):
