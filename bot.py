@@ -162,6 +162,21 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
     if re.search(r'\bSETIAP\s+HARI\b|\bDAILY\b|\bEVERY\s+DAY\b', txt):
         return None
 
+    # Timing/logistics notes that are not day restrictions — always assign.
+    #   "NEXT DAY MUST DELIVER" — instruction to deliver next day, not a day filter
+    #   "SAME DAY DELIVERY"     — urgency note
+    #   "LUNCH TIME"            — time window note
+    #   "MORNING TRIP"          — trip timing note
+    #   "SMALL LORRY"           — lorry size suggestion (handled elsewhere)
+    if re.search(
+        r'\bNEXT\s+DAY\b|\bSAME\s+DAY\b|\bLUNCH\s+TIME\b'
+        r'|\bMORNING\s+TRIP\b|\bAFTERNOON\s+TRIP\b'
+        r'|\bSMALL\s+LORRY\b|\bBIG\s+LORRY\b|\bLARGE\s+LORRY\b'
+        r'|\bAM\s+FIRST\s+TRIP\b|\bPM\s+TRIP\b',
+        txt
+    ):
+        return None
+
     # Operational / informational remarks that mention days as context (not
     # delivery-day restrictions).  Examples:
     #   "LORRY OPERASI ISNIN-SABTU 4PM"  — lorry hours, not customer restriction
@@ -1274,7 +1289,7 @@ def handle_message(phone: str, text: str = None,
                 sess.setdefault("unavailable", set()).discard(p3)
         action_label = "released" if action == "RELEASE" else "marked as fixed"
         plates_str   = ", ".join(batch)
-        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
         follow_up = _build_summary(sess) if in_active else [{
             "_type": "buttons", "body": "Need anything else?",
             "buttons": [{"id": "lorry_maint", "title": "More Actions"},
@@ -1307,7 +1322,7 @@ def handle_message(phone: str, text: str = None,
         if action == "BLOCK":
             record_assignments_today([plate])
             sess.setdefault("unavailable", set()).add(plate)
-            in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+            in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
             follow_up = _build_summary(sess) if in_active else [{
                 "_type": "buttons", "body": "Need anything else?",
                 "buttons": [{"id": "lorry_maint", "title": "More Actions"},
@@ -1384,7 +1399,7 @@ def handle_message(phone: str, text: str = None,
             return [f"⚠️ *{plate}* is already blocked today."]
         sess.setdefault("unavailable", set()).add(plate)
         record_assignments_today([plate])
-        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
         follow_up = _build_summary(sess) if in_active else [_HI_BTN]
         return [f"🚫 *{plate}* blocked for today."] + follow_up
 
@@ -1397,7 +1412,7 @@ def handle_message(phone: str, text: str = None,
             hint  = f"\nDid you mean *{close}*?" if close else ""
             return [f"⚠️ *{plate}* not found in master list.{hint}"]
         released = release_specific_plates([plate])
-        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
         follow_up = _build_summary(sess) if in_active else [_HI_BTN]
         if released:
             sess.setdefault("unavailable", set()).discard(plate)
@@ -1406,7 +1421,7 @@ def handle_message(phone: str, text: str = None,
 
     if text.lower().startswith("select_fixed_lorry "):
         plate = text.split(" ", 1)[1].strip().upper()
-        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
         follow_up = _build_summary(sess) if in_active else [_HI_BTN]
         if remove_broken_lorry(plate):
             sess.setdefault("unavailable", set()).discard(plate)
@@ -1423,7 +1438,7 @@ def handle_message(phone: str, text: str = None,
         sess.setdefault("unavailable", set()).add(broken_plate)
         sess.pop("pending_broken_plate", None)
         rep_str = f"replaced by *{replace_plate}*" if replace_plate != "NONE" else "no replacement"
-        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING") and sess.get("pending_dos")
+        in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
         follow_up = _build_summary(sess) if in_active else [_HI_BTN]
         return [
             f"🔧 *Breakdown logged:*\n"
@@ -1541,7 +1556,7 @@ def handle_message(phone: str, text: str = None,
 
         # ── Re-evaluate active DOs against the newly released lorry(s) ──────────
         reassigned = []
-        active_states = ("CONFIRMING", "REVIEWING")
+        active_states = ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY")
         if released and engine and sess.get("state") in active_states and sess.get("pending_dos"):
             taken = (sess["unavailable"] | get_assigned_today()) - set(released)
             for do in sess["pending_dos"]:
@@ -1767,6 +1782,8 @@ def handle_message(phone: str, text: str = None,
         if file_bytes:
             return _handle_excel_upload(phone, sess, file_bytes)
         return ["Please upload the DO Excel file (.xlsx) to continue."]
+    elif state == "AWAIT_OTHER_USER_REPLY":
+        return _handle_other_user_reply(phone, sess, text)
     elif state in ("REVIEWING", "CONFIRMING"):
         # Allow lorry-status file upload at any point during an active session
         if file_bytes:
@@ -3065,11 +3082,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # committed to a different destination state.
                 _hard_excl = (sess["unavailable"] | get_assigned_today()
                                | _strict_excl | _state_excl)
+                # Also build destination-group rules here so preferred check is consistent
+                # with open assignment: urban routes (KL/Selangor) must use <11T lorries.
+                _pref_dest_min = _DEST_MIN_TON.get(_dest_grp, 0.0)
+                _pref_urban    = _dest_grp in _DEST_URBAN_GROUPS
                 _pref_avail = [
                     p for p in _preferred
                     if p in _lorry_cap_map
                     and p not in _hard_excl
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
+                    and float(_lorry_cap_map.get(p, 0)) >= _pref_dest_min
+                    and not (_pref_urban and float(_lorry_cap_map.get(p, 0)) >= 11.0)
                 ]
                 if _pref_avail:
                     # Among available preferred lorries pick the tightest fit.
@@ -3088,6 +3111,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         for _, r in engine.eligible_lorries.iterrows()
                         if str(r["LORRY"]).strip().upper() not in (sess["unavailable"] | get_assigned_today() | _strict_excl | _state_excl)
                         and _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp) - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0)) >= total_w
+                        and float(r["TON"]) >= _pref_dest_min
+                        and not (_pref_urban and float(r["TON"]) >= 11.0)
                     ]
                     _best_fleet_surplus = min(_all_eligible_surplus) if _all_eligible_surplus else _pref_surplus
 
@@ -4028,7 +4053,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
         total_items = len(my_items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
         if _other_user_count:
-            header += f"\n📌 _{_other_user_count} row(s) from other users' routes left blank — only your route codes were assigned._"
+            # Store info for the follow-up prompt; ask user whether to assign those too
+            sess["other_user_pending_count"] = _other_user_count
+            sess["state"] = "AWAIT_OTHER_USER_REPLY"
         if _sched_notice:
             header += "\n" + "\n".join(_sched_notice)
 
@@ -4147,13 +4174,87 @@ def _handle_excel_upload(phone, sess, file_bytes):
             )
 
         _summ = _build_summary(sess)
-        if isinstance(_summ, list):
-            return [header + "\n\n" + _summ[0]] + _summ[1:]
-        return [header + "\n\n" + _summ]
+        result_msgs = ([header + "\n\n" + _summ[0]] + _summ[1:]
+                       if isinstance(_summ, list) else [header + "\n\n" + _summ])
+
+        # If other-user DOs were found, append a question asking what to do with them
+        if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
+            _ou_count = sess.get("other_user_pending_count", 0)
+            result_msgs.append(
+                f"📌 *{_ou_count} DO(s) from another user's routes* were found in this file and left blank.\n"
+                f"Do you want to assign those too? Reply *YES* to assign them, or *NO* to leave them blank."
+            )
+        return result_msgs
 
     except Exception as e:
         import traceback
         return [f"❌ Failed to read the Excel file: {e}\nPlease re-upload."]
+
+def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
+    """Handle user's YES/NO reply about assigning other-user DOs."""
+    reply = text.strip().upper()
+    if reply in ("YES", "YA", "Y", "OK", "OKAY"):
+        # Re-assign OTHER_USER items using the full fleet (all_lorries, not just owner's)
+        items = sess.get("items", [])
+        other_items = [it for it in items if it.get("LORRY") == "OTHER_USER"]
+        if not other_items:
+            sess["state"] = "CONFIRMING"
+            return ["No other-user items found. Proceeding to assignment summary."] + [_build_summary(sess)]
+
+        engine: LorryEngine = sess["engine"]
+        # Temporarily expand eligible lorries to include ALL lorries (both users)
+        _orig_eligible = engine.eligible_lorries
+        engine.eligible_lorries = engine.all_lorries.copy()
+
+        # Clear OTHER_USER marker so items are treated as unassigned
+        for it in other_items:
+            it["LORRY"] = None
+
+        # Re-run assignment for just these items
+        _assign_group = sess.get("_assign_group_fn")
+        if _assign_group:
+            try:
+                _assign_group(other_items)
+            except Exception:
+                pass
+        else:
+            # Fallback: use engine.suggest for each group by route
+            _session_loads: dict  = sess.get("session_loads", {})
+            _session_routes: dict = sess.get("session_routes", {})
+            from collections import defaultdict as _dd
+            _by_route: dict = _dd(list)
+            for it in other_items:
+                _by_route[it.get("ROUTE", "")].append(it)
+            for _route, _grp in _by_route.items():
+                _total_w = sum(x["WEIGHT"] for x in _grp)
+                _excl = sess.get("unavailable", set())
+                _suggs = engine.suggest(route=_route, total_ton=_total_w,
+                                        unavailable=_excl, top_n=1,
+                                        today_date_str="")
+                if _suggs:
+                    _chosen = _suggs[0]["LORRY"]
+                    for _it in _grp:
+                        _it["LORRY"] = _chosen
+                    _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + _total_w
+                    if _chosen not in _session_routes:
+                        _session_routes[_chosen] = _route
+
+        # Restore original eligible lorries
+        engine.eligible_lorries = _orig_eligible
+
+        sess["state"] = "CONFIRMING"
+        _newly = sum(1 for it in other_items if it.get("LORRY") not in (None, "NO_LORRY", "OTHER_USER", ""))
+        return [f"✅ Assigned {_newly} of {len(other_items)} other-user DO(s)."] + [_build_summary(sess)]
+
+    elif reply in ("NO", "TIDAK", "SKIP", "N"):
+        sess["state"] = "CONFIRMING"
+        _ou_count = sess.get("other_user_pending_count", 0)
+        return [f"OK, {_ou_count} DO(s) from other user's routes will be left blank."] + [_build_summary(sess)]
+
+    return [
+        "Please reply *YES* to assign the other-user DOs, or *NO* to leave them blank."
+    ]
+
 
 def _suggest_current(sess) -> list[str]:
     idx = sess["current_do_index"]
