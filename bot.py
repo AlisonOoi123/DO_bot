@@ -2895,8 +2895,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
             earliest = min(dates) if dates else "9999-12-31"
             return (dest_pri, earliest, -sum(it["WEIGHT"] for it in g))
 
-        # Destination-priority-first, then date, then heaviest
+        # Destination-priority-first, then earliest date, then heaviest.
+        # Within each group, sort items by date so earliest DOs get the first
+        # lorry when capacity forces a split.
         sorted_groups.sort(key=_group_sort_key)
+        for _grp in sorted_groups:
+            _grp.sort(key=lambda it: _parse_date_sortkey(it.get("DATE", "")))
 
         # Session-level capacity tracker so groups can share a lorry when combined
         # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
@@ -2967,22 +2971,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if row["LORRY"] not in _excl_check
                 )
                 if not any(c >= _pre_total_w for c in _avail_caps):
-                    # Too heavy for any single lorry — split by proximity to HQ.
-                    # Nearest DOs load onto the first lorry (first round); the
-                    # remaining DOs go on a second lorry (second round).  This
-                    # ensures the driver can complete the closer deliveries even
-                    # if the full group cannot be handled in one trip.
-                    def _item_dist_hq(it):
-                        c = _route_centroid(it["ROUTE"])
-                        if c is None:
-                            return float("inf")
-                        return _haversine_km(_DEPOT[0], _DEPOT[1], c[0], c[1])
-
-                    _sorted_by_dist = sorted(group_items, key=_item_dist_hq)
+                    # Too heavy for any single lorry — split by DATE (earliest
+                    # DOs get the first lorry so older orders always ship first).
+                    # group_items is already date-sorted from the pre-sort above.
                     _cap1 = max(_avail_caps) if _avail_caps else 0
                     half_a, half_b = [], []
                     _fill_w = 0.0
-                    for _it in _sorted_by_dist:
+                    for _it in group_items:   # already sorted earliest-first
                         if _fill_w + _it["WEIGHT"] <= _cap1:
                             half_a.append(_it)
                             _fill_w += _it["WEIGHT"]
@@ -3414,6 +3409,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Preferred lorries are tried FIRST but if all are full/unavailable, any
         # eligible lorry is used — the DO must ship.
         _excl_consol = sess["unavailable"] | get_assigned_today()
+
+        # Sort unassigned items by date so consolidation assigns oldest DOs first.
+        # Items already assigned keep their position; stable sort preserves relative
+        # order within the same date.
+        items.sort(key=lambda it: (
+            _parse_date_sortkey(it.get("DATE", ""))
+            if it.get("LORRY") in (None, "NO_LORRY") else ""
+        ))
 
         # Pre-build lorry→assigned-states map for state boundary checks
         _consol_lorry_states: dict[str, set] = {}
