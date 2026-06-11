@@ -4195,29 +4195,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
         return [f"❌ Failed to read the Excel file: {e}\nPlease re-upload."]
 
 def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
-    """Handle user's YES/NO reply about assigning their own off-schedule DOs.
-
-    These are the user's OWN routes (correct user) but not on today's schedule.
-    Cross-user assignment (another user's routes) is never allowed here.
-    """
+    """Handle user's YES/NO reply about assigning their own off-schedule DOs."""
     reply = text.strip().upper()
     if reply in ("YES", "YA", "Y", "OK", "OKAY"):
         items = sess.get("items", [])
-        # Only touch NOT_TODAY items — these are the logged-in user's own routes
         not_today_items = [it for it in items if it.get("LORRY") == "NOT_TODAY"]
         if not not_today_items:
             sess["state"] = "CONFIRMING"
-            return ["No off-schedule items found."] + [_build_summary(sess)]
+            return _build_summary(sess)
 
-        # Clear NOT_TODAY so they participate in normal assignment
+        # Clear NOT_TODAY marker so items are treated as unassigned
         for it in not_today_items:
             it["LORRY"] = None
 
-        # Re-run assignment using the existing session engine (same user's lorries)
+        # Seed session loads from already-assigned items
         engine: LorryEngine = sess["engine"]
-        _session_loads:  dict = {}
+        _lorry_cap_map = {
+            str(r["LORRY"]).strip().upper(): float(r["TON"])
+            for _, r in engine.eligible_lorries.iterrows()
+        }
+        _session_loads: dict = {}
         _session_routes: dict = {}
-        # Seed session loads from already-assigned items so lorries don't overflow
         for _it in items:
             _pl = _it.get("LORRY")
             if _pl and _pl not in (None, "NO_LORRY", "NOT_TODAY", "OTHER_USER",
@@ -4226,16 +4224,12 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 if _pl not in _session_routes:
                     _session_routes[_pl] = _it.get("ROUTE", "")
 
+        # Assign grouped by route — use tightest-fit from engine.suggest()
         from collections import defaultdict as _dd
         _by_route: dict = _dd(list)
         for it in not_today_items:
             _by_route[it.get("ROUTE", "")].append(it)
 
-        _lorry_cap_map = {
-            str(r["LORRY"]).strip().upper(): float(r["TON"])
-            for _, r in engine.eligible_lorries.iterrows()
-        }
-        _newly = 0
         for _route, _grp in _by_route.items():
             _total_w = sum(x["WEIGHT"] for x in _grp)
             _excl = sess.get("unavailable", set()) | {
@@ -4252,13 +4246,33 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + _total_w
                 if _chosen not in _session_routes:
                     _session_routes[_chosen] = _route
-                _newly += len(_grp)
             else:
                 for _it in _grp:
                     _it["LORRY"] = "NO_LORRY"
 
+        # Add the newly assigned items into pending_dos so _build_summary shows them
+        pending_dos = sess.get("pending_dos", [])
+        seen_do = {do["DO NUMBER"]: i for i, do in enumerate(pending_dos)}
+        for it in not_today_items:
+            do_num = it["DO NUMBER"]
+            if do_num not in seen_do:
+                seen_do[do_num] = len(pending_dos)
+                pending_dos.append({
+                    "DO NUMBER":      do_num,
+                    "ALL_DO_NUMBERS": [do_num],
+                    "ROUTE":          it["ROUTE"],
+                    "CODE":           it["CODE"],
+                    "CUSTOMER NAME":  it["CUSTOMER NAME"],
+                    "DATE":           it.get("DATE", ""),
+                    "ITEMS":          [],
+                })
+            pending_dos[seen_do[do_num]]["ITEMS"].append(it)
+        # Recompute TOTAL_TON for updated DOs
+        for do in pending_dos:
+            do["TOTAL_TON"] = round(sum(i["WEIGHT"] for i in do["ITEMS"]), 3)
+        sess["pending_dos"] = pending_dos
+
         sess["state"] = "CONFIRMING"
-        # Show the full assignment summary + Confirm/Cancel buttons (no separate prefix message)
         return _build_summary(sess)
 
     elif reply in ("NO", "TIDAK", "SKIP", "N"):
