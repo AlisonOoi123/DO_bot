@@ -3454,13 +3454,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if _lst and it_state not in _lst:
                         return False
                 # Direction guard — applies to ALL routes (urban AND outstation).
-                # A lorry may only receive items from a different route if that route
-                # is in the same corridor group or travels the same direction.
+                # Urban routes: ONLY allow same corridor group (never GPS-bearing match
+                # alone — e.g. KV08A and KV11A both point "east" but are incompatible zones).
+                # Outstation routes: also allow same-way GPS bearing.
                 _lorry_rt = _session_routes.get(p, "")
                 if _lorry_rt and it.get("ROUTE", "") != _lorry_rt:
-                    if (not _same_corridor_group(it.get("ROUTE", ""), _lorry_rt)
-                            and not _routes_on_same_way(it.get("ROUTE", ""), _lorry_rt)):
-                        return False
+                    _it_urban_r     = _classify_dest_group(it.get("ROUTE", "")) in _DEST_URBAN_GROUPS
+                    _lorry_urban_r  = _classify_dest_group(_lorry_rt) in _DEST_URBAN_GROUPS
+                    if _it_urban_r or _lorry_urban_r:
+                        # Urban: same corridor group only
+                        if not _same_corridor_group(it.get("ROUTE", ""), _lorry_rt):
+                            return False
+                    else:
+                        # Outstation: also allow same-way bearing
+                        if (not _same_corridor_group(it.get("ROUTE", ""), _lorry_rt)
+                                and not _routes_on_same_way(it.get("ROUTE", ""), _lorry_rt)):
+                            return False
                 # GPS city-proximity guard for outstation: if this item's GPS
                 # is known, only allow lorries whose assigned items' centroid
                 # is within _MAX_CITY_MERGE_KM_OUTSTATION of this item.
@@ -3503,11 +3512,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if not _cand_plates:
                 continue
 
-            # Among eligible plates, prefer same-corridor then tightest fit
+            # Among eligible plates, prefer same-route/corridor then tightest fit.
+            # For urban items use same-corridor only; outstation may also use same-way.
+            def _compat_check(plate):
+                _pr = _session_routes.get(plate, "")
+                if not _pr or it["ROUTE"] == _pr:
+                    return True
+                if it_dest in _DEST_URBAN_GROUPS or _classify_dest_group(_pr) in _DEST_URBAN_GROUPS:
+                    return _same_corridor_group(it["ROUTE"], _pr)
+                return _routes_on_same_way(it["ROUTE"], _pr)
             _compat = sorted(
                 [(float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
                  for p in _cand_plates
-                 if _routes_on_same_way(it["ROUTE"], _session_routes.get(p, ""))]
+                 if _compat_check(p)]
             )
             _any_fit = sorted(
                 [(float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)), p)
@@ -3557,12 +3574,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         and _session_routes.get(_fp, "")
                         and _classify_dest_group(_session_routes.get(_fp, "")) in _DEST_URBAN_GROUPS):
                     continue
-                # Route direction guard — same route or same corridor or same-way bearing
+                # Route direction guard — same route, same corridor, or (outstation only) same-way bearing
                 _fp_rt = _session_routes.get(_fp, "")
                 if _fp_rt and it_route != _fp_rt:
-                    if (not _same_corridor_group(it_route, _fp_rt)
-                            and not _routes_on_same_way(it_route, _fp_rt)):
-                        continue
+                    _it_urban_fa    = _it_is_urban
+                    _fp_urban_fa    = _classify_dest_group(_fp_rt) in _DEST_URBAN_GROUPS
+                    if _it_urban_fa or _fp_urban_fa:
+                        if not _same_corridor_group(it_route, _fp_rt):
+                            continue
+                    else:
+                        if (not _same_corridor_group(it_route, _fp_rt)
+                                and not _routes_on_same_way(it_route, _fp_rt)):
+                            continue
                 # State boundary
                 _fp_states = _consol_lorry_states.get(_fp, set()) | _session_lorry_states.get(_fp, set())
                 if it_state and _fp_states and not any(_states_compatible(it_state, s) for s in _fp_states):
@@ -3608,12 +3631,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         and _session_routes.get(_op, "")
                         and _classify_dest_group(_session_routes.get(_op, "")) in _DEST_URBAN_GROUPS):
                     continue
-                # Route direction guard
+                # Route direction guard — urban routes only allow same corridor group
                 _op_rt = _session_routes.get(_op, "")
                 if _op_rt and it_route != _op_rt:
-                    if (not _same_corridor_group(it_route, _op_rt)
-                            and not _routes_on_same_way(it_route, _op_rt)):
-                        continue
+                    _op_urban = _classify_dest_group(_op_rt) in _DEST_URBAN_GROUPS
+                    if _it_is_urban or _op_urban:
+                        if not _same_corridor_group(it_route, _op_rt):
+                            continue
+                    else:
+                        if (not _same_corridor_group(it_route, _op_rt)
+                                and not _routes_on_same_way(it_route, _op_rt)):
+                            continue
                 _op_sts = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
                 if it_state and _op_sts and not any(_states_compatible(it_state, s) for s in _op_sts):
                     continue
@@ -4034,11 +4062,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # Must be same destination class (urban stays urban, outstation stays outstation)
                 if _cu_dest != _fp_dest:
                     continue
-                # Route must match lorry's route or be on the same way
+                # Route must match lorry's route; urban uses corridor group only
                 if _fp_route and _cu_route != _fp_route:
-                    if (not _same_corridor_group(_cu_route, _fp_route)
-                            and not _routes_on_same_way(_cu_route, _fp_route)):
-                        continue
+                    if _cu_dest in _DEST_URBAN_GROUPS or _fp_dest in _DEST_URBAN_GROUPS:
+                        if not _same_corridor_group(_cu_route, _fp_route):
+                            continue
+                    else:
+                        if (not _same_corridor_group(_cu_route, _fp_route)
+                                and not _routes_on_same_way(_cu_route, _fp_route)):
+                            continue
                 # State boundary
                 if _fp_states_set and _cu_state and _cu_state not in _fp_states_set:
                     continue
