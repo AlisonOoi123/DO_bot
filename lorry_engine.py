@@ -861,17 +861,14 @@ class LorryEngine:
             _lh_big = merged[merged["TON"] >= _ULTRA_LONG_HAUL_MIN_TON]
             if not _lh_big.empty:
                 merged = _lh_big
-            _sort_cols = ["UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
-            _sort_asc  = [False,        False,       False,           True,     False,       False]
         elif _route_dist_km >= LONG_HAUL_KM:
             _lh_big = merged[merged["TON"] >= _LONG_HAUL_MIN_TON]
             if not _lh_big.empty:
                 merged = _lh_big
-            _sort_cols = ["UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "SURPLUS", "IS_OWNER", "ROUTE_FREQ"]
-            _sort_asc  = [False,        False,       False,           True,     False,       False]
-        else:
-            _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
-            _sort_asc  = [True,      False,       False,          False,        False,       False]
+
+        # Weight-based best-fit: tightest surplus = highest utilization, history as tiebreaker
+        _sort_cols = ["SURPLUS", "UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "IS_OWNER", "ROUTE_FREQ"]
+        _sort_asc  = [True,      False,        False,       False,          False,       False]
 
         UTIL_GOOD_THRESHOLD = 0.60
         UTIL_OK_THRESHOLD   = 0.40

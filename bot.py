@@ -3072,7 +3072,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                 ]
                 if _pref_avail:
-                    # Force assignment to the first available preferred lorry
+                    # Pick tightest-fit preferred lorry (smallest surplus = highest utilization)
+                    _pref_avail.sort(key=lambda p: _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)))
                     _chosen = _pref_avail[0]
                     for it in group_items:
                         it["LORRY"] = _chosen
