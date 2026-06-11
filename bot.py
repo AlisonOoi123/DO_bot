@@ -3450,14 +3450,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _lst = _consol_lorry_states.get(p, set()) | _session_lorry_states.get(p, set())
                     if _lst and it_state not in _lst:
                         return False
-                # Direction guard for outstation lorries
-                if (
-                    _session_routes.get(p)
-                    and it_dest not in _DEST_URBAN_GROUPS
-                    and _classify_dest_group(_session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
-                    and not _routes_on_same_way(it.get("ROUTE", ""), _session_routes.get(p, ""))
-                ):
-                    return False
+                # Direction guard — applies to ALL routes (urban AND outstation).
+                # A lorry may only receive items from a different route if that route
+                # is in the same corridor group or travels the same direction.
+                _lorry_rt = _session_routes.get(p, "")
+                if _lorry_rt and it.get("ROUTE", "") != _lorry_rt:
+                    if (not _same_corridor_group(it.get("ROUTE", ""), _lorry_rt)
+                            and not _routes_on_same_way(it.get("ROUTE", ""), _lorry_rt)):
+                        return False
                 # GPS city-proximity guard for outstation: if this item's GPS
                 # is known, only allow lorries whose assigned items' centroid
                 # is within _MAX_CITY_MERGE_KM_OUTSTATION of this item.
@@ -3549,12 +3549,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 if _fp in _it_strict:
                     continue
-                # Urban↔outstation guard: outstation lorries must not serve urban and vice versa
+                # Urban↔outstation guard
                 if (not _it_is_urban
                         and _session_routes.get(_fp, "")
                         and _classify_dest_group(_session_routes.get(_fp, "")) in _DEST_URBAN_GROUPS):
                     continue
-                # State boundary — only block if lorry already committed to a DIFFERENT state
+                # Route direction guard — same route or same corridor or same-way bearing
+                _fp_rt = _session_routes.get(_fp, "")
+                if _fp_rt and it_route != _fp_rt:
+                    if (not _same_corridor_group(it_route, _fp_rt)
+                            and not _routes_on_same_way(it_route, _fp_rt)):
+                        continue
+                # State boundary
                 _fp_states = _consol_lorry_states.get(_fp, set()) | _session_lorry_states.get(_fp, set())
                 if it_state and _fp_states and not any(_states_compatible(it_state, s) for s in _fp_states):
                     continue
@@ -3599,6 +3605,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         and _session_routes.get(_op, "")
                         and _classify_dest_group(_session_routes.get(_op, "")) in _DEST_URBAN_GROUPS):
                     continue
+                # Route direction guard
+                _op_rt = _session_routes.get(_op, "")
+                if _op_rt and it_route != _op_rt:
+                    if (not _same_corridor_group(it_route, _op_rt)
+                            and not _routes_on_same_way(it_route, _op_rt)):
+                        continue
                 _op_sts = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
                 if it_state and _op_sts and not any(_states_compatible(it_state, s) for s in _op_sts):
                     continue
@@ -3665,6 +3677,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _or = _oc - _ol
                     if _op in _g_strict:
                         continue
+                    # Route direction guard
+                    _op_rt2 = _session_routes.get(_op, "")
+                    if _op_rt2 and _g_route != _op_rt2:
+                        if (not _same_corridor_group(_g_route, _op_rt2)
+                                and not _routes_on_same_way(_g_route, _op_rt2)):
+                            continue
                     _op_sts = _consol_lorry_states.get(_op, set()) | _session_lorry_states.get(_op, set())
                     if _g_state and _op_sts and not any(_states_compatible(_g_state, s) for s in _op_sts):
                         continue
