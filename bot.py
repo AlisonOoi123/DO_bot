@@ -483,8 +483,10 @@ def _extract_route_prefix(route: str) -> str:
 #   KL_SELANGOR (<11T) — All KV routes (Klang Valley urban)
 _DEST_LARGE_LONG_CLUSTERS  = {"PH", "TR", "KB", "JH", "PK", "KD", "PN", "MC", "SB", "SR"}
 _DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
-# KV routes that go outstation (Rawang / Tanjung Malim direction):
-_DEST_MEDIUM_LONG_KV_CODES = {"KV01A", "KV02A"}
+# KV routes that go outstation (toward Tanjung Malim / Perak, genuinely beyond Selangor):
+# KV02A (B.Beruntung/Serendah/Rawang) destinations are all within Selangor → classified
+# as SELANGOR group, not MEDIUM_LONG, so any lorry size is eligible (weight-based fit).
+_DEST_MEDIUM_LONG_KV_CODES = {"KV01A"}
 
 # Rule: small lorries (≤5T) can ONLY serve KL/Selangor urban routes.
 # Outstation routes (PH, TR, NS, JH, PK…) require lorries >5T (medium or large).
@@ -2239,23 +2241,38 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _is_mine = False
                 _other_user_count += 1
 
-            # Schedule check — the ONLY filter for whether a DO ships today.
-            # Assignment is based purely on whether the route prefix is in
-            # today's SCHD sheet. The DATE column and REMARKS day keywords
-            # do NOT gate inclusion. All DOs on scheduled routes are assigned
-            # regardless of how old they are; older DOs are prioritised by the
-            # date-sort applied to `items` after this loop.
+            # Schedule check: route must be on today's SCHD sheet.
             if _is_mine and _sched_prefixes is not None:
                 if pfx not in _sched_prefixes:
                     _is_today = False
                     _not_today_count += 1
 
             _remarks_raw = str(row.get("REMARKS", "")).strip()
+
+            # Remarks-day filter: if the remark explicitly specifies delivery days
+            # (e.g. "SELASA DAN JUMAAT", "FRIDAY") and today is NOT one of those
+            # days, mark the item as day-restricted — it should not be assigned.
+            _remarks_day_restricted = False
+            if _is_mine and _is_today:
+                _rm_days = _remarks_days_for(_remarks_raw)
+                if _rm_days is not None:
+                    # Compute trip weekday
+                    _td_obj = datetime.now().date()
+                    if sess.get("trip_day") == "tomorrow":
+                        _td_obj += __import__("datetime").timedelta(days=1)
+                        while _td_obj.weekday() >= 5:
+                            _td_obj += __import__("datetime").timedelta(days=1)
+                    _trip_wd_check = _td_obj.weekday()
+                    if _trip_wd_check not in _rm_days:
+                        _remarks_day_restricted = True
+
             _lorry_init = None
             if not _is_mine:
                 _lorry_init = "OTHER_USER"
             elif not _is_today:
                 _lorry_init = "NOT_TODAY"
+            elif _remarks_day_restricted:
+                _lorry_init = "REMARKS_SKIP"
             elif sess.get("_prefilled_count"):
                 # Case B: pre-filled file — rows that already have a valid lorry
                 # plate in LICENSE keep that assignment so session_loads is accurate.
@@ -2396,12 +2413,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _prefill_loads: dict[str, float] = {}
         _prefill_routes: dict[str, str]  = {}
         _prefill_states: dict[str, set]  = {}   # plate → set of destination states
-        SKIP_SENTINELS = {"OTHER_USER", "NOT_TODAY", "NO_LORRY", "SPLIT",
-                          "SKIPPED", "OTHER_USER", None, ""}
+        SKIP_SENTINELS = {"OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "NO_LORRY",
+                          "SPLIT", "SKIPPED", None, ""}
 
         for it in items:
             lorry = it.get("LORRY")
-            if lorry and lorry not in SKIP_SENTINELS and lorry not in {"OTHER_USER","NOT_TODAY","NO_LORRY"}:
+            if lorry and lorry not in SKIP_SENTINELS:
                 # Pre-filled item — record it as already assigned
                 if it.get("LORRY") not in (None,):
                     plate = lorry.strip().upper()
@@ -2431,7 +2448,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         for it in items:
             lorry = it.get("LORRY")
-            if lorry in ("OTHER_USER", "NOT_TODAY"):
+            if lorry in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP"):
                 continue
             # Skip pre-filled items — they're already in sess["assigned"]
             if lorry and lorry not in (None,) and re.match(r'^[A-Z]{1,3}\d', lorry.strip().upper()):
@@ -3382,7 +3399,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Update session load and state trackers for subsequent groups
             for _it in _all_group:
                 _pl = _it.get("LORRY")
-                if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "", None}:
+                if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "", None}:
                     _session_loads[_pl] = float(_session_loads.get(_pl, 0)) + _it["WEIGHT"]
                     if _pl not in _session_routes:
                         _session_routes[_pl] = route
@@ -3404,7 +3421,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _cpl = _cit.get("LORRY")
             _cst = _cit.get("STATE", "").strip().upper()
             if _cpl and _cst and _cpl not in {
-                "NO_LORRY", "OTHER_USER", "NOT_TODAY", "SPLIT", "SKIPPED", "", None
+                "NO_LORRY", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "SPLIT", "SKIPPED", "", None
             }:
                 _consol_lorry_states.setdefault(_cpl, set()).add(_cst)
 
@@ -4002,8 +4019,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # pending_dos is used by _build_summary; rebuild from items
         seen_do = {}
         pending_dos = []
+        _remarks_skip_count = sum(1 for it in items if it.get("LORRY") == "REMARKS_SKIP")
         for item in items:
-            if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY"):
+            if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP"):
                 continue          # keep in raw_df for export blank; hide from UI
             do_num = item["DO NUMBER"]
             if do_num not in seen_do:
@@ -4028,12 +4046,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
         sess["unassigned_reasons"]   = _unassigned_reasons
 
         # ── Build and return summary ──────────────────────────────────────────
-        my_items    = [it for it in items if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY")]
+        my_items    = [it for it in items if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP")]
         total_items = len(my_items)
         header = f"✅ *{total_items} item(s) across {len(pending_dos)} DO(s) auto-assigned!*"
         if _other_user_count:
-            # Cross-user DOs: always blank, no prompt, just inform
             header += f"\n📌 _{_other_user_count} DO(s) from another user's routes — left blank (cross-user assignment not allowed)._"
+        if _remarks_skip_count:
+            header += f"\n📅 _{_remarks_skip_count} DO(s) skipped — REMARKS indicate delivery not due today._"
         if _not_today_count:
             # User's own DOs not on today's schedule — ask if they want to assign anyway
             sess["not_today_pending_count"] = _not_today_count
@@ -4047,7 +4066,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _lorry_items: dict[str, list] = {}
         for _it in my_items:
             _pl = _it.get("LORRY")
-            if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "", None}:
+            if _pl and _pl not in {"NO_LORRY", "SPLIT", "SKIPPED", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "", None}:
                 _lorry_items.setdefault(_pl, []).append(_it)
         _low_util_warns = []
         for _pl, _its in _lorry_items.items():
@@ -4124,7 +4143,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _assigned_plates = {
             it.get("LORRY") for it in my_items
             if it.get("LORRY") not in {
-                "NO_LORRY", "OTHER_USER", "NOT_TODAY", "SPLIT", "SKIPPED", "", None
+                "NO_LORRY", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "SPLIT", "SKIPPED", "", None
             }
         }
         _today_log_plates = get_assigned_today()
@@ -4201,7 +4220,7 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
         _lorry_states: dict = {}   # plate → set of destination states (for boundary check)
         for _it in items:
             _pl = _it.get("LORRY")
-            if _pl and _pl not in (None, "NO_LORRY", "NOT_TODAY", "OTHER_USER",
+            if _pl and _pl not in (None, "NO_LORRY", "NOT_TODAY", "REMARKS_SKIP", "OTHER_USER",
                                    "SPLIT", "SKIPPED", "", "LOAD_BELOW_MIN_UTIL"):
                 _session_loads[_pl] = _session_loads.get(_pl, 0.0) + _it.get("WEIGHT", 0.0)
                 if _pl not in _session_routes:
@@ -4759,7 +4778,7 @@ def _build_summary(sess) -> str:
     # ── Build lorry-grouped view ──────────────────────────────────────────
     # Collect all items and build per-lorry buckets (exclude other-user rows)
     all_items = [it for do in pending for it in do.get("ITEMS", [])
-                 if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY")]
+                 if it.get("LORRY") not in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP")]
 
     # Map DO NUMBER → (customer_short, route_code, date)
     do_meta: dict[str, tuple] = {}
@@ -5288,7 +5307,7 @@ def _export_result_inner(sess) -> list[str]:
     # Blank out any stale sentinel strings in LICENSE so we only write real plates
     new_df["LICENSE"] = new_df["LICENSE"].astype(str).replace({"nan": "", "None": ""})
 
-    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "OTHER_USER", "NOT_TODAY", "", None}
+    SENTINELS = {"SKIPPED", "NO_LORRY", "SPLIT", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "", None}
     confirmed_plates = []
     assigned_row_idxs = set()
 
