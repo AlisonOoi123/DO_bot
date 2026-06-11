@@ -447,12 +447,14 @@ def _scheduled_prefixes_for_upload(user: str, trip_day: str = "today") -> set[st
         while target_date.weekday() >= 5:
             target_date += _timedelta(days=1)
 
-    wd = target_date.weekday()
-    prefixes = schedule.get(wd)
-    if prefixes is None:
-        # No routes scheduled for that day — return empty set (nothing to assign)
-        return set()
-    return prefixes
+    # Return ALL routes the user owns (union across every day column).
+    # The SCHD sheet defines which routes belong to this user; the day columns
+    # are informational (weekly cadence). Every uploaded item on any of the
+    # user's routes gets assigned — backlog from previous days is included.
+    all_prefixes: set[str] = set()
+    for day_set in schedule.values():
+        all_prefixes |= day_set
+    return all_prefixes if all_prefixes else set()
 
 
 def _extract_route_prefix(route: str) -> str:
@@ -620,6 +622,23 @@ _ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     "PH06":  ["BPE9788", "WA6899M"],
     "PH07":  ["BPE9788", "WA6899M"],
     "PH08":  ["BPE9788", "WA6899M"],
+    # Perak corridor (Ipoh, Batu Gajah, Taiping, Teluk Intan) — large outstation
+    "PK":    ["VJN9910", "BQY7823", "BQX9983"],
+    # Johor corridor (Yong Peng, Batu Pahat, Muar, JB) — large outstation
+    "JH":    ["VJN9910", "BQX9983", "BQY7823"],
+    # Terengganu corridor (Kemaman, Kuala Terengganu) — large outstation
+    "TR":    ["VER2872", "VJN9910", "BQY7823"],
+    # Kelantan — large outstation
+    "KB":    ["VJN9910", "BQY7823", "VER2872"],
+    # Kedah / Perlis — large outstation
+    "KD":    ["VJN9910", "BQY7823", "BQX9983"],
+    # Penang — large outstation
+    "PN":    ["VJN9910", "BQY7823", "BQX9983"],
+    # Melaka — large outstation
+    "MC":    ["BQX9983", "VJN9910", "BQY7823"],
+    # Sabah / Sarawak — large outstation
+    "SB":    ["VJN9910", "BQX9983"],
+    "SR":    ["VJN9910", "BQX9983"],
 }
 
 # Maximum average DO weight (tonnes) below which a route is considered
@@ -2289,7 +2308,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             )
             if _not_today_count:
                 _sched_notice.append(
-                    f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s schedule — left unassigned."
+                    f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s route list — left unassigned (different user's routes)."
                 )
 
         sess["items"]      = items          # row-level item list
