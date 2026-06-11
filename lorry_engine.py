@@ -866,20 +866,13 @@ class LorryEngine:
             if not _lh_big.empty:
                 merged = _lh_big
 
-        # Weight-based best-fit: tightest surplus = highest utilization, history as tiebreaker
-        _sort_cols = ["SURPLUS", "UTIL_SCORE", "CUST_FREQ", "CLUSTER_FREQ", "IS_OWNER", "ROUTE_FREQ"]
-        _sort_asc  = [True,      False,        False,       False,          False,       False]
-
-        UTIL_GOOD_THRESHOLD = 0.60
-        UTIL_OK_THRESHOLD   = 0.40
-        merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
-        merged["UTIL_OK"]   = (merged["UTIL"] >= UTIL_OK_THRESHOLD).astype(int)
-
-        tier2 = merged[merged["UTIL_GOOD"] == 1].sort_values(_sort_cols, ascending=_sort_asc)
-        tier1 = merged[(merged["UTIL_GOOD"] == 0) & (merged["UTIL_OK"] == 1)].sort_values(_sort_cols, ascending=_sort_asc)
-        tier0 = merged[merged["UTIL_OK"] == 0].sort_values(_sort_cols, ascending=_sort_asc)
-        import pandas as _pd
-        merged = _pd.concat([tier2, tier1, tier0]).reset_index(drop=True)
+        # Weight-based best-fit: smallest lorry that fits = highest utilization.
+        # SURPLUS ascending = tightest fit. History/owner are tiebreakers only.
+        # No tiering — tiering previously selected already-busy (oversized) lorries
+        # over a smaller lorry that would achieve higher utilization for this load.
+        _sort_cols = ["SURPLUS", "IS_OWNER", "CUST_FREQ", "CLUSTER_FREQ", "ROUTE_FREQ"]
+        _sort_asc  = [True,      False,      False,       False,          False]
+        merged = merged.sort_values(_sort_cols, ascending=_sort_asc).reset_index(drop=True)
 
         results = []
         for _, row in merged.head(top_n).iterrows():

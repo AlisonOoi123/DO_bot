@@ -3060,6 +3060,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _preferred = _preferred_lorries_for_route(_dominant_route)
             _base_excluded = excluded   # save pre-size excluded set for fallback
             if _preferred:
+                # Preferred lorries are a hint — weight fit wins.
                 # Hard-exclude preferred lorries if: truly unavailable, full,
                 # strictly forbidden for ANY route in this group, OR already
                 # committed to a different destination state.
@@ -3072,19 +3073,39 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                 ]
                 if _pref_avail:
-                    # Pick tightest-fit preferred lorry (smallest surplus = highest utilization)
+                    # Among available preferred lorries pick the tightest fit.
                     _pref_avail.sort(key=lambda p: _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)))
-                    _chosen = _pref_avail[0]
-                    for it in group_items:
-                        it["LORRY"] = _chosen
-                    _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
-                    if _chosen not in _session_routes:
-                        _session_routes[_chosen] = _dominant_route
-                    _record_lorry_state(_chosen, _grp_state)
-                    for it in _all_group:
-                        sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
-                    return
-                # Preferred lorries full/unavailable → fall through to open assignment
+                    _pref_best = _pref_avail[0]
+                    _pref_surplus = _eff_cap_for(_pref_best, _dest_grp) - float(_session_loads.get(_pref_best, 0)) - total_w
+
+                    # Only force-assign the preferred lorry if it is also the
+                    # tightest-fitting lorry in the whole eligible fleet.
+                    # If a non-preferred lorry has smaller surplus, let open
+                    # weight-based assignment find it instead.
+                    _all_eligible_surplus = [
+                        _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp)
+                        - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0))
+                        - total_w
+                        for _, r in engine.eligible_lorries.iterrows()
+                        if str(r["LORRY"]).strip().upper() not in (sess["unavailable"] | get_assigned_today() | _strict_excl | _state_excl)
+                        and _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp) - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0)) >= total_w
+                    ]
+                    _best_fleet_surplus = min(_all_eligible_surplus) if _all_eligible_surplus else _pref_surplus
+
+                    # Use preferred lorry if its surplus is within 1T of fleet best
+                    # (allow small slack so a corridor lorry isn't bypassed for 200 kg difference)
+                    if _pref_surplus <= _best_fleet_surplus + 1.0:
+                        _chosen = _pref_best
+                        for it in group_items:
+                            it["LORRY"] = _chosen
+                        _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
+                        if _chosen not in _session_routes:
+                            _session_routes[_chosen] = _dominant_route
+                        _record_lorry_state(_chosen, _grp_state)
+                        for it in _all_group:
+                            sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
+                        return
+                # Preferred lorry not tightest fit / unavailable → open weight-based assignment
 
             # ── Destination-based lorry size enforcement ───────────────────────
             _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
@@ -3176,7 +3197,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _mark_no_lorry(group_items, "LOAD_BELOW_MIN_UTIL")
                 else:
                     split_option = None
-                    if single_util < 0.60:
+                    # Only split if utilization is very low (<30%) — weight-based
+                    # selection already picks the smallest fitting lorry, so splitting
+                    # at 60% would waste an extra truck unnecessarily.
+                    if single_util < 0.30:
                         split_option = engine.suggest_split(
                             route=route,
                             total_ton=total_w,
