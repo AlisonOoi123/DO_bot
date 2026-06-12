@@ -463,7 +463,7 @@ def _scheduled_prefixes_for_upload(user: str, trip_day: str = "today") -> set[st
     target_date = datetime.now().date()
     if trip_day == "tomorrow":
         target_date += _timedelta(days=1)
-        while target_date.weekday() >= 5:
+        while target_date.weekday() == 6:
             target_date += _timedelta(days=1)
 
     target_wd = target_date.weekday()   # 0=Mon … 6=Sun
@@ -1897,7 +1897,7 @@ def _handle_user_id(phone, sess, text):
     from datetime import timedelta as _td
     _today_name    = datetime.now().strftime("%A")
     _tomorrow_date = datetime.now().date() + _td(days=1)
-    while _tomorrow_date.weekday() >= 5:
+    while _tomorrow_date.weekday() == 6:
         _tomorrow_date += _td(days=1)
     _tomorrow_name = _tomorrow_date.strftime("%A")
 
@@ -1933,7 +1933,7 @@ def _handle_trip_day(phone, sess, text):
         from datetime import timedelta as _td
         _today_name    = datetime.now().strftime("%A")
         _tomorrow_date = datetime.now().date() + _td(days=1)
-        while _tomorrow_date.weekday() >= 5:
+        while _tomorrow_date.weekday() == 6:
             _tomorrow_date += _td(days=1)
         _tomorrow_name = _tomorrow_date.strftime("%A")
         return [{
@@ -1954,7 +1954,7 @@ def _handle_trip_day(phone, sess, text):
         _day_label = datetime.now().strftime("%A, %d %b")
     else:
         _d = datetime.now().date() + _td(days=1)
-        while _d.weekday() >= 5:
+        while _d.weekday() == 6:
             _d += _td(days=1)
         _day_label = _d.strftime("%A, %d %b")
 
@@ -2260,7 +2260,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _td_obj = datetime.now().date()
                     if sess.get("trip_day") == "tomorrow":
                         _td_obj += __import__("datetime").timedelta(days=1)
-                        while _td_obj.weekday() >= 5:
+                        while _td_obj.weekday() == 6:
                             _td_obj += __import__("datetime").timedelta(days=1)
                     _trip_wd_check = _td_obj.weekday()
                     if _trip_wd_check not in _rm_days:
@@ -2337,7 +2337,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _tgt_date = datetime.now().date()
             else:
                 _tgt_date = datetime.now().date() + _td(days=1)
-                while _tgt_date.weekday() >= 5:
+                while _tgt_date.weekday() == 6:
                     _tgt_date += _td(days=1)
             _tgt_wd = _tgt_date.weekday()
             _sched_notice.append(
