@@ -62,7 +62,7 @@ _ADJACENT_CORRIDORS = {
 MAX_STOPS_PER_LORRY   = 8     # Rule 6
 MERGE_DIST_THRESHOLD  = 0.25  # Rule 7: reject if extra dist > 25%
 CAPACITY_TARGET       = 0.80  # Rule 3: target >= 80% utilisation
-MIN_UTIL_TO_ASSIGN    = 0.10  # Rule 8: don't assign a lorry if load < 10% of its capacity
+MIN_UTIL_TO_ASSIGN    = 0.05  # Rule 8: don't assign a lorry if load < 5% of its capacity
 
 # ── Geographic cross-cluster merging (Nominatim/OSM + Haversine) ─────────────
 # Nominatim is the geocoding service behind OpenStreetMap — completely free,
@@ -445,13 +445,22 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
         if ia["corridor"] != ib["corridor"]:
             return False
     elif ia["corridor"] == "GENERAL" and ib["corridor"] == "GENERAL":
-        # Path B: BOTH are GENERAL → need shared waypoints to confirm direction
+        # Path B: BOTH are GENERAL → prefer shared waypoints to confirm direction
         wp1 = _extract_waypoints(route1)
         wp2 = _extract_waypoints(route2)
-        if not wp1 or not wp2:
-            return False
-        if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
-            return False
+        if wp1 and wp2:
+            # Both have place names — require geographic overlap
+            if not (bool(wp1 & wp2) or wp1 <= wp2 or wp2 <= wp1):
+                return False
+        elif not wp1 or not wp2:
+            # One or both are bare route codes (e.g. "NS01" with no place name).
+            # KL/KV routes fan out in all compass directions so bare codes cannot
+            # be safely merged without bearing data.  All other clusters (NS, PH,
+            # TR …) are outstation regions whose routes share the same highway
+            # corridor — allow the merge and let the bearing check below veto it.
+            _NO_BARE_MERGE = {"KL_VALLEY", "KL_CITY"}
+            if ia["cluster"] in _NO_BARE_MERGE:
+                return False
     # else: one has a named corridor and the other is GENERAL (same cluster).
     # The named corridor gives directional context; let the bearing check below
     # decide whether they actually point the same way.  This handles routes like
@@ -759,22 +768,33 @@ class LorryEngine:
             lambda u: 1.0 if u >= CAPACITY_TARGET else u / CAPACITY_TARGET)
         merged["IS_OWNER"] = (merged["USER"].str.upper() == self.owner_user).astype(int)
 
-        # Per-tier sort — SURPLUS (tightest fit) is the primary key in every tier.
-        # History (CUST_FREQ / CLUSTER_FREQ) breaks ties within the same capacity class
-        # so a familiar driver is preferred when two lorries are equally efficient.
-        # This ensures minimum capacity waste regardless of route history.
-        _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "IS_OWNER", "ROUTE_FREQ"]
-        _sort_asc  = [True,      False,       False,          False,        False,       False]
+        # Ranking strategy — owner lorries (IS_OWNER=1) always take precedence over
+        # spare lorries, then within each ownership group the standard efficiency
+        # tiers apply: UTIL_GOOD (≥60%) > UTIL_OK (≥40%) > the rest.
+        # Within the same tier SURPLUS (tightest fit) is the primary key, with
+        # route/customer history breaking exact ties.
+        _sort_cols = ["SURPLUS", "CUST_FREQ", "CLUSTER_FREQ", "UTIL_SCORE", "ROUTE_FREQ"]
+        _sort_asc  = [True,      False,       False,          False,        False]
         UTIL_GOOD_THRESHOLD = 0.60
         UTIL_OK_THRESHOLD   = 0.40
         merged["UTIL_GOOD"] = (merged["UTIL"] >= UTIL_GOOD_THRESHOLD).astype(int)
         merged["UTIL_OK"]   = (merged["UTIL"] >= UTIL_OK_THRESHOLD).astype(int)
 
-        tier2 = merged[merged["UTIL_GOOD"] == 1].sort_values(_sort_cols, ascending=_sort_asc)
-        tier1 = merged[(merged["UTIL_GOOD"] == 0) & (merged["UTIL_OK"] == 1)].sort_values(_sort_cols, ascending=_sort_asc)
-        tier0 = merged[merged["UTIL_OK"] == 0].sort_values(_sort_cols, ascending=_sort_asc)
+        def _tier_sort(df):
+            return df.sort_values(_sort_cols, ascending=_sort_asc)
+
+        owner = merged[merged["IS_OWNER"] == 1]
+        spare = merged[merged["IS_OWNER"] == 0]
+
         import pandas as _pd
-        merged = _pd.concat([tier2, tier1, tier0]).reset_index(drop=True)
+        merged = _pd.concat([
+            _tier_sort(owner[owner["UTIL_GOOD"] == 1]),
+            _tier_sort(owner[(owner["UTIL_GOOD"] == 0) & (owner["UTIL_OK"] == 1)]),
+            _tier_sort(owner[owner["UTIL_OK"] == 0]),
+            _tier_sort(spare[spare["UTIL_GOOD"] == 1]),
+            _tier_sort(spare[(spare["UTIL_GOOD"] == 0) & (spare["UTIL_OK"] == 1)]),
+            _tier_sort(spare[spare["UTIL_OK"] == 0]),
+        ]).reset_index(drop=True)
 
         results = []
         for _, row in merged.head(top_n).iterrows():
