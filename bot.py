@@ -15,6 +15,39 @@ import threading
 from datetime import date, datetime, time as dtime
 import pandas as pd
 from lorry_engine import LorryEngine
+from assignment_config import (
+    # Capacity / utilisation
+    CAPACITY_TARGET, MIN_UTIL_TO_ASSIGN, MAX_STOPS_PER_LORRY,
+    NAIK_FACTOR, SAME_ROUTE_NAIK, REBAL_THRESHOLD, FILL_TARGET,
+    MAX_DOS_PER_LORRY,
+    # Lorry size
+    LORRY_LARGE_MIN_TON, LORRY_SMALL_MAX_TON, LORRY_TINY_EXCL_TON,
+    OUTSTATION_MIN_TON as _OUTSTATION_MIN_TON,
+    # Geographic
+    DEPOT_LAT, DEPOT_LON,
+    CROSS_BEARING_LIMIT as _CROSS_BEARING_LIMIT,
+    MAX_CITY_MERGE_KM_OUTSTATION as _MAX_CITY_MERGE_KM_OUTSTATION,
+    # Destination classification
+    DEST_MIN_TON         as _DEST_MIN_TON,
+    DEST_LARGE_LONG_CLUSTERS  as _DEST_LARGE_LONG_CLUSTERS,
+    DEST_MEDIUM_LONG_CLUSTERS as _DEST_MEDIUM_LONG_CLUSTERS,
+    DEST_MEDIUM_LONG_KV_CODES as _DEST_MEDIUM_LONG_KV_CODES,
+    DEST_URBAN_GROUPS    as _DEST_URBAN_GROUPS,
+    DEST_SORT_PRI        as _DEST_SORT_PRI,
+    URBAN_COMPATIBLE_STATES as _URBAN_COMPATIBLE_STATES,
+    # Geography / normalisation
+    STATE_NAME_NORM      as _STATE_NAME_NORM,
+    POSTCODE_STATE_RANGES as _POSTCODE_STATE_RANGES,
+    # Schedule / remarks parsing
+    SCHD_DAY_MAP         as _SCHD_DAY_MAP,
+    REMARKS_KEYWORD_DAY  as _REMARKS_KEYWORD_DAY,
+    # Route rules
+    ROUTE_CORRIDOR_GROUPS as _ROUTE_CORRIDOR_GROUPS,
+    LORRY_STRICT_ROUTE   as _LORRY_STRICT_ROUTE,
+    ROUTE_PREFERRED_LORRY as _ROUTE_PREFERRED_LORRY,
+    # Tiny-item guard
+    TINY_ITEM_AVG_WEIGHT_T as _TINY_ITEM_AVG_WEIGHT_T,
+)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,19 +84,7 @@ HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx") 
 _CITY_TO_STATE: dict[str, str] = {}   # city.upper() → canonical state key
 _STATE_TO_CITIES: dict[str, set] = {} # canonical state key → set of city names (upper)
 
-# Normalise verbose sheet state names to the shorter keys used in DO items.
-_STATE_NAME_NORM: dict[str, str] = {
-    "KUALA LUMPUR (FEDERAL TERRITORY)": "KUALA LUMPUR",
-    "WILAYAH PERSEKUTUAN KUALA LUMPUR": "KUALA LUMPUR",
-    "W.P. KUALA LUMPUR":                "KUALA LUMPUR",
-    "PUTRAJAYA (FEDERAL TERRITORY)":    "PUTRAJAYA",
-    "WILAYAH PERSEKUTUAN PUTRAJAYA":    "PUTRAJAYA",
-    "LABUAN (FEDERAL TERRITORY)":       "LABUAN",
-    "WILAYAH PERSEKUTUAN LABUAN":       "LABUAN",
-    "PULAU PINANG":                     "PENANG",
-    "PULAU PINANG (PENANG)":            "PENANG",
-    "NEGERI SEMBILAN":                  "NEGERI SEMBILAN",   # keep as-is
-}
+# _STATE_NAME_NORM imported from assignment_config
 
 def _norm_state(st: str) -> str:
     """Normalise a state name to the canonical short form used in DO items."""
@@ -128,38 +149,7 @@ def _load_user_route_prefixes(user: str) -> set | None:
     except Exception:
         return None
 
-# Day-name aliases used in the SCHD sheet headers
-_SCHD_DAY_MAP = {
-    "MON": 0, "MONDAY": 0,
-    "TUES": 1, "TUES.": 1, "TUESDAYS": 1, "TUESDAY": 1, "TUE": 1, "TEUS": 1,
-    "WED": 2, "WEDNESDAY": 2,
-    "THUS": 3, "THURS": 3, "THURSDAY": 3, "THU": 3,
-    "FRI": 4, "FRIDAY": 4,
-    "SAT": 5, "SATURDAY": 5,
-    "SUN": 6, "SUNDAY": 6,
-}
-
-# ── REMARKS delivery-day parser ───────────────────────────────────────────────
-# Maps BM/English keywords found in the REMARKS column to weekday integers.
-# Mon=0 … Sun=6 (Python datetime.weekday() convention).
-_REMARKS_KEYWORD_DAY: list[tuple[str, int]] = [
-    # Malay day names
-    ("ISNIN",   0), ("SENIN",  0),
-    ("SELASA",  1),
-    ("RABU",    2),
-    ("KHAMIS",  3),
-    ("JUMAAT",  4), ("JUMAT", 4),
-    ("SABTU",   5),
-    ("AHAD",    6), ("MINGGU", 6),
-    # English day names / abbrevs
-    ("MONDAY",  0), ("MON",   0),
-    ("TUESDAY", 1), ("TUES",  1), ("TUE", 1),
-    ("WEDNESDAY",2),("WED",   2),
-    ("THURSDAY",3), ("THURS", 3), ("THU", 3),
-    ("FRIDAY",  4), ("FRI",   4),
-    ("SATURDAY",5), ("SAT",   5),
-    ("SUNDAY",  6), ("SUN",   6),
-]
+# _SCHD_DAY_MAP and _REMARKS_KEYWORD_DAY imported from assignment_config
 
 def _parse_remarks_days(remarks: str) -> set[int] | None:
     """Parse a REMARKS string into a set of delivery weekday integers.
@@ -489,47 +479,7 @@ def _extract_route_prefix(route: str) -> str:
     return m.group(1).upper() if m else ""
 
 # ── Destination state classification ─────────────────────────────────────────
-# Maps route-code prefix (2-char cluster) to destination group.
-# Groups drive minimum lorry size:
-#   LARGE_LONG  — Pahang, Kuantan, Terengganu, Kelantan, Johor, Perak, etc. (LARGE lorry preferred)
-#   MEDIUM_LONG — Rawang, Tanjung Malim, Kemaman, Port Dickson, Seremban/NS
-#   KL_SELANGOR (<11T) — All KV routes (Klang Valley urban)
-_DEST_LARGE_LONG_CLUSTERS  = {"PH", "TR", "KB", "JH", "PK", "KD", "PN", "MC", "SB", "SR"}
-_DEST_MEDIUM_LONG_CLUSTERS = {"NS"}
-# KV routes that go outstation (toward Tanjung Malim / Perak, genuinely beyond Selangor):
-# KV02A (B.Beruntung/Serendah/Rawang) destinations are all within Selangor → classified
-# as SELANGOR group, not MEDIUM_LONG, so any lorry size is eligible (weight-based fit).
-_DEST_MEDIUM_LONG_KV_CODES = {"KV01A"}
-
-# Rule: small lorries (≤5T) can ONLY serve KL/Selangor urban routes.
-# Outstation routes (PH, TR, NS, JH, PK…) require lorries >5T (medium or large).
-# Urban routes (KL/Selangor) accept any lorry size — weight-based best-fit selects
-# the right size based on gross weight.
-_OUTSTATION_MIN_TON = 5.001   # lorries with TON ≤ 5T excluded from outstation
-
-# Minimum lorry tonnage per destination group.
-# These are soft floors — lorries at or above this tonnage are eligible.
-# The engine further PREFERS the largest lorries for long-haul routes
-# (via _ULTRA_LONG_HAUL_MIN_TON preference in lorry_engine.py), so ≥14T
-# lorries will be chosen first for Kuantan/Pahang; BPE9788 (13.3T) only
-# gets used as fallback when all ≥14T lorries are full or excluded.
-_DEST_MIN_TON = {
-    "LARGE_LONG":  5.001, # Outstation (Pahang/TR/JH/PK…): small lorries (≤5T) forbidden
-    "MEDIUM_LONG": 5.001, # NS/Seremban/regional: small lorries (≤5T) forbidden
-    "KL":          0.0,   # Kuala Lumpur urban — no lower bound (any size allowed)
-    "SELANGOR":    0.0,   # Selangor — no lower bound (any size allowed)
-    "KL_SELANGOR": 0.0,   # fallback urban — no lower bound (any size allowed)
-}
-# Groups that use urban (<11T) lorries only
-_DEST_URBAN_GROUPS = {"KL", "SELANGOR", "KL_SELANGOR"}
-
-# States considered mutually compatible for urban lorries.
-# KL and Selangor urban delivery vans serve BOTH states freely — the hard
-# state-boundary rule (no mixing) must NOT apply within this set.
-_URBAN_COMPATIBLE_STATES: frozenset[str] = frozenset({
-    "KUALA LUMPUR", "W.P. KUALA LUMPUR", "WILAYAH PERSEKUTUAN KUALA LUMPUR",
-    "SELANGOR", "KL", "WP KL",
-})
+# All constants imported from assignment_config — see ASSIGNMENT_RULES.md §3.
 
 def _states_compatible(s1: str, s2: str) -> bool:
     """Return True if two destination states are allowed to share the same lorry."""
@@ -571,42 +521,7 @@ def _classify_dest_group(route: str, state: str = "") -> str:
         return "SELANGOR"
     return "KL_SELANGOR"   # unknown — treat as generic urban
 
-# Priority order: long-distance groups must be assigned FIRST so they claim
-# large/medium lorries before KL groups get a chance to take them.
-_DEST_SORT_PRI = {
-    "LARGE_LONG":  0,
-    "MEDIUM_LONG": 1,
-    "SELANGOR":    2,
-    "KL":          2,
-    "KL_SELANGOR": 2,
-}
-
-# ── Strict lorry-route reservations ──────────────────────────────────────────
-# Some lorries are physically configured or contractually bound to specific
-# route directions.  These rules are enforced both ways:
-#   (a) the restricted lorry is excluded from ALL other routes, and
-#   (b) the target route prefers this lorry first.
-# Key: lorry plate.  Value: set of route-code PREFIXES (first 2-5 chars) it
-# is allowed to serve.  Any route whose prefix is NOT in the set is blocked.
-_LORRY_STRICT_ROUTE: dict[str, set] = {
-    "BQU3875": {"PH"},           # 21T — Pahang routes only
-    # BQY7823 (14.5T) is PREFERRED for KV01A/KV02A (Rawang/T.Malim) but not
-    # strictly forbidden elsewhere — when KV-north is handled by another lorry,
-    # BQY7823 can serve Pahang or other outstation routes as best-fit.
-    "WA6899M": {"PH"},           # 13T spare — Pahang routes only (avoid sending for urban)
-}
-
-# ── Explicit route corridor groups (routes that must be merged before lorry lock) ──
-# Routes within the same corridor group always merge in Step 2, even when
-# _routes_on_same_way() returns False due to waypoint mismatch.
-# This prevents greedy single-route assignment from starving adjacent routes
-# that belong to the same physical delivery corridor.
-_ROUTE_CORRIDOR_GROUPS: dict[str, list] = {
-    "NS":       ["NS04", "NS05", "NS06", "NS07", "NS08"],
-    "PH_INT":   ["PH01", "PH02", "PH03", "PH04", "PH05", "PH06", "PH07", "PH08"],
-    "KV_NORTH": ["KV01A", "KV02A", "KV04A"],
-    "KV_EAST":  ["KV10A", "KV11A", "KV12A"],
-}
+# _DEST_SORT_PRI, _LORRY_STRICT_ROUTE, _ROUTE_CORRIDOR_GROUPS imported from assignment_config
 
 def _same_corridor_group(route1: str, route2: str) -> bool:
     """Return True when both routes belong to the same delivery corridor group."""
@@ -618,74 +533,8 @@ def _same_corridor_group(route1: str, route2: str) -> bool:
             return True
     return False
 
-# ── Route-to-lorry ownership (preferred lorry per route corridor) ─────────────
-# When the preferred lorry is available and has capacity, it is tried FIRST
-# and given a strong priority boost.  Other lorries can still be used as
-# fallback if the preferred lorry is full or unavailable.
-# Key: route-code PREFIX (2–5 chars, matched with startswith).
-# Value: ordered list of plates — first plate is the primary, rest are backups
-# within the same corridor before falling to general assignment.
-_ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
-    # North KL corridor (outstation Rawang / T.Malim direction)
-    # BQY7823 primary; BMN3682 is fallback when BQY7823 is committed to Pahang runs.
-    # This matches manual: BQY7823→PH09, BMN3682→KV01A+KV02A.
-    "KV01A": ["BQY7823", "BMN3682"],
-    "KV02A": ["BQY7823", "BMN3682"],
-    # Inner-KL tight streets (4.2T lorries only — can't park 14T there)
-    "KV06A": ["W3618U", "W3826C"],
-    "KV07A": ["W3618U", "W3826C"],
-    # Central KL
-    "KV10A": ["W3826C", "W3618U"],
-    # Pudu / Ampang — tiny shophouse deliveries; must use a van or small lorry
-    "KV11A": ["VKN8836", "W3618U", "W3826C"],
-    # Southeast KL corridor (Sungai Besi / Cheras / Kajang / Semenyih / Bangi)
-    "KV18A": ["BPE9788", "VJN9910", "VEA2818"],
-    "KV19A": ["BPE9788", "VJN9910", "VEA2818"],
-    "KV20A": ["BPE9788", "VJN9910", "VEA2818"],
-    # NS (Negeri Sembilan) corridor — BQX9983 primary, BMN3682 backup.
-    # Manual assigns BQX9983 to NS05+NS06, BMN3682 to KV01A+KV02A.
-    "NS04":  ["BQX9983", "BMN3682"],
-    "NS05":  ["BQX9983", "BMN3682"],
-    "NS06":  ["BQX9983", "BMN3682"],
-    # Pahang interior corridor — BPE9788 primary, WA6899M spare (only if BPE9788 full)
-    "PH01":  ["BPE9788", "WA6899M"],
-    "PH02":  ["BPE9788", "WA6899M"],
-    "PH03":  ["BPE9788", "WA6899M"],
-    "PH04":  ["BPE9788", "WA6899M"],
-    "PH05":  ["BPE9788", "WA6899M"],
-    "PH06":  ["BPE9788", "WA6899M"],
-    "PH07":  ["BPE9788", "WA6899M"],
-    "PH08":  ["BPE9788", "WA6899M"],
-    # Perak corridor (Ipoh, Batu Gajah, Taiping, Teluk Intan) — large outstation
-    "PK":    ["VJN9910", "BQY7823", "BQX9983"],
-    # Johor corridor (Yong Peng, Batu Pahat, Muar, JB) — large outstation
-    "JH":    ["VJN9910", "BQX9983", "BQY7823"],
-    # Terengganu corridor (Kemaman, Kuala Terengganu) — large outstation
-    "TR":    ["VER2872", "VJN9910", "BQY7823"],
-    # Kelantan — large outstation
-    "KB":    ["VJN9910", "BQY7823", "VER2872"],
-    # Kedah / Perlis — large outstation
-    "KD":    ["VJN9910", "BQY7823", "BQX9983"],
-    # Penang — large outstation
-    "PN":    ["VJN9910", "BQY7823", "BQX9983"],
-    # Melaka — large outstation
-    "MC":    ["BQX9983", "VJN9910", "BQY7823"],
-    # Sabah / Sarawak — large outstation
-    "SB":    ["VJN9910", "BQX9983"],
-    "SR":    ["VJN9910", "BQX9983"],
-}
-
-# Maximum average DO weight (tonnes) below which a route is considered
-# "tiny-item" and must NOT be served by a large lorry (≥11T).
-# KV11A averages ~0.046T per DO — a 14T truck cannot park in those streets.
-_TINY_ITEM_AVG_WEIGHT_T  = 0.15   # if avg DO weight ≤ 150 kg → tiny-item route
-_CROSS_BEARING_LIMIT     = 90.0   # max bearing diff (°) for same-direction merge
-# Max GPS distance (km) allowed when merging two city clusters on the SAME lorry.
-# Within a state, cities within this radius can share; farther cities get their own lorry.
-# Urban KL/Selangor routes: unlimited (already bucketed by city, proximity via bearing).
-_MAX_CITY_MERGE_KM_OUTSTATION = 60.0   # Bahau↔Kuala Pilah ~30 km ✓; Raub-town↔Jerantut ~70 km ✗
-# Tightened from 80→60 km: prevents near-border Raub (3.81, 101.87) merging with
-# far-cluster "Raub" (3.24, 102.41) which is actually near Jerantut (~70 km away).
+# _ROUTE_PREFERRED_LORRY, _TINY_ITEM_AVG_WEIGHT_T, _CROSS_BEARING_LIMIT,
+# _MAX_CITY_MERGE_KM_OUTSTATION imported from assignment_config
 
 
 def _preferred_lorries_for_route(route_text: str) -> list[str]:
@@ -721,37 +570,7 @@ def _resolve_history_path() -> str:
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
 DAILY_LOG_PATH = os.path.join(_DATA_DIR, "daily_assignments.json")
 
-# ── Postcode → Malaysian State lookup ────────────────────────────────────────
-# Covers the postcode ranges used by each state.  Used as a fallback when the
-# uploaded DO file does not have a STATE column.
-_POSTCODE_STATE_RANGES = [
-    # (lo, hi, state_name)  — ranges are inclusive
-    (50000, 60999, "KUALA LUMPUR"),
-    (40000, 42999, "SELANGOR"),
-    (43000, 43999, "SELANGOR"),    # Kajang / Hulu Langat
-    (44000, 44999, "SELANGOR"),
-    (45000, 45999, "SELANGOR"),    # Rawang / Ulu Selangor
-    (47000, 47999, "SELANGOR"),
-    (48000, 48999, "SELANGOR"),    # Kuala Selangor
-    (63000, 63999, "SELANGOR"),
-    (64000, 64999, "SELANGOR"),
-    (68000, 68999, "SELANGOR"),    # Ampang / Ulu Langat
-    (70000, 73999, "NEGERI SEMBILAN"),
-    (25000, 28999, "PAHANG"),
-    (39000, 39999, "PAHANG"),
-    (18000, 18999, "TERENGGANU"),
-    (20000, 24999, "TERENGGANU"),
-    (15000, 17999, "KELANTAN"),
-    (80000, 83999, "JOHOR"),
-    (84000, 86999, "JOHOR"),
-    (30000, 34999, "PERAK"),
-    (35000, 36999, "PERAK"),
-    (5000,  9999,  "KEDAH"),
-    (10000, 14999, "PENANG"),
-    (75000, 78999, "MELAKA"),
-    (88000, 91300, "SABAH"),
-    (93000, 98999, "SARAWAK"),
-]
+# _POSTCODE_STATE_RANGES imported from assignment_config
 
 def _postcode_to_state(postcode) -> str:
     """Return Malaysian state name from postcode, or '' if unknown."""
@@ -2970,7 +2789,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # lorries so drivers aren't overloaded and idle ABI lorries get work.
             # MAX_STOPS_PER_LORRY (=8) was designed for route-count merging;
             # here we use a separate threshold for DO count.
-            _MAX_DOS_PER_LORRY = 15
+            _MAX_DOS_PER_LORRY = MAX_DOS_PER_LORRY
             if len(group_items) > _MAX_DOS_PER_LORRY:
                 # Only split when the combined weight truly exceeds every
                 # available lorry's capacity.  If the full group fits on a
@@ -3173,11 +2992,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _n_items = len(group_items)
             _avg_w = total_w / _n_items if _n_items > 0 else total_w
             if _avg_w <= _TINY_ITEM_AVG_WEIGHT_T:
-                # Exclude any lorry ≥ 4.5T — these tiny-item routes need vans/small lorries
+                # Exclude lorries too large for tiny-item routes (narrow shophouse streets)
                 excluded = excluded | {
                     str(r["LORRY"]).strip().upper()
                     for _, r in engine.eligible_lorries.iterrows()
-                    if float(r["TON"]) >= 4.5
+                    if float(r["TON"]) >= LORRY_TINY_EXCL_TON
                 }
 
             # ── Within-session lorry sharing ──────────────────────────────────
@@ -3793,7 +3612,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # heavier than A's (so A's utilisation improves after taking B's items).
         # Pick the swap with the biggest waste reduction each round; repeat
         # until no improving swap remains.
-        _LARGE_T = 11.0
+        _LARGE_T = LORRY_LARGE_MIN_TON
         _pit: dict[str, list] = {}
         for _it in items:
             _pl = _it.get("LORRY")
@@ -3954,7 +3773,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # oscillation.  Each item may only be moved once (tracked by object id).
         # Example: BPE9788 (14T, 30% Temerloh) absorbs individual Kuantan DOs
         # from BQX9983 (10.5T, 95%) since PH05/PH09 are both east-bound.
-        _REBAL_THRESHOLD = 0.50
+        _REBAL_THRESHOLD = REBAL_THRESHOLD
         _rebal_moved: set = set()
         _rebal_ok = True
         while _rebal_ok:
@@ -4042,8 +3861,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # absorb unassigned items from the SAME route+city+state bucket sorted
         # by GPS proximity to the lorry's route centroid.  This prevents leaving
         # items unassigned when a compatible lorry still has headroom.
-        _FILL_TARGET = 0.80
-        _NAIK_FACTOR = 1.05
+        _FILL_TARGET = FILL_TARGET
+        _NAIK_FACTOR = NAIK_FACTOR
         # Rebuild load map from _pit
         _fill_ploads = {p: sum(x["WEIGHT"] for x in its) for p, its in _pit.items()}
         # Collect all currently unassigned items (NO_LORRY or None/blank)

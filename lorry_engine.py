@@ -20,49 +20,25 @@ import requests
 import pandas as pd
 from math import radians, degrees, atan2, cos, sin, asin, sqrt
 from typing import Optional
+from assignment_config import (
+    CLUSTER_MAP       as _CLUSTER_MAP,
+    CORRIDOR_MAP      as _CORRIDOR_MAP,
+    ADJACENT_CORRIDORS as _ADJACENT_CORRIDORS,
+    MAX_STOPS_PER_LORRY,
+    MERGE_DIST_THRESHOLD,
+    CAPACITY_TARGET,
+    MIN_UTIL_TO_ASSIGN,
+    OUTSTATION_MIN_TON  as _OUTSTATION_MIN_TON,
+    OUTSTATION_DIST_KM  as _OUTSTATION_DIST_KM,
+    LOCAL_ZONE_KM       as _LOCAL_ZONE_KM,
+    MAX_CROSS_CLUSTER_KM      as _MAX_CROSS_CLUSTER_KM,
+    MAX_CROSS_CLUSTER_BEARING as _MAX_CROSS_CLUSTER_BEARING,
+    DEPOT_LAT, DEPOT_LON,
+)
 
 
-# ── Route intelligence maps ───────────────────────────────────────────────────
-
-_CLUSTER_MAP = {
-    "KV": "KL_VALLEY",  "KL": "KL_CITY",
-    "JH": "JOHOR",      "NS": "NEGERI_SEMBILAN",
-    "PH": "PAHANG",     "PK": "PERAK",
-    "MC": "MELAKA",     "SB": "SABAH",
-    "SR": "SARAWAK",    "KD": "KEDAH",
-    "PN": "PENANG",     "TR": "TERENGGANU",
-    "KB": "KELANTAN",
-}
-
-_CORRIDOR_MAP = {
-    "N": "NORTH",    "S": "SOUTH",     "E": "EAST",      "W": "WEST",
-    "SE": "SOUTHEAST", "ES": "SOUTHEAST",
-    "NE": "NORTHEAST", "EN": "NORTHEAST",
-    "SW": "SOUTHWEST", "WS": "SOUTHWEST",
-    "NW": "NORTHWEST", "WN": "WEST_NORTH",
-    "C": "CENTRAL",  "P": "PORT",
-}
-
-# Rule 2: which corridors can share a lorry
-_ADJACENT_CORRIDORS = {
-    "NORTH":      {"NORTH", "WEST_NORTH", "NORTHWEST", "CENTRAL"},
-    "SOUTH":      {"SOUTH", "SOUTHEAST", "SOUTHWEST", "CENTRAL"},
-    "EAST":       {"EAST", "NORTHEAST", "SOUTHEAST", "CENTRAL"},
-    "WEST":       {"WEST", "WEST_NORTH", "NORTHWEST", "SOUTHWEST", "PORT"},
-    "SOUTHEAST":  {"SOUTHEAST", "EAST", "SOUTH"},
-    "NORTHEAST":  {"NORTHEAST", "EAST", "NORTH"},
-    "SOUTHWEST":  {"SOUTHWEST", "WEST", "SOUTH"},
-    "NORTHWEST":  {"NORTHWEST", "WEST", "NORTH", "WEST_NORTH"},
-    "CENTRAL":    {"CENTRAL", "NORTH", "SOUTH", "EAST", "WEST"},
-    "WEST_NORTH": {"WEST_NORTH", "NORTH", "WEST", "NORTHWEST"},
-    "PORT":       {"PORT", "WEST"},
-    "GENERAL":    {"GENERAL"},
-}
-
-MAX_STOPS_PER_LORRY   = 8     # Rule 6
-MERGE_DIST_THRESHOLD  = 0.25  # Rule 7: reject if extra dist > 25%
-CAPACITY_TARGET       = 0.80  # Rule 3: target >= 80% utilisation
-MIN_UTIL_TO_ASSIGN    = 0.10  # Rule 8: don't assign a lorry if load < 10% of its capacity
+# ── Route intelligence maps, capacities, and thresholds ──────────────────────
+# All constants imported from assignment_config.py (single source of truth).
 
 # ── Geographic cross-cluster merging (Nominatim/OSM + Haversine) ─────────────
 # Nominatim is the geocoding service behind OpenStreetMap — completely free,
@@ -280,8 +256,8 @@ def _bearing_diff(b1: float, b2: float) -> float:
     diff = abs(b1 - b2) % 360
     return diff if diff <= 180 else 360 - diff
 
-# Depot: Eng Sheng HQ — No 11 Persiaran Sabak Bernam, Section 26 (HICOM), 40400 Shah Alam
-_DEPOT = (3.0340, 101.5563)
+# Depot coordinates — imported from assignment_config
+_DEPOT = (DEPOT_LAT, DEPOT_LON)
 
 # Per-route GPS centroids derived from the LONGITUD column in the history file.
 # Populated by LorryEngine._load_history(); takes priority over waypoint geocoding.
