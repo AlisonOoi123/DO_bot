@@ -17,6 +17,19 @@ import pandas as pd
 from lorry_engine import LorryEngine
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ── Load assignment rules file ────────────────────────────────────────────────
+# ASSIGNMENT_RULES.md is the authoritative rules reference.  It is loaded once
+# at startup so the contents are available for logging/display.  All assignment
+# logic in this file must conform to the rules defined there.
+_RULES_PATH = os.path.join(_HERE, "ASSIGNMENT_RULES.md")
+try:
+    with open(_RULES_PATH, encoding="utf-8") as _rf:
+        ASSIGNMENT_RULES_TEXT = _rf.read()
+    print(f"[RULES] Loaded {_RULES_PATH} ({len(ASSIGNMENT_RULES_TEXT)} chars)")
+except FileNotFoundError:
+    ASSIGNMENT_RULES_TEXT = ""
+    print(f"[RULES] WARNING: {_RULES_PATH} not found — rules file missing!")
 # Keep data files in a separate subfolder so Flask's watchdog reloader
 # never sees Excel writes and restarts the server mid-request.
 _DATA_DIR = os.path.join(_HERE, "data")

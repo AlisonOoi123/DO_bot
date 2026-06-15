@@ -1,0 +1,263 @@
+# Lorry Assignment Rules
+# Version: 1.0 — Read by bot on every run. All rules below are MANDATORY.
+# Last updated: 2026-06-15
+
+---
+
+## SECTION 1 — DATE PRIORITY
+
+**RULE 1.1 — Earliest Date First**
+Always assign DOs with the earliest date first. Within any group sharing the same route + city + state, sort items by DATE ascending before assigning lorries. Older orders must never be displaced by newer orders for the same lorry slot.
+
+**RULE 1.2 — Capacity Split by Date**
+If a group's total weight exceeds any single lorry's capacity and must be split, the earliest-date items fill the first lorry. Newer items go to the second lorry or remain pending (NO_LORRY).
+
+---
+
+## SECTION 2 — GEOGRAPHIC GROUPING (Mandatory before assignment)
+
+**RULE 2.1 — Group by Route + City + State First**
+Before assigning any lorry, categorize all items by:
+  1. ROUTE (exact route code, e.g. KV11A)
+  2. STATE (e.g. KUALA LUMPUR, SELANGOR, PAHANG)
+  3. CITY (e.g. AMPANG, CHERAS, KUANTAN)
+Items sharing the same Route + State + City must be assigned to the SAME lorry.
+
+**RULE 2.2 — Nearest Longitude Within Same Bucket**
+Within the same Route + State + City bucket, sort items by nearest longitude (GPS proximity to lorry's route centroid). Geographically closest items are assigned together to avoid mixed-direction delivery runs.
+
+**RULE 2.3 — No Route Mixing Across Different Geography**
+Do NOT assign items from different cities, different states, or geographically distant longitudes to the same lorry unless they are in the same corridor group (see Rule 8.1). Items far apart in longitude or from different cities/states must use separate lorries.
+
+**RULE 2.4 — Urban Sub-Bucketing (KL / Selangor)**
+Urban routes (KV codes, KL, Selangor): split buckets by STATE + CITY.
+  - Example: KV11A items in KUALA LUMPUR city and KV11A items in AMPANG (SELANGOR) are separate buckets — different lorries.
+
+**RULE 2.5 — Outstation Sub-Bucketing (GPS Bearing)**
+Outstation routes (PH, NS, TR, PK, etc.): split buckets by STATE + GPS bearing octant from depot (N/NE/E/SE/S/SW/W/NW). Prevents same route code items pointing in genuinely opposite directions from sharing a lorry.
+
+---
+
+## SECTION 3 — LORRY SIZE RULES
+
+**RULE 3.1 — Small Lorry (≤5T) — Urban Only**
+Lorries with tonnage ≤ 5T (including 4.2T vans) may ONLY be assigned to KL or Selangor (urban) routes. They are STRICTLY FORBIDDEN on any outstation route (Kuantan, Pahang, Seremban, Negeri Sembilan, Tanjung Malim, Rawang outstation, Kemaman, Port Dickson, or any route > ~50 km from depot).
+
+**RULE 3.2 — Outstation Minimum Tonnage: 5.001T**
+Any route classified as outstation (LARGE_LONG or MEDIUM_LONG) requires a lorry with TON > 5T. The minimum effective tonnage is 5.001T. This applies to:
+  - LARGE_LONG: PH, TR, KB, JH, PK, KD, PN, MC, SB, SR (Pahang, Terengganu, Kelantan, Johor, Perak, Kedah, Penang, Melaka, Sabah, Sarawak)
+  - MEDIUM_LONG: NS (Negeri Sembilan / Seremban), KV01A (Rawang / Tanjung Malim direction toward Perak)
+
+**RULE 3.3 — Urban Routes Accept Any Lorry Size**
+KL and Selangor urban routes (KV codes) accept lorries of ANY size (van, small, medium, large). Lorry selection is weight-optimized (best-fit first). No upper tonnage cap for urban routes.
+
+**RULE 3.4 — Lorry Size Categories**
+  - SMALL: ≤ 5T (vans and small lorries)
+  - MEDIUM: 5T – 11T
+  - LARGE: ≥ 11T
+
+---
+
+## SECTION 4 — OUTSTATION ROUTE RULES
+
+**RULE 4.1 — Outstation Lorries Cannot Share Routes**
+Lorries assigned to outstation destinations (Kuantan, Pahang, Seremban, Tanjung Malim, Rawang outstation, Kemaman, Port Dickson, and all LARGE_LONG/MEDIUM_LONG clusters) must NOT share their lorry with items from a different outstation destination UNLESS the routes travel in the same geographic direction (bearing difference ≤ 80°) AND are within 60 km of each other.
+
+**RULE 4.2 — Direction Compatibility**
+Two outstation routes may share a lorry only if:
+  - Both are in the same route corridor group (see Rule 8.1), OR
+  - GPS centroids are within 60 km of each other AND bearing from depot differs by ≤ 80°.
+
+**RULE 4.3 — Outstation Hard Cap (1 Trip)**
+Outstation lorries make exactly ONE trip. Effective capacity = lorry's rated tonnage (no double-trip multiplier). LORRY NAIK (5% tolerance) still applies for same-route loads.
+
+**RULE 4.4 — Strict Lorry Reservations for Outstation**
+  - BQU3875: Pahang (PH) routes ONLY.
+  - WA6899M: Pahang (PH) routes ONLY — spare lorry, cannot serve urban.
+  - These lorries are forbidden from ALL other route types.
+
+---
+
+## SECTION 5 — DAILY ROUTE SCHEDULE (SCHD Sheet)
+
+**RULE 5.1 — Check SCHD Sheet Before Assignment**
+Before every assignment run, load the SCHD sheet for the current user from the LORRY DAILY PLANNING file:
+  - Sheet name: SCHD(abi) or SCHD(vivian) depending on logged-in user.
+  - The sheet maps each weekday (Monday–Saturday) to which route codes are scheduled.
+
+**RULE 5.2 — Only Assign Today's Scheduled Routes**
+Items whose route is NOT scheduled for today (or tomorrow if planning tomorrow's trip) are marked NOT_TODAY and left blank. The user is prompted to confirm if they want to assign NOT_TODAY routes anyway.
+
+**RULE 5.3 — Working Days: Monday to Saturday**
+The bot treats Monday through Saturday as working days. Sunday is the only rest day. "Tomorrow" always skips Sunday and lands on the next weekday (Mon–Sat). Saturday is a valid working day and must NOT be skipped.
+
+---
+
+## SECTION 6 — REMARKS-BASED RULES
+
+**RULE 6.1 — Day-Restricted Delivery (REMARKS_SKIP)**
+If a DO's REMARKS specify delivery days (e.g., "SELASA DAN JUMAAT", "TUESDAY & FRIDAY DELIVERY", "WEDNESDAY & SATURDAY") and today's weekday is NOT in that list, the item is marked REMARKS_SKIP and NOT assigned. It will not appear in the assignment output.
+
+**RULE 6.2 — Remarks Day Parsing**
+Day names accepted in remarks (Malay and English):
+  - ISNIN / MONDAY = 0, SELASA / TUESDAY = 1, RABU / WEDNESDAY = 2
+  - KHAMIS / THURSDAY = 3, JUMAAT / FRIDAY = 4, SABTU / SATURDAY = 5, AHAD / SUNDAY = 6
+Negative patterns (day is OFF/CLOSED) exclude that day from valid delivery days.
+
+**RULE 6.3 — Remarks That Are NOT Day Restrictions (Ignore)**
+Do not parse these as delivery-day restrictions:
+  - "SETIAP HARI", "DAILY", "EVERY DAY"
+  - "NEXT DAY MUST DELIVER", "SAME DAY DELIVERY"
+  - "LUNCH TIME", "MORNING TRIP", "AFTERNOON TRIP"
+  - "SMALL LORRY", "BIG LORRY", "LARGE LORRY", "LORRY KECIL"
+  - "WAKTU OPERASI", "OPERATION HOURS"
+  - Time ranges like "9AM - 4PM"
+
+**RULE 6.4 — Special Delivery Requirements in Remarks**
+  - "LORRY KECIL SAJA" / "LORRY KECIL" → assign only small lorry (≤5T)
+  - "VAN" / "VAN ONLY" → assign VAN-class vehicle only
+  - "LORI BESAR TIDAK BOLEH MASUK" → assign small lorry or van, NOT large
+  - These remarks override standard weight-based lorry selection.
+
+---
+
+## SECTION 7 — LORRY UTILIZATION RULES
+
+**RULE 7.1 — 80% Utilization Target**
+Every lorry that is assigned at least one DO must reach ≥ 80% utilization (based on gross weight vs lorry rated tonnage). After initial assignment, run a fill-to-80% pass: find unassigned items from the same route + city + state bucket, sorted by GPS proximity, and add them to underloaded lorries until ≥ 80% is reached or no more matching items exist.
+
+**RULE 7.2 — LORRY NAIK (5% Overload Tolerance)**
+Lorries may carry up to 5% over their rated tonnage (LORRY NAIK). Effective maximum capacity = rated TON × 1.05. Same-route loads may use up to 10% overage (× 1.10).
+  - Use NAIK capacity in split threshold checks: if a group fits within TON × 1.05, keep it on ONE lorry — do NOT split.
+
+**RULE 7.3 — Double-Trip for Urban Small/Medium Lorries**
+Small and medium lorries (< 11T) on urban (KL/Selangor) routes can make 2 trips per day (morning + afternoon). Their effective capacity = rated TON × 2 for urban route scheduling. Large lorries (≥ 11T) and any lorry on outstation routes make exactly 1 trip (hard cap, no double-trip).
+
+**RULE 7.4 — Minimum Utilization Threshold (Outstation)**
+Do not dispatch an outstation lorry with < 10% utilization. Exception: urban routes (always ship regardless of load) and tiny-item routes (e.g. KV11A).
+
+---
+
+## SECTION 8 — ROUTE CORRIDOR GROUPS
+
+**RULE 8.1 — Corridor Group Definition**
+Routes within the same corridor group may share a lorry even if they don't perfectly overlap geographically:
+  - NS: [NS04, NS05, NS06, NS07, NS08] — Negeri Sembilan corridor
+  - PH_INT: [PH01, PH02, PH03, PH04, PH05, PH06, PH07, PH08] — Pahang interior
+  - KV_NORTH: [KV01A, KV02A, KV04A] — North KL / Damansara / Rawang
+  - KV_EAST: [KV10A, KV11A, KV12A] — East KL / Chow Kit / Pudu / Ampang
+
+**RULE 8.2 — Urban Routes: Corridor Group Only for Cross-Route Sharing**
+For KL/Selangor urban routes, a lorry may only accept items from a DIFFERENT route if both routes are in the SAME corridor group. GPS bearing alone is NOT sufficient to mix urban routes. Example: KV08A (Gombak/Setapak) and KV11A (Pudu/Cheras) both point "east" from depot but are NOT in the same corridor group → must use separate lorries.
+
+**RULE 8.3 — Outstation Routes: Corridor Group OR Same-Way Bearing**
+For outstation routes, cross-route sharing is allowed if:
+  - Both routes are in the same corridor group, OR
+  - GPS bearing from depot differs by ≤ 80° AND centroids are within 60 km.
+
+---
+
+## SECTION 9 — PREFERRED LORRY ASSIGNMENTS
+
+**RULE 9.1 — Preferred Lorry Per Route**
+Each route has a preferred lorry list. The preferred lorry is tried FIRST during assignment if it is the tightest-fitting available (within 1T of best available capacity). Preferred lorries are NOT forced if a significantly better fit is available.
+
+Key preferred assignments:
+  - KV01A, KV02A → BQY7823, BMN3682 (north corridor)
+  - KV04A → BQY7823, BMN3682
+  - KV05A → WA6899M, BMN3682
+  - KV06A, KV07A → W3618U, W3826C (tight inner-KL, 4.2T only)
+  - KV10A → W3826C, W3618U
+  - KV11A → VKN8836, W3618U, W3826C (shophouse deliveries, small lorry only)
+  - KV18A, KV19A, KV20A → BPE9788, VJN9910, VEA2818 (SE corridor)
+  - NS routes → BQX9983, BMN3682
+  - PH routes → BPE9788, WA6899M
+  - Long-haul (PK, JH, TR, KB, KD, PN) → VJN9910, BQY7823, BQX9983, VER2872
+
+**RULE 9.2 — Tiny-Item Routes (Small Lorry Mandatory)**
+Routes with average DO weight ≤ 150 kg (e.g., KV11A ~46 kg/DO) MUST use small lorries or vans. Lorries ≥ 4.5T are excluded from tiny-item routes because large trucks cannot maneuver in narrow shophouse streets.
+
+---
+
+## SECTION 10 — STATE BOUNDARY RULES
+
+**RULE 10.1 — No Cross-State Lorry Assignment**
+Once a lorry is committed to a destination state (e.g., PAHANG), it cannot serve items destined for a different state (e.g., TERENGGANU) in the same session.
+
+**RULE 10.2 — KL / Selangor Exception**
+KUALA LUMPUR and SELANGOR are treated as compatible states. A lorry serving KL items may also serve Selangor items (and vice versa) within the same session. This applies only to urban KV routes.
+
+---
+
+## SECTION 11 — SPLIT RULES
+
+**RULE 11.1 — Do Not Split If It Fits**
+Before splitting a group across multiple lorries, check if the total weight fits within any available lorry's NAIK capacity (TON × 1.05). If yes, keep the group on ONE lorry. Never create two underloaded lorries when one lorry can handle the load.
+
+**RULE 11.2 — Split Threshold: 15 DOs Per Lorry**
+If a bucket group has more than 15 DOs AND total weight exceeds all available lorry NAIK capacities, split the group. Always split by DATE (earliest DOs fill the first lorry).
+
+**RULE 11.3 — Bin-Pack for Overflow**
+For groups of > 1 unassigned item sharing the same city + state: attempt a bin-pack split across 2 eligible lorries (heaviest items first) before resorting to individual overflow. If bin-pack fails, process individually with ≤ 1T overage tolerance.
+
+---
+
+## SECTION 12 — CROSS-USER AND SCHEDULE FILTERING
+
+**RULE 12.1 — Cross-User Routes (OTHER_USER)**
+Each user (ABI, VIVIAN, TRANSPORT) owns specific route prefixes (defined in their ROUTE sheet). Items with a route prefix NOT belonging to the logged-in user are marked OTHER_USER and left blank. Cross-user assignment is NOT allowed.
+
+**RULE 12.2 — Pre-Filled LICENSE Column**
+  - Case A (all rows filled): Register plates as assigned today. Show summary. Do NOT re-assign.
+  - Case B (some rows blank): Respect pre-filled plates as capacity seeds. Auto-assign only blank rows.
+
+---
+
+## SECTION 13 — SENTINEL VALUES (Skip List)
+
+Items with any of the following statuses are NEVER auto-assigned:
+  - OTHER_USER — route belongs to a different user
+  - NOT_TODAY — route not on today's SCHD schedule
+  - REMARKS_SKIP — REMARKS restrict delivery to days that don't include today
+  - NO_LORRY — no eligible lorry found (manual intervention required)
+  - SKIPPED — manually skipped by user
+  - Blank / None / "nan" / "n/a" / "-"
+
+---
+
+## SECTION 14 — OPTIMIZATION PASSES (Run in Order)
+
+After initial group assignment, run the following passes in sequence:
+
+1. **Lorry-Swap Pass** — Swap large underloaded lorry with small overloaded lorry if: large load fits on small, small is heavier, and large load fills small to ≥ 70%.
+2. **Same-Route Merge Pass** — If lorry A's entire load fits on lorry B (same or compatible route), merge A onto B to free a lorry.
+3. **Partial-Transfer Rebalance Pass** — Move individual items from well-loaded lorries (≥ 50%) onto underloaded lorries (< 50%) when routes are compatible and source stays above threshold.
+4. **Fill-to-80% Pass** — Absorb unassigned items from same route + city + state bucket (sorted by GPS proximity) onto lorries below 80% utilization, up to NAIK capacity (× 1.05).
+5. **Hard Capacity Guard** — Trim any lorry exceeding physical capacity: keep nearest-to-depot items, mark overflow as NO_LORRY.
+
+---
+
+## SECTION 15 — GEOGRAPHIC CONSTANTS
+
+  - Depot / HQ: HICOM Shah Alam (3.0340°N, 101.5563°E)
+  - Outstation distance threshold: ≥ 50 km from depot
+  - Max outstation city merge radius: 60 km
+  - Max bearing difference for same-direction merge: 80°
+  - LOCAL zone radius: 8 km from depot (fallback to city sub-key if within zone)
+
+---
+
+## SECTION 16 — SPECIFIC ROUTE CLASSIFICATIONS
+
+  - KV02A (Batu Beruntung / Serendah / Rawang area): classified as SELANGOR (urban) — any lorry size eligible.
+  - KV01A (Rawang / Tanjung Malim toward Perak): classified as MEDIUM_LONG (outstation) — minimum 5.001T.
+  - KV05A (Selayang / Batu Caves): SELANGOR urban.
+  - KV04A (Sungai Buloh / Kota Damansara): KV_NORTH corridor, SELANGOR urban.
+  - PH routes: all outstation LARGE_LONG — Pahang minimum 5.001T, preferred BPE9788 / WA6899M.
+  - NS routes: outstation MEDIUM_LONG — Negeri Sembilan minimum 5.001T, preferred BQX9983 / BMN3682.
+  - TR02 (Kemaman): outstation LARGE_LONG.
+  - NS04, NS06 (Port Dickson, Seremban): outstation MEDIUM_LONG — minimum 5.001T.
+
+---
+
+## END OF RULES FILE
