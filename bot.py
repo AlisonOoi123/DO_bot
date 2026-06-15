@@ -2533,12 +2533,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     or _oct_base == "LOCAL" or _oct_cand == "LOCAL"
                     or _oct_cand != _OPPOSITE.get(_oct_base, "")
                 )
-                # State boundary check — different state = different lorry
+                # State boundary check — different state = different lorry.
+                # Exception: same route prefix (e.g. both KV01A) always merges —
+                # the route already accounts for cross-state travel.
                 _st_base = _state_from_bkey(base_bkey)
                 _st_cand = _state_from_bkey(cand_bkey)
                 _same_state = (
                     not _st_base or not _st_cand
                     or _st_base == _st_cand
+                    or base_route == cand_route  # same route code → allow cross-state merge
                 )
 
                 # City-proximity check for outstation routes: only merge city
