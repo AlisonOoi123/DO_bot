@@ -2191,30 +2191,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
             _remarks_raw = str(row.get("REMARKS", "")).strip()
 
-            # Remarks-day filter: if the remark explicitly specifies delivery days
-            # (e.g. "SELASA DAN JUMAAT", "FRIDAY") and today is NOT one of those
-            # days, mark the item as day-restricted — it should not be assigned.
-            _remarks_day_restricted = False
-            if _is_mine and _is_today:
-                _rm_days = _remarks_days_for(_remarks_raw)
-                if _rm_days is not None:
-                    # Compute trip weekday
-                    _td_obj = datetime.now().date()
-                    if sess.get("trip_day") == "tomorrow":
-                        _td_obj += __import__("datetime").timedelta(days=1)
-                        while _td_obj.weekday() == 6:
-                            _td_obj += __import__("datetime").timedelta(days=1)
-                    _trip_wd_check = _td_obj.weekday()
-                    if _trip_wd_check not in _rm_days:
-                        _remarks_day_restricted = True
+            # Remarks-day filter DISABLED by request: assignment now depends only
+            # on the trip day the user selected at login (today/tomorrow) plus the
+            # SCHD schedule check above. Delivery-day hints in REMARKS (e.g.
+            # "SABTU", "JANGAN HANTAR SELASA", "KEDAI TUTUP RABU") no longer block
+            # assignment — the user decides the day.
 
             _lorry_init = None
             if not _is_mine:
                 _lorry_init = "OTHER_USER"
             elif not _is_today:
                 _lorry_init = "NOT_TODAY"
-            elif _remarks_day_restricted:
-                _lorry_init = "REMARKS_SKIP"
             elif sess.get("_prefilled_count"):
                 # Case B: pre-filled file — rows that already have a valid lorry
                 # plate in LICENSE keep that assignment so session_loads is accurate.
