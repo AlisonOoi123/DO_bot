@@ -189,7 +189,7 @@ For outstation routes, cross-route sharing is allowed if:
 **RULE 9.1 — Preferred Lorry Per Route**
 Each route has a preferred lorry list. The preferred lorry is tried FIRST during assignment if it is the tightest-fitting available (within 1T of best available capacity). Preferred lorries are NOT forced if a significantly better fit is available.
 
-The preferred lists are DERIVED FROM REAL MANUAL-ASSIGNMENT HISTORY (data/ZSDOROUTEWRH):
+The preferred lists are DERIVED FROM REAL MANUAL-ASSIGNMENT HISTORY (data/ZSDOROUTEWRH.xlsx):
 for each route, the lorries the owning planner (ABI or VIVIAN) used most often,
 counting only owner-owned + SPARE lorries — cross-owner borrows/swaps are ignored.
 Route codes are matched by LONGEST prefix, so specific codes (e.g. KV24A → VIVIAN)

@@ -226,7 +226,7 @@ LORRY_STRICT_ROUTE: dict[str, set[str]] = {
 # Matched by route-code prefix (startswith) — SPECIFIC route codes are listed
 # FIRST so they win over the generic 2-char cluster fallbacks at the bottom.
 #
-# Derived from real manual-assignment history (data/ZSDOROUTEWRH): for each
+# Derived from real manual-assignment history (data/ZSDOROUTEWRH.xlsx): for each
 # route, the lorries the owning planner (ABI or VIVIAN) most frequently used,
 # counting only owner-owned + SPARE lorries (cross-owner borrows/swaps ignored).
 # When ABI is logged in only ABI+SPARE lorries are eligible, and when VIVIAN is

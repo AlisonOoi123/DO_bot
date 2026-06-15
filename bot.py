@@ -72,8 +72,9 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 
 PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY DAILY PLANNING.xlsx")         # lorry naik + route codes
 MASTER_PATH    = PLANNING_PATH   # alias kept for backwards compat inside engine calls
-# History paths — checked in priority order; .xls preferred as it contains LONGITUD GPS data
-HISTORY_PATH_XLS = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xls")               # new format with LONGITUD column
+# History path — single source of truth (manual-assignment history, new format
+# with LONGITUD GPS column).  Use the .xlsx everywhere; the old .xls duplicate is
+# no longer referenced so it can be deleted.
 HISTORY_PATH     = os.path.join(_DATA_DIR, "ZSDOROUTEWRH.xlsx")               # primary (new format, manual assignments)
 HISTORY_PATH_ALT = os.path.join(_DATA_DIR, "ZSDOROUTEWRH-bot.xlsx")          # bot-exported (new format)
 HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx")  # legacy reference
@@ -646,9 +647,10 @@ def _strict_route_excl(route_text: str) -> set:
 
 def _resolve_history_path() -> str:
     """Return the best available history file.
-    Prefers the .xls version (has LONGITUD GPS column) over .xlsx fallbacks.
+    Single source of truth is the .xlsx; bot-exported and legacy files are
+    fallbacks only.
     """
-    for p in [HISTORY_PATH_XLS, HISTORY_PATH, HISTORY_PATH_ALT, HISTORY_PATH_OLD]:
+    for p in [HISTORY_PATH, HISTORY_PATH_ALT, HISTORY_PATH_OLD]:
         if os.path.exists(p):
             return p
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
@@ -1021,7 +1023,7 @@ def handle_message(phone: str, text: str = None,
         _e = sess.get("engine")
         if _e is None and sess.get("user_id"):
             try:
-                _e = LorryEngine(MASTER_PATH, HISTORY_PATH, owner_user=sess["user_id"])
+                _e = LorryEngine(MASTER_PATH, _resolve_history_path(), owner_user=sess["user_id"])
             except Exception:
                 pass
         return _e
