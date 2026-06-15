@@ -4105,6 +4105,79 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     sess["assigned"][_it["DO NUMBER"]] = "NO_LORRY"
             _pit[_pl] = _kept
 
+        # ── Reassign trimmed overflow to idle/available lorries ───────────────
+        # The hard capacity guard above may strand items as NO_LORRY when a small
+        # preferred lorry (e.g. a van) was chosen on its 2-trip effective capacity
+        # but can only physically carry one trip.  Those items must still ship if
+        # ANY eligible lorry has physical room — otherwise idle lorries sit unused
+        # while DOs go unassigned.  Recompute true physical loads from items, then
+        # place each stranded item on the tightest-fitting compatible lorry.
+        _phys_load: dict[str, float] = defaultdict(float)
+        for _it in items:
+            _lp = _it.get("LORRY")
+            if _lp and _lp not in ("NO_LORRY", "OTHER_USER", "NOT_TODAY",
+                                    "REMARKS_SKIP", "SPLIT", "SKIPPED", "", None):
+                _phys_load[_lp] += _it["WEIGHT"]
+
+        for _it in items:
+            if _it.get("LORRY") != "NO_LORRY":
+                continue
+            _w        = _it["WEIGHT"]
+            _it_route = _it.get("ROUTE", "")
+            _it_state = _it.get("STATE", "").strip().upper()
+            _it_dest  = _classify_dest_group(_it_route, _it.get("STATE", ""))
+            _it_min_t = _DEST_MIN_TON.get(_it_dest, 0.0)
+            _it_strict_r = _strict_route_excl(_it_route)
+            _it_urban = _it_dest in _DEST_URBAN_GROUPS
+
+            _cands = []
+            for _cp, _ccap in _lorry_cap_map.items():
+                _ccap = float(_ccap)
+                if _cp in sess.get("unavailable", set()):
+                    continue
+                _crem = _ccap - _phys_load.get(_cp, 0.0)
+                if _crem < _w:
+                    continue
+                if _ccap < _it_min_t:
+                    continue
+                if _it.get("MAX_TON") is not None and _ccap > _it["MAX_TON"]:
+                    continue
+                if _cp in _it_strict_r:
+                    continue
+                # Route/direction compatibility with whatever the lorry already carries
+                _cp_rt = _session_routes.get(_cp, "")
+                if _cp_rt and _it_route != _cp_rt:
+                    _cp_urban = _classify_dest_group(_cp_rt) in _DEST_URBAN_GROUPS
+                    if _it_urban or _cp_urban:
+                        if not _same_corridor_group(_it_route, _cp_rt):
+                            continue
+                    elif (not _same_corridor_group(_it_route, _cp_rt)
+                          and not _routes_on_same_way(_it_route, _cp_rt)):
+                        continue
+                # State compatibility
+                _cp_states = (_consol_lorry_states.get(_cp, set())
+                              | _session_lorry_states.get(_cp, set()))
+                if _it_state and _cp_states and not any(
+                        _states_compatible(_it_state, s) for s in _cp_states):
+                    continue
+                _cands.append((_crem, _cp))
+
+            if not _cands:
+                continue
+            _cands.sort()                      # tightest physical fit first
+            _pick = _cands[0][1]
+            _it["LORRY"] = _pick
+            _phys_load[_pick] += _w
+            _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + _w
+            if _it_state:
+                _consol_lorry_states.setdefault(_pick, set()).add(_it_state)
+            _record_lorry_state(_pick, _it_state)
+            if _pick not in _session_routes:
+                _session_routes[_pick] = _it_route
+            _pit.setdefault(_pick, []).append(_it)
+            sess["assigned"][_it["DO NUMBER"]] = _pick
+            _unassigned_reasons.pop(_it["DO NUMBER"], None)
+
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
