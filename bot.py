@@ -2933,22 +2933,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
 
-            # ── Effective-capacity helper (accounts for 2-trip local runs) ─────
-            # LARGE lorries (≥11T): hard cap — outstation runs take the full day.
-            # MEDIUM/SMALL lorries on LOCAL routes: 2 trips (morning + afternoon).
-            # Any lorry on OUTSTATION routes: hard cap (1 trip).
+            # ── Effective-capacity helper ─────────────────────────────────────
+            # Per user preference: assign by SINGLE-trip physical capacity only —
+            # always pick the smallest lorry that fits in one trip. No 2-trip
+            # (morning+afternoon) capacity crediting, which previously let a small
+            # van "fit" a group it could not physically carry in one load.
             def _eff_cap_for(plate: str, grp_dest: str) -> float:
-                cap = float(_lorry_cap_map.get(plate, 0.0))
-                if cap >= 11.0:
-                    return cap   # large lorries never double-trip
-                lorry_dest = _classify_dest_group(
-                    _session_routes.get(plate, ""))
-                # Allow double capacity only when BOTH lorry's existing route
-                # AND the new group are LOCAL (KV/KL/Selangor).
-                if (lorry_dest in _DEST_URBAN_GROUPS
-                        and grp_dest in _DEST_URBAN_GROUPS):
-                    return cap * 2  # morning + afternoon trips
-                return cap
+                return float(_lorry_cap_map.get(plate, 0.0))
 
             # ── Destination group — must be defined BEFORE _session_full ─────────
             # LARGE_LONG  (Pahang/Kuantan/Terengganu/…): must use ≥14T lorry
