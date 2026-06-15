@@ -2495,13 +2495,36 @@ def _handle_excel_upload(phone, sess, file_bytes):
                              sum(it["WEIGHT"] for it in cand_bucket)
                 n_distinct = len({it["ROUTE"] for it in merged_items}) + 1
 
-                # Don't merge routes whose preferred-lorry sets are disjoint
+                # Don't merge routes whose preferred-lorry sets are disjoint —
+                # unless BOTH routes are urban (KL/Selangor) and their GPS centroids
+                # are within _MAX_CITY_MERGE_KM_OUTSTATION of each other, in which
+                # case proximity overrides the preferred-lorry constraint so nearby
+                # city routes (e.g. KV05A + KV19A, both around KL) can share one lorry.
                 _base_pref = set(_preferred_lorries_for_route(base_route))
                 _cand_pref = set(_preferred_lorries_for_route(cand_route))
+                _base_dest_g_pref = _classify_dest_group(base_route, "")
+                _cand_dest_g_pref = _classify_dest_group(cand_route, "")
+                _both_urban = (_base_dest_g_pref in _DEST_URBAN_GROUPS
+                               and _cand_dest_g_pref in _DEST_URBAN_GROUPS)
+                # Check GPS proximity between the two route centroids.
+                # Use live GPS from uploaded items first; fall back to static centroid DB.
+                _bc_pref = (_live_centroids.get(base_bkey)
+                            or _live_centroids.get(base_route)
+                            or _route_centroid(base_route))
+                _cc_pref = (_live_centroids.get(cand_bkey)
+                            or _live_centroids.get(cand_route)
+                            or _route_centroid(cand_route))
+                _geo_close = (
+                    _both_urban
+                    and _bc_pref and _cc_pref
+                    and _haversine_km(_bc_pref[0], _bc_pref[1], _cc_pref[0], _cc_pref[1])
+                        <= _MAX_CITY_MERGE_KM_OUTSTATION
+                )
                 _pref_overlap = (
                     not _base_pref
                     or not _cand_pref
                     or bool(_base_pref & _cand_pref)
+                    or _geo_close   # urban routes close together may share a lorry
                 )
 
                 # Don't merge buckets whose GPS bearing octants are incompatible,
@@ -2584,14 +2607,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             )
 
                 _corridor_merge = _same_corridor_group(base_route, cand_route)
+                _urban_prox_merge = _geo_close
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
-                    and (_routes_on_same_way(base_route, cand_route) or _corridor_merge)
+                    and (_routes_on_same_way(base_route, cand_route) or _corridor_merge
+                         or _urban_prox_merge)
                     and _pref_overlap
                     and _geo_ok
                     and _same_state
-                    and (_city_dist_ok or _corridor_merge)
+                    and (_city_dist_ok or _corridor_merge or _urban_prox_merge)
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
