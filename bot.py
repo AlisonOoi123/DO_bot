@@ -193,17 +193,39 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
 
     # Negative patterns: a day mentioned as CLOSED / OFF / not accepted.
     # Patterns: "<DAY> OFF", "<DAY> TUTUP", "<DAY> TAK TERIMA", "TUTUP <DAY>",
-    #           "CLOSED <DAY>", "TAK TERIMA <DAY>", "<DAY> TIDAK HANTAR"
+    #           "CLOSED <DAY>", "TAK TERIMA <DAY>", "<DAY> TIDAK HANTAR",
+    #           "KEDAI TUTUP" (shop closed on those days),
+    #           "JANGAN HANTAR <DAY>" (do not deliver on those days)
     _NEG_SUFFIX = (
-        r'\s+(?:OFF|TUTUP|TAK\s+TERIMA(?:\s+BARANG)?'
+        r'(?:[\s:]+\w+)*[\s:]+(?:OFF|TUTUP|TAK\s+TERIMA(?:\s+BARANG)?'
         r'|TIDAK\s+(?:TERIMA|HANTAR|ACCEPT|BOLEH)'
         r'|CLOSED|BLOCKED|SKIP|TOLAK)'
     )
     _NEG_PREFIX = (
         r'(?:TUTUP|CLOSED|OFF|TAK\s+TERIMA(?:\s+BARANG)?'
-        r'|TIDAK\s+(?:TERIMA|HANTAR))\s+'
+        r'|TIDAK\s+(?:TERIMA|HANTAR)'
+        r'|JANGAN\s+HANTAR(?:\s+BARANG)?)'
+        r'(?:\s+(?:DALAM|PADA|HARI|BARANG))*\s+'
     )
-    neg_days: set[int] = set()
+    # Sentence-level negation: if the whole clause contains a block keyword,
+    # all day keywords found in that same clause are treated as negated.
+    # Split on common clause separators (-->  /  ;  ,  &-free boundary).
+    _CLAUSE_NEG = re.compile(
+        r'\b(?:JANGAN\s+HANTAR(?:\s+BARANG)?'
+        r'|TIDAK\s+(?:TERIMA|HANTAR)'
+        r'|TAK\s+TERIMA(?:\s+BARANG)?'
+        r'|KEDAI\s+TUTUP|TUTUP|CLOSED|OFF)\b'
+    )
+    # Split remark into clauses on --> or ; separators
+    clauses = re.split(r'-->', txt)
+    clause_neg_days: set[int] = set()
+    for clause in clauses:
+        if _CLAUSE_NEG.search(clause):
+            for kw, wd in _REMARKS_KEYWORD_DAY:
+                if re.search(r'\b' + re.escape(kw) + r'\b', clause):
+                    clause_neg_days.add(wd)
+
+    neg_days: set[int] = set(clause_neg_days)
     for kw, wd in _REMARKS_KEYWORD_DAY:
         kw_re = r'\b' + re.escape(kw) + r'\b'
         if re.search(kw_re + _NEG_SUFFIX, txt):
@@ -217,8 +239,10 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
         if wd not in neg_days and re.search(r'\b' + re.escape(kw) + r'\b', txt):
             days.add(wd)
 
-    # If only negation was found (no positive days), treat as no restriction —
-    # the customer just noted which day(s) to avoid; all others are fine.
+    # If only negation was found (no positive days), invert: allow all weekdays
+    # except the blocked ones (Mon-Sat = 0-5, skip Sun=6 as no deliveries).
+    if not days and neg_days:
+        return {d for d in range(6) if d not in neg_days}
     return days if days else None
 
 
