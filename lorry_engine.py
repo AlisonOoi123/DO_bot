@@ -474,7 +474,7 @@ class LorryEngine:
         self._build_daily_stop_counts()
 
     def _load_master(self, path):
-        """Load lorry capacities from LORRY_DAILY_PLANNING.xlsx MUATAN sheet.
+        """Load lorry capacities from LORRY DAILY PLANNING.xlsx MUATAN sheet.
 
         Sheet layout (no header row):
           Col 0: LORRY plate (or section label ABI / VIVIAN / SPARE / …)

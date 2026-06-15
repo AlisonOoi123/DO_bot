@@ -170,6 +170,39 @@ REMARKS_KEYWORD_DAY: list[tuple[str, int]] = [
     ("SUNDAY",   6), ("SUN",   6),
 ]
 
+# ── REMARKS FIELD — lorry tonnage requirement (FIELD 3) ───────────────────────
+# The "REMARKS FIELD" sheet in LORRY DAILY PLANNING.xlsx defines the canonical
+# remark phrases planners use.  FIELD 3 specifies which lorry size a DO needs.
+# A DO whose REMARKS match one of these phrases MUST be assigned to a lorry whose
+# rated tonnage is at or below the cap.  When REMARKS are empty, no cap applies
+# and the DO follows normal city + state + nearest-longitude grouping.
+#
+# phrase (UPPER, substring match) → max lorry tonnage allowed (None = any size)
+REMARKS_FIELD3_TON_CAP: dict[str, float | None] = {
+    "VAN":           2.0,    # van class only (≤ 2T)
+    "BELOW 5 TON":   5.0,
+    "BELOW 10 TON":  10.0,
+    "BELOW 14 TON":  14.0,
+    "BELOW 20 TON":  20.0,
+    "ANY SIZE":      None,    # explicit no-cap
+}
+
+# Free-text remark phrases (mixed Malay/English) that imply a size cap but do
+# not use the canonical FIELD 3 wording.  Mapped to the same tonnage caps.
+REMARKS_SIZE_ALIASES: dict[str, float | None] = {
+    "LORRY KECIL SAHAJA":        5.0,
+    "LORRY KECIL SAJA":          5.0,
+    "LORRY KECIL":               5.0,
+    "LORI KECIL":                5.0,
+    "SMALL LORRY":               5.0,
+    "LORI BESAR TIDAK BOLEH":    5.0,   # big lorry can't enter → small only
+    "LORRY BESAR TIDAK BOLEH":   5.0,
+    "LORI BESAR TAK BOLEH":      5.0,
+    "BIG LORRY":                 None,
+    "LORI BESAR":                None,
+    "LORRY BESAR":               None,
+}
+
 # ── Route corridor groups ─────────────────────────────────────────────────────
 # Routes in the same group always merge before lorry lock — prevents greedy
 # single-route assignment from starving adjacent routes in the same corridor.
@@ -190,46 +223,93 @@ LORRY_STRICT_ROUTE: dict[str, set[str]] = {
 
 # ── Preferred lorry per route ─────────────────────────────────────────────────
 # Ordered list: first plate is primary, remainder are backups.
-# Matched by route-code prefix (startswith).
+# Matched by route-code prefix (startswith) — SPECIFIC route codes are listed
+# FIRST so they win over the generic 2-char cluster fallbacks at the bottom.
+#
+# Derived from real manual-assignment history (data/ZSDOROUTEWRH): for each
+# route, the lorries the owning planner (ABI or VIVIAN) most frequently used,
+# counting only owner-owned + SPARE lorries (cross-owner borrows/swaps ignored).
+# When ABI is logged in only ABI+SPARE lorries are eligible, and when VIVIAN is
+# logged in only VIVIAN+SPARE — so both owners' preferences can coexist here.
 ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
+    # ── ABI routes ────────────────────────────────────────────────────────────
     # North KL corridor — Rawang / Tanjung Malim
-    "KV01A": ["BQY7823", "BMN3682"],
-    "KV02A": ["BQY7823", "BMN3682"],
-    # Inner-KL tight streets (4.2T only)
-    "KV06A": ["W3618U",  "W3826C"],
-    "KV07A": ["W3618U",  "W3826C"],
+    "KV01A": ["BQY7823", "BMN3682", "VER2872"],
+    "KV02A": ["BQY7823", "VER2872", "BQX9983", "BMN3682"],
+    "KV04A": ["W3826C",  "W3618U",  "BQX7228", "BMN3682"],
+    # Selayang / Batu Caves
+    "KV05A": ["BQX7228", "W3618U",  "W3826C"],
+    # Inner-KL tight streets (4.2T / van)
+    "KV06A": ["W3826C",  "BQX7228", "W3618U"],
+    "KV07A": ["W3618U",  "W3826C",  "BQX7228"],
+    "KV08A": ["BQX7228", "W3826C",  "W3618U"],
+    "KV09A": ["BQX7228", "W3618U",  "W3826C"],
     # Central KL
-    "KV10A": ["W3826C",  "W3618U"],
+    "KV10A": ["W3826C",  "BQX7228", "W3618U"],
     # Pudu / Ampang shophouse (van / small lorry only)
-    "KV11A": ["VKN8836", "W3618U",  "W3826C"],
-    # Southeast KL corridor — Cheras / Kajang / Semenyih
-    "KV18A": ["BPE9788", "VJN9910", "VEA2818"],
-    "KV19A": ["BPE9788", "VJN9910", "VEA2818"],
-    "KV20A": ["BPE9788", "VJN9910", "VEA2818"],
+    "KV11A": ["VEA2818", "VKN8836", "W3826C", "BQX7228", "W3618U"],
+    "KV12A": ["BQX7228", "W3826C",  "W3618U"],
+    # ABI Southeast / Cheras-Kajang corridor (medium lorries)
+    "KV19A": ["BQX9983", "BMN3682", "BPE9788"],
+    "KV20A": ["BMN3682", "BQX9983", "BPE9788"],
+    "KV24":  ["BQX9983", "BMN3682", "BPE9788"],   # Semenyih (no history → SE fallback)
     # Negeri Sembilan corridor
-    "NS04":  ["BQX9983", "BMN3682"],
-    "NS05":  ["BQX9983", "BMN3682"],
-    "NS06":  ["BQX9983", "BMN3682"],
+    "NS04":  ["BQX9983", "BPE9788", "BQY7823"],
+    "NS05":  ["BQX9983", "BMN3682", "BQY7823"],
+    "NS06":  ["BQX9983", "BQY7823", "BMN3682"],
     # Pahang interior
-    "PH01":  ["BPE9788", "WA6899M"],
-    "PH02":  ["BPE9788", "WA6899M"],
-    "PH03":  ["BPE9788", "WA6899M"],
-    "PH04":  ["BPE9788", "WA6899M"],
-    "PH05":  ["BPE9788", "WA6899M"],
-    "PH06":  ["BPE9788", "WA6899M"],
-    "PH07":  ["BPE9788", "WA6899M"],
-    "PH08":  ["BPE9788", "WA6899M"],
-    # Long-haul outstation
-    "PK":    ["VJN9910", "BQY7823", "BQX9983"],
-    "JH":    ["VJN9910", "BQX9983", "BQY7823"],
+    "PH01":  ["BPE9788", "BQX9983", "BMN3682"],
+    "PH02":  ["BQX9983", "BPE9788", "BMN3682"],
+    "PH03":  ["BPE9788", "BQX9983", "BQY7823"],
+    "PH04":  ["BPE9788", "BQY7823", "BQX9983"],
+    "PH05":  ["BPE9788", "BQY7823", "BQX9983", "BMN3682"],
+    "PH06":  ["BPE9788", "BMN3682", "BQX9983", "BQY7823"],
+    "PH07":  ["BQX9983", "BPE9788", "BMN3682"],
+    "PH09":  ["VJN9910", "BQU3875", "VER2872", "BQY7823"],   # Kuantan — heaviest run
+    "PH10":  ["BQX9983", "BPE9788"],
+    "PH11":  ["BPE9788", "BQX9983", "BMN3682"],   # Temerloh (no history → PH fallback)
+    "TR02":  ["BQY7823", "VER2872", "WA6899M"],
+    # ── VIVIAN routes ─────────────────────────────────────────────────────────
+    # Johor corridor
+    "JH01":  ["VJN8929", "VJA7981", "VNL6819"],
+    "JH05":  ["VJN8929", "WA9225H", "VNL6819"],
+    "JH06":  ["VJN8929", "VJA7981"],
+    "JH09":  ["BPR9226", "WA9225H", "VJN8929"],
+    "JH10":  ["VJN8929", "VJA7981", "VNL6819"],   # no history → JH fallback
+    # Klang Valley (VIVIAN) — small/medium lorries
+    "KV03A": ["VCC3998", "BPE9878", "VNL6819", "WA9225H"],
+    "KV13A": ["VKN8836", "WYS5281", "BPE9878", "VCC3998"],
+    "KV14A": ["VKN8836", "BPE9878", "WYS5281", "VCC3998"],
+    "KV15A": ["VKN8836", "WYS5281", "VCC3998"],
+    "KV16A": ["VKN8836", "WYS5281", "BPE9878"],
+    "KV17A": ["VKN8836", "VCC3998", "WYS5281"],
+    "KV18A": ["VKN8836", "WYS5281", "VCC3998", "BPE9878"],
+    "KV21A": ["VCC3998", "BPE9878", "VKN8836", "WYS5281"],
+    "KV22A": ["VKN8836", "WYS5281", "BPE9878", "VCC3998"],
+    "KV23A": ["WYS5281", "VCC3998", "BPE9878"],
+    "KV24A": ["VCC3998", "BPE9878", "WYS5281", "VKN8836"],
+    "KV25A": ["VCC3998", "BPE9878", "VNL6819", "WYS5281"],
+    "MC01":  ["VNL6819", "VJA7981", "VJN8929"],
+    "NS01":  ["BPE9878", "VCC3998", "WYS5281"],
+    "PK01":  ["VJA7981", "WA9225H", "VJN8929", "VNL6819"],
+    "PK02":  ["VJA7981", "VJN8929", "VNL6819"],
+    "PK04":  ["VNL6819", "VJA7981", "VJN8929"],
+    "PK05":  ["VJA7981", "VNL6819", "VJN8929"],
+    # ── Generic cluster fallbacks (routes without specific history) ────────────
+    # Matched only when no specific route code above matches (2-char prefix).
+    # ABI long-haul (large outstation)
     "TR":    ["VER2872", "VJN9910", "BQY7823"],
     "KB":    ["VJN9910", "BQY7823", "VER2872"],
     "KD":    ["VJN9910", "BQY7823", "BQX9983"],
     "PN":    ["VJN9910", "BQY7823", "BQX9983"],
-    "MC":    ["BQX9983", "VJN9910", "BQY7823"],
     "SB":    ["VJN9910", "BQX9983"],
     "SR":    ["VJN9910", "BQX9983"],
+    # VIVIAN long-haul fallbacks
+    "JH":    ["VJN8929", "VJA7981", "VNL6819"],
+    "PK":    ["VJA7981", "VNL6819", "VJN8929"],
+    "MC":    ["VNL6819", "VJA7981", "VJN8929"],
 }
+
 
 # ── Route intelligence maps (used by lorry_engine.py) ────────────────────────
 CLUSTER_MAP: dict[str, str] = {

@@ -41,6 +41,8 @@ from assignment_config import (
     # Schedule / remarks parsing
     SCHD_DAY_MAP         as _SCHD_DAY_MAP,
     REMARKS_KEYWORD_DAY  as _REMARKS_KEYWORD_DAY,
+    REMARKS_FIELD3_TON_CAP as _REMARKS_FIELD3_TON_CAP,
+    REMARKS_SIZE_ALIASES   as _REMARKS_SIZE_ALIASES,
     # Route rules
     ROUTE_CORRIDOR_GROUPS as _ROUTE_CORRIDOR_GROUPS,
     LORRY_STRICT_ROUTE   as _LORRY_STRICT_ROUTE,
@@ -127,7 +129,7 @@ def _resolve_state(state_raw: str, city_raw: str) -> str:
 
 def _load_user_route_prefixes(user: str) -> set | None:
     """Return the set of route-code prefixes assigned to *user* by reading
-    the '{USER} ROUTE' sheet from LORRY_DAILY_PLANNING.xlsx.
+    the '{USER} ROUTE' sheet from LORRY DAILY PLANNING.xlsx.
     Scans all columns for route-like strings (robust to column layout changes).
     Returns None if the file/sheet doesn't exist (no filtering applied).
     """
@@ -395,6 +397,82 @@ def _remarks_days_for(remarks: str) -> set[int] | None:
     return _parse_remarks_days(remarks)
 
 
+# ── REMARKS FIELD sheet (FIELD 3 — lorry tonnage requirement) ─────────────────
+# The optional "REMARKS FIELD" sheet in LORRY DAILY PLANNING.xlsx lists the
+# canonical remark phrases.  Column 3 (FIELD 3) holds the lorry-size phrases
+# (VAN, BELOW 5 TON, …, ANY SIZE).  We load them so the size-cap detection stays
+# in sync with the planners' spreadsheet; if the sheet is absent we fall back to
+# the defaults in assignment_config.REMARKS_FIELD3_TON_CAP.
+_remarks_field3_cache: dict[str, float | None] | None = None
+
+def _ton_cap_from_field3_phrase(phrase: str) -> float | None:
+    """Map a FIELD 3 phrase (e.g. 'BELOW 10 TON') to a tonnage cap."""
+    p = phrase.strip().upper()
+    if p in _REMARKS_FIELD3_TON_CAP:
+        return _REMARKS_FIELD3_TON_CAP[p]
+    if p == "VAN":
+        return 2.0
+    m = re.search(r'BELOW\s+(\d+(?:\.\d+)?)\s*TON', p)
+    if m:
+        return float(m.group(1))
+    if "ANY SIZE" in p:
+        return None
+    return None
+
+def _load_remarks_field3() -> dict[str, float | None]:
+    """Return {phrase_upper: ton_cap} from the REMARKS FIELD sheet (FIELD 3),
+    merged over the assignment_config defaults.  Cached after first read."""
+    global _remarks_field3_cache
+    if _remarks_field3_cache is not None:
+        return _remarks_field3_cache
+    table: dict[str, float | None] = dict(_REMARKS_FIELD3_TON_CAP)
+    if os.path.exists(PLANNING_PATH):
+        try:
+            df = pd.read_excel(PLANNING_PATH, sheet_name="REMARKS FIELD", header=0)
+            # FIELD 3 is the third labelled column (the lorry-size column).
+            f3_col = None
+            for c in df.columns:
+                if str(c).strip().upper() in ("FIELD 3", "FIELD3"):
+                    f3_col = c
+                    break
+            if f3_col is None and df.shape[1] >= 3:
+                f3_col = df.columns[2]
+            if f3_col is not None:
+                for v in df[f3_col].dropna().astype(str):
+                    phrase = v.strip().upper()
+                    if phrase:
+                        table[phrase] = _ton_cap_from_field3_phrase(phrase)
+        except Exception:
+            pass   # sheet missing or malformed → config defaults only
+    _remarks_field3_cache = table
+    return table
+
+def _remarks_lorry_cap(remarks: str) -> float | None:
+    """Return the maximum lorry tonnage allowed for a DO based on its REMARKS,
+    or None if the remark imposes no size requirement.
+
+    Detection order:
+      1. Canonical FIELD 3 phrases (from the REMARKS FIELD sheet / config).
+      2. Free-text size aliases (LORRY KECIL, VAN, LORI BESAR TIDAK BOLEH …).
+    The tightest (smallest) matching cap wins.
+    """
+    if not remarks:
+        return None
+    txt = str(remarks).strip().upper()
+    if not txt or txt in ("NAN", "NONE"):
+        return None
+    caps: list[float] = []
+    # 1. Canonical FIELD 3 phrases
+    for phrase, cap in _load_remarks_field3().items():
+        if cap is not None and phrase and phrase in txt:
+            caps.append(cap)
+    # 2. Free-text aliases
+    for phrase, cap in _REMARKS_SIZE_ALIASES.items():
+        if cap is not None and phrase in txt:
+            caps.append(cap)
+    return min(caps) if caps else None
+
+
 def _load_schedule(user: str) -> dict[int, set[str]]:
     """Return {weekday_int: set_of_route_prefixes} from the SCHD sheet.
     weekday_int follows Python's datetime.weekday(): Mon=0 … Sun=6.
@@ -538,12 +616,18 @@ def _same_corridor_group(route1: str, route2: str) -> bool:
 
 
 def _preferred_lorries_for_route(route_text: str) -> list[str]:
-    """Return the ordered list of preferred plates for this route, or []."""
+    """Return the ordered list of preferred plates for this route, or [].
+    Matches the LONGEST route-code prefix so specific codes (e.g. KV24A) win
+    over shorter ones (e.g. KV24) regardless of dict insertion order.
+    """
     r = route_text.strip().upper()
+    best_pfx = ""
+    best_plates: list[str] = []
     for pfx, plates in _ROUTE_PREFERRED_LORRY.items():
-        if r.startswith(pfx):
-            return plates
-    return []
+        if r.startswith(pfx) and len(pfx) > len(best_pfx):
+            best_pfx = pfx
+            best_plates = plates
+    return best_plates
 
 def _strict_route_excl(route_text: str) -> set:
     """Return plates that must NOT serve this route due to strict reservations.
@@ -1663,7 +1747,7 @@ def handle_message(phone: str, text: str = None,
 # ── State handlers ────────────────────────────────────────────────────────────
 
 def _get_valid_users() -> list[str]:
-    """Read valid users from LORRY_DAILY_PLANNING.xlsx MUATAN sheet.
+    """Read valid users from LORRY DAILY PLANNING.xlsx MUATAN sheet.
     Users are section headers (rows where col 0 has a non-lorry string like ABI/VIVIAN).
     """
     try:
@@ -2141,6 +2225,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "GPS_LON":       _gps_lon,
                 "LORRY":         _lorry_init,
                 "SPLIT_LORRIES": None,
+                # Max lorry tonnage required by this DO's REMARKS (None = any size).
+                "MAX_TON":       _remarks_lorry_cap(_remarks_raw),
             })
 
         # Sort eligible items by DATE ascending so oldest pending DOs are
@@ -2923,6 +3009,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _dominant_route = max(_route_counts, key=lambda r: _route_counts[r])
             _preferred = _preferred_lorries_for_route(_dominant_route)
             _base_excluded = excluded   # save pre-size excluded set for fallback
+            # REMARKS size cap (FIELD 3) — smallest cap among this group's DOs.
+            _grp_caps_pre = [it["MAX_TON"] for it in group_items
+                             if it.get("MAX_TON") is not None]
+            _grp_cap_pre = min(_grp_caps_pre) if _grp_caps_pre else None
             if _preferred:
                 # Preferred lorries are a hint — weight fit wins.
                 # Hard-exclude preferred lorries if: truly unavailable, full,
@@ -2939,6 +3029,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and p not in _hard_excl
                     and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                     and float(_lorry_cap_map.get(p, 0)) >= _pref_dest_min
+                    and (_grp_cap_pre is None or float(_lorry_cap_map.get(p, 0)) <= _grp_cap_pre)
                 ]
                 if _pref_avail:
                     # Among available preferred lorries pick the tightest fit.
@@ -2997,6 +3088,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     str(r["LORRY"]).strip().upper()
                     for _, r in engine.eligible_lorries.iterrows()
                     if float(r["TON"]) >= LORRY_TINY_EXCL_TON
+                }
+            # ── REMARKS size requirement (FIELD 3) ────────────────────────────
+            # A DO whose REMARKS demand a lorry size (e.g. "VAN", "LORRY KECIL",
+            # "BELOW 10 TON") caps the lorries this group may use.  The binding
+            # cap is the SMALLEST cap among the group's items (DOs without a
+            # remark impose no cap).
+            if _grp_cap_pre is not None:
+                excluded = excluded | {
+                    str(r["LORRY"]).strip().upper()
+                    for _, r in engine.eligible_lorries.iterrows()
+                    if float(r["TON"]) > _grp_cap_pre
                 }
 
             # ── Within-session lorry sharing ──────────────────────────────────
@@ -3278,6 +3380,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return False
                 if float(_lorry_cap_map.get(p, 0)) < _it_dest_min_t:
                     return False
+                # REMARKS size cap (FIELD 3) — DO must not exceed its lorry-size limit
+                if it.get("MAX_TON") is not None and float(_lorry_cap_map.get(p, 0)) > it["MAX_TON"]:
+                    return False
                 # Hard state boundary — never mix states regardless of tier.
                 # _session_lorry_states tracks states assigned in this session;
                 # _consol_lorry_states tracks assignments made during this pass.
@@ -3399,6 +3504,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 if _fp_cap < _it_dest_min_t:
                     continue
+                # REMARKS size cap (FIELD 3)
+                if it.get("MAX_TON") is not None and _fp_cap > it["MAX_TON"]:
+                    continue
                 if _fp in _it_strict:
                     continue
                 # Urban↔outstation guard
@@ -3446,7 +3554,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         #   • Single remaining item → allow ≤1T overage directly.
         # Process items one at a time so each assignment updates _session_loads.
 
-        def _overflow_eligible_lorries(it_w, it_route, it_state, it_dest):
+        def _overflow_eligible_lorries(it_w, it_route, it_state, it_dest, it_max_ton=None):
             """Return [(remaining_cap, plate)] sorted by most-remaining-cap first."""
             _it_is_urban = it_dest in _DEST_URBAN_GROUPS
             _it_strict   = _strict_route_excl(it_route)
@@ -3458,6 +3566,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _ol = float(_session_loads.get(_op, 0))
                 _or = _oc - _ol
                 if _op in _it_strict:
+                    continue
+                # REMARKS size cap (FIELD 3)
+                if it_max_ton is not None and _oc > it_max_ton:
                     continue
                 if (not _it_is_urban
                         and _session_routes.get(_op, "")
@@ -3519,6 +3630,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _it["WEIGHT"], _it.get("ROUTE",""),
                     _it.get("STATE","").strip().upper(),
                     _classify_dest_group(_it.get("ROUTE",""), _it.get("STATE","")),
+                    _it.get("MAX_TON"),
                 )
                 _do_overflow_assign(_it, _cands)
             else:
@@ -3602,6 +3714,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             _it["WEIGHT"], _it.get("ROUTE",""),
                             _it.get("STATE","").strip().upper(),
                             _classify_dest_group(_it.get("ROUTE",""), _it.get("STATE","")),
+                            _it.get("MAX_TON"),
                         )
                         _do_overflow_assign(_it, _cands)
 
@@ -3911,6 +4024,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 # Lorry size vs outstation min tonnage
                 if _cap < _DEST_MIN_TON.get(_cu_dest, 0.0):
+                    continue
+                # REMARKS size cap (FIELD 3) — don't overfill onto too-big a lorry
+                if _cu.get("MAX_TON") is not None and _cap > _cu["MAX_TON"]:
                     continue
                 _candidates.append(_cu)
             if not _candidates:

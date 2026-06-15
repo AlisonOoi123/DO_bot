@@ -119,6 +119,33 @@ Do not parse these as delivery-day restrictions:
   - "LORI BESAR TIDAK BOLEH MASUK" → assign small lorry or van, NOT large
   - These remarks override standard weight-based lorry selection.
 
+**RULE 6.5 — REMARKS FIELD Sheet (FIELD 3 — Lorry Tonnage Requirement)**
+The "REMARKS FIELD" sheet in LORRY DAILY PLANNING.xlsx defines the canonical
+remark phrases planners use, in three columns:
+  - **FIELD 1** — delivery days (MON,WED,FRI / EVERY MON / EVERY DAY …) → Rule 6.1/6.2
+  - **FIELD 2** — time windows (AM ONLY, PM ONLY, 8AM-5PM, 24 HOURS …) → informational
+  - **FIELD 3** — required lorry size → hard tonnage cap on lorry selection
+
+FIELD 3 phrase → maximum lorry tonnage allowed:
+  - "VAN" → ≤ 2T (van class only)
+  - "BELOW 5 TON" → ≤ 5T
+  - "BELOW 10 TON" → ≤ 10T
+  - "BELOW 14 TON" → ≤ 14T
+  - "BELOW 20 TON" → ≤ 20T
+  - "ANY SIZE" → no cap
+
+**RULE 6.6 — REMARKS-Driven Size vs Geographic Grouping**
+  - If a DO's REMARKS specify a lorry size (FIELD 3 phrase or a free-text alias
+    like "LORRY KECIL", "VAN", "LORI BESAR TIDAK BOLEH"), that DO MUST be assigned
+    to a lorry at or below the cap. The cap is enforced in every assignment pass
+    (initial, consolidation, force-assign, overflow, fill-to-80%).
+  - When a bucket of DOs shares a lorry, the binding cap is the SMALLEST cap among
+    the bucket's DOs (DOs without a size remark impose no cap).
+  - If REMARKS are EMPTY, no size cap applies and the DO follows normal grouping
+    by city + state + nearest longitude (Section 2).
+  - The phrase→cap table is loaded from the REMARKS FIELD sheet at runtime when
+    present, falling back to the defaults in assignment_config.py.
+
 ---
 
 ## SECTION 7 — LORRY UTILIZATION RULES
@@ -161,6 +188,14 @@ For outstation routes, cross-route sharing is allowed if:
 
 **RULE 9.1 — Preferred Lorry Per Route**
 Each route has a preferred lorry list. The preferred lorry is tried FIRST during assignment if it is the tightest-fitting available (within 1T of best available capacity). Preferred lorries are NOT forced if a significantly better fit is available.
+
+The preferred lists are DERIVED FROM REAL MANUAL-ASSIGNMENT HISTORY (data/ZSDOROUTEWRH):
+for each route, the lorries the owning planner (ABI or VIVIAN) used most often,
+counting only owner-owned + SPARE lorries — cross-owner borrows/swaps are ignored.
+Route codes are matched by LONGEST prefix, so specific codes (e.g. KV24A → VIVIAN)
+win over shorter ones (e.g. KV24 → ABI). When ABI is logged in only ABI+SPARE
+lorries are eligible; when VIVIAN is logged in only VIVIAN+SPARE — so both owners'
+preferences coexist in the table without conflict.
 
 Key preferred assignments:
   - KV01A, KV02A → BQY7823, BMN3682 (north corridor)
