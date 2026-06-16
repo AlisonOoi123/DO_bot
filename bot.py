@@ -2423,6 +2423,28 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _rt_key = f"{_rt_key}||{_sub_key}"
             route_buckets[_rt_key].append(it)
 
+        # Step 1.5 — Collapse same-route-prefix sub-buckets into one bucket.
+        # The geographic sub-bucketing above (state|city or state|octant) can split
+        # a single route like KV11A into several keys:
+        #   KV11A - PUDU…||SELANGOR|CHERAS
+        #   KV11A - PUDU…||WP|KUALA LUMPUR
+        # These must ride the same lorry (same route = same physical road).
+        # Pre-merge them here so the cross-route merge step (Step 2) sees one
+        # unified bucket per route, not scattered fragments.
+        _pfx_to_keys: dict[str, list] = {}
+        for _bk in list(route_buckets.keys()):
+            _bare_rt = _bk.split("||")[0]
+            _pfx = _extract_route_prefix(_bare_rt)
+            if _pfx:
+                _pfx_to_keys.setdefault(_pfx, []).append(_bk)
+        for _pfx, _bkeys in _pfx_to_keys.items():
+            if len(_bkeys) <= 1:
+                continue
+            # Merge all sub-buckets for this prefix into the first key
+            _primary = _bkeys[0]
+            for _other in _bkeys[1:]:
+                route_buckets[_primary].extend(route_buckets.pop(_other))
+
         # Step 2 — cluster same-way buckets into corridor super-groups
         # Each super-group is a list of route-bucket lists.
         max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
