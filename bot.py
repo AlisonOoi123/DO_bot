@@ -2608,15 +2608,49 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
                 _corridor_merge = _same_corridor_group(base_route, cand_route)
                 _urban_prox_merge = _geo_close
+
+                # ── Priority-ordered merge rules (per user request) ───────────
+                # Group items onto the same lorry in this priority order:
+                #   1. SAME ROUTE  — identical route prefix (e.g. KV05A == KV05A)
+                #   2. SAME CITY   — same state AND same city
+                #   3. SAME STATE + NEAREST LONGITUDE — same state and centroids
+                #      close together (longitude/GPS within the merge radius)
+                _pfx_base = _extract_route_prefix(base_route)
+                _pfx_cand = _extract_route_prefix(cand_route)
+                _same_route_pfx = bool(_pfx_base) and _pfx_base == _pfx_cand
+
+                _base_cities2 = {it.get("CITY", "").strip().upper()
+                                 for it in base_bucket if it.get("CITY")}
+                _cand_cities2 = {it.get("CITY", "").strip().upper()
+                                 for it in cand_bucket if it.get("CITY")}
+                _same_city = (
+                    bool(_base_cities2 & _cand_cities2)
+                    and (not _st_base or not _st_cand or _st_base == _st_cand)
+                )
+
+                # Same-state + nearest-longitude: both in the same state and their
+                # GPS centroids are within the city-merge radius of each other.
+                _lon_close = False
+                if (_st_base and _st_cand and _st_base == _st_cand
+                        and _bc_pref and _cc_pref):
+                    _lon_close = (
+                        _haversine_km(_bc_pref[0], _bc_pref[1],
+                                      _cc_pref[0], _cc_pref[1])
+                        <= _MAX_CITY_MERGE_KM_OUTSTATION
+                    )
+
+                _priority_merge = _same_route_pfx or _same_city or _lon_close
+
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
                     and (_routes_on_same_way(base_route, cand_route) or _corridor_merge
-                         or _urban_prox_merge)
-                    and _pref_overlap
+                         or _urban_prox_merge or _priority_merge)
+                    and (_pref_overlap or _same_route_pfx or _same_city)
                     and _geo_ok
                     and _same_state
-                    and (_city_dist_ok or _corridor_merge or _urban_prox_merge)
+                    and (_city_dist_ok or _corridor_merge or _urban_prox_merge
+                         or _same_route_pfx or _same_city or _lon_close)
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
