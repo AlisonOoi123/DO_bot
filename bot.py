@@ -495,6 +495,24 @@ def _remarks_lorry_cap(remarks: str) -> float | None:
     for phrase, cap in _REMARKS_SIZE_ALIASES.items():
         if cap is not None and phrase in txt:
             caps.append(cap)
+    # 3. Free-text "N TON" size caps, tolerant of filler words & ordering, e.g.
+    #      "BELOW 5 TON"            "BELOW OR 5 TON LORRY"
+    #      "5 TON OR BELOW"         "5 TON LORRY AND BELOW"
+    #      "5 TON KE BAWAH"         "MAX 5 TON"
+    #    Any of these caps the lorry at N tonnes.
+    _below_words = r'(?:BELOW|MAX(?:IMUM)?|UNDER|KE\s*BAWAH|AND\s+BELOW|OR\s+BELOW)'
+    _ton_patterns = [
+        rf'{_below_words}\s+(?:OR\s+)?(\d+(?:\.\d+)?)\s*TON',   # BELOW [OR] N TON
+        rf'(\d+(?:\.\d+)?)\s*TON(?:\s+LORRY)?\s+(?:OR\s+|AND\s+)?{_below_words}',  # N TON [LORRY] [OR/AND] BELOW
+        rf'(\d+(?:\.\d+)?)\s*TON\s+KE\s*BAWAH',                  # N TON KE BAWAH
+        rf'(?:MAX(?:IMUM)?|MAKS)\s+(\d+(?:\.\d+)?)\s*TON',      # MAX N TON
+    ]
+    for _pat in _ton_patterns:
+        for _m in re.finditer(_pat, txt):
+            try:
+                caps.append(float(_m.group(1)))
+            except (ValueError, IndexError):
+                pass
     return min(caps) if caps else None
 
 
