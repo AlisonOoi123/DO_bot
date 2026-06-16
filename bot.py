@@ -5822,7 +5822,7 @@ def _generate_trip_manifest(sess) -> bytes:
     from openpyxl.utils import get_column_letter
     from datetime import date as _date, datetime as _dt
     from collections import defaultdict as _dd
-    from lorry_engine import _haversine_km, _DEPOT
+    from lorry_engine import _haversine_km, _DEPOT, road_matrix_km, _osrm_table_km
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -5864,6 +5864,10 @@ def _generate_trip_manifest(sess) -> bytes:
         depot, so the driver travels the shortest practical path without
         zig-zagging across the route.
 
+        Distances are REAL driving distances via OSRM (free OpenStreetMap
+        routing) when reachable, falling back to straight-line haversine when
+        OSRM is unavailable.
+
         Stops with no GPS coordinates are appended at the end, sorted by route
         then customer name.
         """
@@ -5875,20 +5879,24 @@ def _generate_trip_manifest(sess) -> bytes:
             no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
             return no_coords
 
-        # Greedy nearest-neighbour from depot
-        depot_lat, depot_lon = _DEPOT[0], _DEPOT[1]
-        remaining = list(has_coords)
+        # Build coordinate list: index 0 is the depot, 1..N are the stops.
+        coords = [(_DEPOT[0], _DEPOT[1])] + [ll for _, _, ll in has_coords]
+        dist = road_matrix_km(coords)     # real road km (OSRM) or haversine
+
+        # Greedy nearest-neighbour starting from the depot (index 0).
+        n = len(has_coords)
+        visited = [False] * n
         ordered = []
-        cur_lat, cur_lon = depot_lat, depot_lon
-        while remaining:
-            nearest_idx = min(
-                range(len(remaining)),
-                key=lambda i: _haversine_km(cur_lat, cur_lon,
-                                            remaining[i][2][0], remaining[i][2][1])
+        cur = 0                           # current matrix index (0 = depot)
+        for _ in range(n):
+            nearest = min(
+                (i for i in range(n) if not visited[i]),
+                key=lambda i: dist[cur][i + 1],
             )
-            chosen = remaining.pop(nearest_idx)
-            ordered.append((chosen[0], chosen[1]))
-            cur_lat, cur_lon = chosen[2][0], chosen[2][1]
+            visited[nearest] = True
+            do, it, _ll = has_coords[nearest]
+            ordered.append((do, it))
+            cur = nearest + 1             # +1 because depot occupies index 0
 
         # Append stops with no coordinates sorted by route then customer
         no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
@@ -6041,10 +6049,16 @@ def _generate_trip_manifest(sess) -> bytes:
         if last_ll:
             coords.append(_DEPOT)
 
+        # Prefer real OSRM driving distance; fall back to haversine×road-factor.
         total_km = 0.0
-        for i in range(len(coords) - 1):
-            total_km += _haversine(coords[i][0], coords[i][1],
-                                   coords[i+1][0], coords[i+1][1]) * _ROAD_FACTOR
+        _osrm = _osrm_table_km(coords) if len(coords) >= 2 else None
+        if _osrm is not None:
+            for i in range(len(coords) - 1):
+                total_km += _osrm[i][i + 1]
+        else:
+            for i in range(len(coords) - 1):
+                total_km += _haversine(coords[i][0], coords[i][1],
+                                       coords[i+1][0], coords[i+1][1]) * _ROAD_FACTOR
 
         drive_min  = (total_km / _AVG_SPEED_KMH) * 60
         total_min  = stop_min + drive_min

@@ -243,6 +243,88 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     return 2 * R * asin(sqrt(a))
 
+# ── OSRM road-distance routing (free, OpenStreetMap-based) ───────────────────
+# Provides REAL driving distances instead of straight-line haversine.  OSRM is
+# free and open-source: it can be self-hosted (recommended for production) or
+# reached via the public demo server.  Configure with the OSRM_URL environment
+# variable; if unset it defaults to the public demo.  When OSRM is unreachable
+# every helper transparently falls back to haversine so the bot never breaks.
+#
+#   Self-host (no limits, fully offline):
+#     docker run -p 5000:5000 osrm/osrm-backend ...   (Malaysia OSM extract)
+#     export OSRM_URL=http://localhost:5000
+#
+_OSRM_URL = os.environ.get("OSRM_URL", "https://router.project-osrm.org").rstrip("/")
+_OSRM_TIMEOUT = float(os.environ.get("OSRM_TIMEOUT", "8"))
+_OSRM_DISABLED = os.environ.get("OSRM_URL", "").strip() == "" and \
+                 os.environ.get("OSRM_USE_DEMO", "1").strip() == "0"
+# After this many consecutive failures we stop calling OSRM for the rest of the
+# process and rely on haversine — avoids repeated multi-second timeouts.
+_osrm_fail_count = 0
+_OSRM_MAX_FAILS = 3
+
+
+def _osrm_available() -> bool:
+    return not _OSRM_DISABLED and _osrm_fail_count < _OSRM_MAX_FAILS
+
+
+def _osrm_table_km(coords: list) -> Optional[list]:
+    """Return an N×N driving-distance matrix (km) for the given coordinates
+    using OSRM's table service in a single request, or None if unavailable.
+
+    `coords` is a list of (lat, lon) tuples.  OSRM expects lon,lat order.
+    """
+    global _osrm_fail_count
+    if not _osrm_available() or len(coords) < 2:
+        return None
+    locs = ";".join(f"{lon},{lat}" for lat, lon in coords)
+    url = f"{_OSRM_URL}/table/v1/driving/{locs}"
+    try:
+        resp = requests.get(
+            url,
+            params={"annotations": "distance"},
+            headers={"User-Agent": _NOMINATIM_UA},
+            timeout=_OSRM_TIMEOUT,
+        )
+        data = resp.json()
+        if data.get("code") != "Ok" or "distances" not in data:
+            _osrm_fail_count += 1
+            return None
+        # OSRM returns metres; convert to km. None entries (unroutable) → haversine.
+        matrix = []
+        for i, row in enumerate(data["distances"]):
+            out = []
+            for j, d in enumerate(row):
+                if d is None:
+                    out.append(_haversine_km(coords[i][0], coords[i][1],
+                                             coords[j][0], coords[j][1]))
+                else:
+                    out.append(d / 1000.0)
+            matrix.append(out)
+        _osrm_fail_count = 0          # reset on success
+        return matrix
+    except Exception:
+        _osrm_fail_count += 1
+        return None
+
+
+def road_matrix_km(coords: list) -> list:
+    """N×N distance matrix (km) between coords (list of (lat, lon) tuples).
+
+    Uses real OSRM driving distance when reachable; otherwise falls back to
+    straight-line haversine.  Always returns a full matrix.
+    """
+    osrm = _osrm_table_km(coords)
+    if osrm is not None:
+        return osrm
+    n = len(coords)
+    return [
+        [_haversine_km(coords[i][0], coords[i][1], coords[j][0], coords[j][1])
+         for j in range(n)]
+        for i in range(n)
+    ]
+
+
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Compass bearing (0–360°, clockwise from North) from point 1 to point 2."""
     dlon = radians(lon2 - lon1)

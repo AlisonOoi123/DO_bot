@@ -280,6 +280,28 @@ After initial group assignment, run the following passes in sequence:
   - Max bearing difference for same-direction merge: 80°
   - LOCAL zone radius: 8 km from depot (fallback to city sub-key if within zone)
 
+### Distance / routing
+
+  - **Customer location**: real GPS pin from the `LONGITUD` column of the upload
+    when present; otherwise the place name is geocoded via Nominatim
+    (OpenStreetMap, free) and cached in `data/geocode_cache.json`.
+  - **Distance between two points**:
+      - Grouping / proximity decisions use **haversine** (straight-line) km.
+      - The driver trip-manifest **stop ordering** (greedy nearest-neighbour
+        from depot) and the **return-time estimate** use **real driving
+        distance via OSRM** (free OpenStreetMap routing) when reachable, and
+        fall back automatically to haversine if OSRM is unavailable.
+  - **Enabling OSRM** (optional — improves stop ordering accuracy):
+      - Self-host (recommended, no limits, offline): run an OSRM backend with a
+        Malaysia OSM extract, then set `OSRM_URL=http://localhost:5000`.
+      - Public demo: leave `OSRM_URL` unset to use
+        `https://router.project-osrm.org`. NOTE: in a managed/web environment
+        this host must be added to the network egress allowlist, otherwise
+        OSRM calls are blocked (403) and the bot silently falls back to
+        haversine.
+      - Env vars: `OSRM_URL` (base URL), `OSRM_TIMEOUT` (seconds, default 8),
+        `OSRM_USE_DEMO=0` to disable the demo fallback entirely.
+
 ---
 
 ## SECTION 16 — SPECIFIC ROUTE CLASSIFICATIONS
