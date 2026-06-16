@@ -3074,13 +3074,26 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Uses _session_lorry_states (running tracker, updated after each
             # assignment) so it is never confused by pre-assigned rows from
             # other days that happen to share the same items list.
+            # A merged route bucket may legitimately span several COMPATIBLE
+            # states (e.g. KV11A covers SELANGOR + WP KUALA LUMPUR — adjacent
+            # urban states). Collect ALL states in the group, and exclude a
+            # lorry only if NONE of its committed states are compatible with
+            # ANY of the group's states. Exact-match exclusion here was wrongly
+            # stranding same-route items that cross an urban state line.
             _grp_state = (group_items[0].get("STATE", "").strip().upper()
                           if group_items else "")
+            _grp_states = {
+                it.get("STATE", "").strip().upper()
+                for it in group_items if it.get("STATE")
+            }
             _state_excl: set[str] = set()
-            if _grp_state:
+            if _grp_states:
                 _state_excl = {
                     p for p, sts in _session_lorry_states.items()
-                    if sts and _grp_state not in sts
+                    if sts and not any(
+                        _states_compatible(_gs, _ls)
+                        for _gs in _grp_states for _ls in sts
+                    )
                 }
             excluded = excluded | _state_excl
 
@@ -4488,7 +4501,7 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 p for p, sts in _lorry_states.items()
                 if sts and _grp_state
                 and _grp_state not in sts
-                and not _states_compatible(_grp_state, next(iter(sts)))
+                and not any(_states_compatible(_grp_state, _ls) for _ls in sts)
             }
 
             # Size exclusion: outstation → exclude small lorries (≤5T); urban → no upper cap
