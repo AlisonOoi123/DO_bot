@@ -5790,22 +5790,58 @@ def _generate_trip_manifest(sess) -> bytes:
 
     def _nn_sort(pairs: list) -> list:
         """
-        Greedy nearest-neighbour sort within a single date group.
-        Pairs with no coordinates are appended at the end in route order.
+        Order stops into a single one-way geographic sweep so the driver follows
+        the natural road direction without zig-zagging (e.g. RAWANG → BATU CAVES
+        → KAJANG → SEMENYIH instead of bouncing north-south).
+
+        Method — principal-axis sweep:
+          1. Find the two stops farthest apart → that line is the dominant travel
+             axis (delivery corridors are roughly linear).
+          2. Project every stop onto that axis and sort along it (monotonic — no
+             backtracking).
+          3. Orient the sweep so it STARTS at the endpoint nearest the depot, so
+             the driver leaves HQ heading toward the closer end and sweeps out.
+
+        Stops with no GPS are appended at the end in route order.
         """
         with_coords    = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
         has_coords     = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
         no_coords      = [(do, it)     for do, it, ll in with_coords if ll is None]
 
         result: list = []
-        unvisited     = list(has_coords)
-        cur           = _DEPOT
+        if len(has_coords) <= 2:
+            # 0–2 stops: just order nearest-to-depot first
+            result = [(do, it) for do, it, ll in
+                      sorted(has_coords,
+                             key=lambda x: _haversine(_DEPOT[0], _DEPOT[1], x[2][0], x[2][1]))]
+        else:
+            # 1. Dominant axis = the pair of stops farthest apart
+            best_d, p_a, p_b = -1.0, None, None
+            for a in range(len(has_coords)):
+                for b in range(a + 1, len(has_coords)):
+                    lla = has_coords[a][2]
+                    llb = has_coords[b][2]
+                    d = _haversine(lla[0], lla[1], llb[0], llb[1])
+                    if d > best_d:
+                        best_d, p_a, p_b = d, lla, llb
 
-        while unvisited:
-            nearest = min(unvisited, key=lambda x: _haversine(cur[0], cur[1], x[2][0], x[2][1]))
-            result.append((nearest[0], nearest[1]))
-            cur = nearest[2]
-            unvisited.remove(nearest)
+            # Axis vector (use raw lat/lon deltas — fine for projection ordering)
+            ax = (p_b[0] - p_a[0], p_b[1] - p_a[1])
+            axlen2 = ax[0] ** 2 + ax[1] ** 2 or 1.0
+
+            def _proj(ll) -> float:
+                # scalar projection of (ll - p_a) onto the axis
+                return ((ll[0] - p_a[0]) * ax[0] + (ll[1] - p_a[1]) * ax[1]) / axlen2
+
+            ordered = sorted(has_coords, key=lambda x: _proj(x[2]))
+
+            # 3. Orient so the endpoint nearest the depot comes first
+            d_first = _haversine(_DEPOT[0], _DEPOT[1], ordered[0][2][0], ordered[0][2][1])
+            d_last  = _haversine(_DEPOT[0], _DEPOT[1], ordered[-1][2][0], ordered[-1][2][1])
+            if d_last < d_first:
+                ordered = list(reversed(ordered))
+
+            result = [(do, it) for do, it, _ in ordered]
 
         # Append stops with no coordinates sorted by route then customer
         no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
@@ -5938,15 +5974,11 @@ def _generate_trip_manifest(sess) -> bytes:
 
         _apply_headers(ws, 2)
 
-        # Sort: group by date chronologically, then nearest-neighbour within each date
-        date_groups: dict[str, list] = _dd(list)
-        for do, it in pairs:
-            dk = _date_sortkey(do.get("DATE", ""))
-            date_groups[dk].append((do, it))
-
-        sorted_pairs: list = []
-        for dk in sorted(date_groups.keys()):
-            sorted_pairs.extend(_nn_sort(date_groups[dk]))
+        # Sort: ONE continuous geographic sweep across ALL stops (nearest-neighbour
+        # + 2-opt from the depot), so the driver follows a single one-way route and
+        # never zig-zags back and forth.  Delivery date is shown per row but no
+        # longer fragments the geographic order.
+        sorted_pairs: list = _nn_sort(pairs)
 
         prev_date = None
         for seq, (do, it) in enumerate(sorted_pairs, 1):
