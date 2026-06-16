@@ -5822,6 +5822,7 @@ def _generate_trip_manifest(sess) -> bytes:
     from openpyxl.utils import get_column_letter
     from datetime import date as _date, datetime as _dt
     from collections import defaultdict as _dd
+    from lorry_engine import _haversine_km, _DEPOT
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -5859,32 +5860,40 @@ def _generate_trip_manifest(sess) -> bytes:
 
     def _nn_sort(pairs: list) -> list:
         """
-        Order stops into a one-way geographic sweep so the driver travels without
-        zig-zagging.
+        Order stops using a greedy nearest-neighbour chain starting from the
+        depot, so the driver travels the shortest practical path without
+        zig-zagging across the route.
 
-        Sort by latitude DESCENDING (north → south). In Malaysia all delivery
-        corridors trend northward from the depot or northeast/southeast, so the
-        driver always departs HQ heading toward the northernmost stop and sweeps
-        south through the rest — no backtracking.
-
-        Examples:
-          Pahang:  Jerantut (3.948) → Damak (3.937) → Mentakab (3.486) → Temerloh (3.449) → Bera (2.674)
-          KL east: Rawang  (3.326) → Batu Caves (3.24) → Kajang (3.09) → Semenyih (2.93)
-
-        Stops with no GPS coordinates are appended at the end.
+        Stops with no GPS coordinates are appended at the end, sorted by route
+        then customer name.
         """
         with_coords = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
         has_coords  = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
         no_coords   = [(do, it)     for do, it, ll in with_coords if ll is None]
 
-        # Sort by latitude descending (north → south); break ties by longitude ascending
-        ordered = sorted(has_coords, key=lambda x: (-x[2][0], x[2][1]))
-        result = [(do, it) for do, it, _ in ordered]
+        if not has_coords:
+            no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
+            return no_coords
+
+        # Greedy nearest-neighbour from depot
+        depot_lat, depot_lon = _DEPOT[0], _DEPOT[1]
+        remaining = list(has_coords)
+        ordered = []
+        cur_lat, cur_lon = depot_lat, depot_lon
+        while remaining:
+            nearest_idx = min(
+                range(len(remaining)),
+                key=lambda i: _haversine_km(cur_lat, cur_lon,
+                                            remaining[i][2][0], remaining[i][2][1])
+            )
+            chosen = remaining.pop(nearest_idx)
+            ordered.append((chosen[0], chosen[1]))
+            cur_lat, cur_lon = chosen[2][0], chosen[2][1]
 
         # Append stops with no coordinates sorted by route then customer
         no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
-        result.extend(no_coords)
-        return result
+        ordered.extend(no_coords)
+        return ordered
 
     # ── Date helpers ──────────────────────────────────────────────────────────
     def _fmt_date(s) -> str:
