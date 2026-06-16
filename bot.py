@@ -5790,58 +5790,21 @@ def _generate_trip_manifest(sess) -> bytes:
 
     def _nn_sort(pairs: list) -> list:
         """
-        Order stops into a single one-way geographic sweep so the driver follows
-        the natural road direction without zig-zagging (e.g. RAWANG → BATU CAVES
-        → KAJANG → SEMENYIH instead of bouncing north-south).
+        Order stops into a one-way geographic sweep so the driver travels without
+        zig-zagging (e.g. RAWANG → BATU CAVES → KAJANG → SEMENYIH).
 
-        Method — principal-axis sweep:
-          1. Find the two stops farthest apart → that line is the dominant travel
-             axis (delivery corridors are roughly linear).
-          2. Project every stop onto that axis and sort along it (monotonic — no
-             backtracking).
-          3. Orient the sweep so it STARTS at the endpoint nearest the depot, so
-             the driver leaves HQ heading toward the closer end and sweeps out.
-
-        Stops with no GPS are appended at the end in route order.
+        Sort by longitude ascending (west → east). The depot is at lon≈101.556
+        which is the western edge, so routes naturally run west→east and ascending
+        longitude gives the correct one-way driving order.
+        Stops with no GPS coordinates are appended at the end.
         """
-        with_coords    = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
-        has_coords     = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
-        no_coords      = [(do, it)     for do, it, ll in with_coords if ll is None]
+        with_coords = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
+        has_coords  = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
+        no_coords   = [(do, it)     for do, it, ll in with_coords if ll is None]
 
-        result: list = []
-        if len(has_coords) <= 2:
-            # 0–2 stops: just order nearest-to-depot first
-            result = [(do, it) for do, it, ll in
-                      sorted(has_coords,
-                             key=lambda x: _haversine(_DEPOT[0], _DEPOT[1], x[2][0], x[2][1]))]
-        else:
-            # 1. Dominant axis = the pair of stops farthest apart
-            best_d, p_a, p_b = -1.0, None, None
-            for a in range(len(has_coords)):
-                for b in range(a + 1, len(has_coords)):
-                    lla = has_coords[a][2]
-                    llb = has_coords[b][2]
-                    d = _haversine(lla[0], lla[1], llb[0], llb[1])
-                    if d > best_d:
-                        best_d, p_a, p_b = d, lla, llb
-
-            # Axis vector (use raw lat/lon deltas — fine for projection ordering)
-            ax = (p_b[0] - p_a[0], p_b[1] - p_a[1])
-            axlen2 = ax[0] ** 2 + ax[1] ** 2 or 1.0
-
-            def _proj(ll) -> float:
-                # scalar projection of (ll - p_a) onto the axis
-                return ((ll[0] - p_a[0]) * ax[0] + (ll[1] - p_a[1]) * ax[1]) / axlen2
-
-            ordered = sorted(has_coords, key=lambda x: _proj(x[2]))
-
-            # 3. Orient so the endpoint nearest the depot comes first
-            d_first = _haversine(_DEPOT[0], _DEPOT[1], ordered[0][2][0], ordered[0][2][1])
-            d_last  = _haversine(_DEPOT[0], _DEPOT[1], ordered[-1][2][0], ordered[-1][2][1])
-            if d_last < d_first:
-                ordered = list(reversed(ordered))
-
-            result = [(do, it) for do, it, _ in ordered]
+        # Sort by longitude ascending (west → east), break ties by latitude
+        ordered = sorted(has_coords, key=lambda x: (x[2][1], x[2][0]))
+        result = [(do, it) for do, it, _ in ordered]
 
         # Append stops with no coordinates sorted by route then customer
         no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
