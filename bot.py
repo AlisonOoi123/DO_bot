@@ -5878,19 +5878,25 @@ def _generate_trip_manifest(sess) -> bytes:
     def _nn_sort(pairs: list) -> list:
         """
         Order stops into a one-way geographic sweep so the driver travels without
-        zig-zagging (e.g. RAWANG → BATU CAVES → KAJANG → SEMENYIH).
+        zig-zagging.
 
-        Sort by longitude ascending (west → east). The depot is at lon≈101.556
-        which is the western edge, so routes naturally run west→east and ascending
-        longitude gives the correct one-way driving order.
+        Sort by latitude DESCENDING (north → south). In Malaysia all delivery
+        corridors trend northward from the depot or northeast/southeast, so the
+        driver always departs HQ heading toward the northernmost stop and sweeps
+        south through the rest — no backtracking.
+
+        Examples:
+          Pahang:  Jerantut (3.948) → Damak (3.937) → Mentakab (3.486) → Temerloh (3.449) → Bera (2.674)
+          KL east: Rawang  (3.326) → Batu Caves (3.24) → Kajang (3.09) → Semenyih (2.93)
+
         Stops with no GPS coordinates are appended at the end.
         """
         with_coords = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
         has_coords  = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
         no_coords   = [(do, it)     for do, it, ll in with_coords if ll is None]
 
-        # Sort by longitude ascending (west → east), break ties by latitude
-        ordered = sorted(has_coords, key=lambda x: (x[2][1], x[2][0]))
+        # Sort by latitude descending (north → south); break ties by longitude ascending
+        ordered = sorted(has_coords, key=lambda x: (-x[2][0], x[2][1]))
         result = [(do, it) for do, it, _ in ordered]
 
         # Append stops with no coordinates sorted by route then customer
