@@ -5913,6 +5913,74 @@ def _generate_trip_manifest(sess) -> bytes:
         except Exception:
             return ""
 
+    # ── Trip-time estimation constants ───────────────────────────────────────
+    _DEPART_HOUR      = 7       # driver leaves HQ at 07:00
+    _DEADLINE_HOUR    = 13      # must return by 13:00
+    _AVG_SPEED_KMH    = 60.0   # average road speed
+    _ROAD_FACTOR      = 1.4    # haversine × factor ≈ road distance
+    _STOP_MIN         = 20     # average unloading time per stop (minutes)
+    _OUTSTATION_KM    = 150    # last-stop distance from HQ > this → overnight
+
+    def _est_return(sorted_pairs_: list) -> tuple[str, str, bool]:
+        """
+        Estimate return time to HQ and 1pm margin.
+        Returns (return_time_str, margin_str, is_outstation).
+        """
+        from datetime import timedelta as _td, datetime as _dtt
+        if not sorted_pairs_:
+            return ("—", "—", False)
+
+        # Last stop GPS
+        last_ll = None
+        for _do, _it in reversed(sorted_pairs_):
+            ll = _parse_latlon(_it.get("ROW_IDX"))
+            if ll:
+                last_ll = ll
+                break
+
+        # Outstation check
+        if last_ll:
+            dist_to_hq = _haversine(_DEPOT[0], _DEPOT[1], last_ll[0], last_ll[1]) * _ROAD_FACTOR
+            if dist_to_hq > _OUTSTATION_KM:
+                return ("OUTSTATION", f"{dist_to_hq:.0f} km back", True)
+
+        # Estimate travel + stop time
+        n_stops    = len(sorted_pairs_)
+        stop_min   = n_stops * _STOP_MIN
+
+        # Sum segment distances: HQ→stop1→stop2→…→last→HQ
+        coords = [_DEPOT]
+        for _do, _it in sorted_pairs_:
+            ll = _parse_latlon(_it.get("ROW_IDX"))
+            if ll:
+                coords.append(ll)
+        if last_ll:
+            coords.append(_DEPOT)
+
+        total_km = 0.0
+        for i in range(len(coords) - 1):
+            total_km += _haversine(coords[i][0], coords[i][1],
+                                   coords[i+1][0], coords[i+1][1]) * _ROAD_FACTOR
+
+        drive_min  = (total_km / _AVG_SPEED_KMH) * 60
+        total_min  = stop_min + drive_min
+
+        depart = _dtt.today().replace(hour=_DEPART_HOUR, minute=0, second=0, microsecond=0)
+        arrive = depart + _td(minutes=total_min)
+        deadline = depart.replace(hour=_DEADLINE_HOUR)
+
+        margin_min = int((deadline - arrive).total_seconds() / 60)
+        margin_str = (f"+{margin_min}min early" if margin_min >= 0
+                      else f"⚠️ {abs(margin_min)}min LATE")
+        return_km  = (_haversine(_DEPOT[0], _DEPOT[1], last_ll[0], last_ll[1]) * _ROAD_FACTOR
+                      if last_ll else 0)
+        return (arrive.strftime("%H:%M"), f"{margin_str}  |  {return_km:.0f}km back", False)
+
+    _RTN_FILL = PatternFill("solid", fgColor="D9D9D9")  # light grey for return row
+    _RTN_FONT = Font(bold=True, italic=True, size=9, color="404040")
+    _LATE_FILL = PatternFill("solid", fgColor="FF0000")
+    _LATE_FONT = Font(bold=True, size=9, color="FFFFFF")
+
     # ── One sheet per lorry ───────────────────────────────────────────────────
     last_col = get_column_letter(len(HEADERS))
     for plate in sorted_lorries:
@@ -5924,24 +5992,26 @@ def _generate_trip_manifest(sess) -> bytes:
         ws = wb.create_sheet(title=plate[:31].replace("/", "-"))
         ws.freeze_panes = "A3"
 
-        # Title
+        sorted_pairs: list = _nn_sort(pairs)
+        ret_time, ret_note, is_outstation = _est_return(sorted_pairs)
+
+        # Title row (row 1) — includes return time summary
         ws.merge_cells(f"A1:{last_col}1")
         util_icon = "✅" if util_pct >= 75 else ("🟡" if util_pct >= 50 else "⚠️")
-        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
-                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   "
-                     f"|   Generated: {generated_str}")
+        if is_outstation:
+            ret_summary = "🌙 OUTSTATION — overnight, no 1pm return"
+        else:
+            late_flag = "⚠️" if "LATE" in ret_note else "🕐"
+            ret_summary = f"{late_flag} Est. return HQ: {ret_time}  ({ret_note})"
+        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T cap   "
+                     f"|   {total_w}T ({util_pct}%) {util_icon}   "
+                     f"|   {ret_summary}   |   {generated_str}")
         t = ws.cell(1, 1, title_txt)
         t.font = _TITLE_FONT; t.fill = _TITLE_FILL
         t.alignment = Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[1].height = 22
 
         _apply_headers(ws, 2)
-
-        # Sort: ONE continuous geographic sweep across ALL stops (nearest-neighbour
-        # + 2-opt from the depot), so the driver follows a single one-way route and
-        # never zig-zags back and forth.  Delivery date is shown per row but no
-        # longer fragments the geographic order.
-        sorted_pairs: list = _nn_sort(pairs)
 
         prev_date = None
         for seq, (do, it) in enumerate(sorted_pairs, 1):
@@ -5969,8 +6039,37 @@ def _generate_trip_manifest(sess) -> bytes:
             if remarks_val:
                 ws.row_dimensions[dr].height = min(60, max(15, len(remarks_val) // 5 * 8))
 
-        # Footer
-        fr = len(sorted_pairs) + 3
+        # ↩ RETURN TO HQ row
+        rtn_row = len(sorted_pairs) + 3
+        is_late = not is_outstation and "LATE" in ret_note
+        rtn_fill = _LATE_FILL if is_late else _RTN_FILL
+        rtn_font = _LATE_FONT if is_late else _RTN_FONT
+        if is_outstation:
+            rtn_label = "🌙  OUTSTATION — driver stays overnight, no same-day return"
+        else:
+            rtn_label = f"↩  RETURN TO HQ — Eng Sheng Shah Alam"
+        ws.merge_cells(f"A{rtn_row}:E{rtn_row}")
+        c = ws.cell(rtn_row, 1, rtn_label)
+        c.font = rtn_font; c.fill = rtn_fill; c.border = _brd
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[rtn_row].height = 16
+
+        # Est return time in col 6-7, margin in col 7-last
+        c = ws.cell(rtn_row, 6, "—")
+        c.font = rtn_font; c.fill = rtn_fill; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
+
+        ws.merge_cells(f"G{rtn_row}:{last_col}{rtn_row}")
+        if is_outstation:
+            rtn_detail = "1 day 1 trip — overnight stay"
+        else:
+            rtn_detail = f"Est. arrive HQ: {ret_time}   {ret_note}   (depart 07:00, 60km/h avg)"
+        c = ws.cell(rtn_row, 7, rtn_detail)
+        c.font = rtn_font; c.fill = rtn_fill; c.border = _brd
+        c.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Footer (total / utilisation)
+        fr = rtn_row + 1
         ws.merge_cells(f"A{fr}:E{fr}")
         c = ws.cell(fr, 1, f"TOTAL — {len(sorted_pairs)} stop(s)")
         c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
