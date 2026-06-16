@@ -3151,40 +3151,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and (_grp_cap_pre is None or float(_lorry_cap_map.get(p, 0)) <= _grp_cap_pre)
                 ]
                 if _pref_avail:
-                    # Among available preferred lorries pick the tightest fit.
+                    # OWNER-FIRST: use the tightest-fitting preferred lorry
+                    # unconditionally. Fall back to open fleet only when ALL
+                    # preferred lorries are full, unavailable, or size-capped
+                    # (i.e. _pref_avail is empty — handled below).
                     _pref_avail.sort(key=lambda p: _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)))
-                    _pref_best = _pref_avail[0]
-                    _pref_surplus = _eff_cap_for(_pref_best, _dest_grp) - float(_session_loads.get(_pref_best, 0)) - total_w
-
-                    # Only force-assign the preferred lorry if it is also the
-                    # tightest-fitting lorry in the whole eligible fleet.
-                    # If a non-preferred lorry has smaller surplus, let open
-                    # weight-based assignment find it instead.
-                    _all_eligible_surplus = [
-                        _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp)
-                        - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0))
-                        - total_w
-                        for _, r in engine.eligible_lorries.iterrows()
-                        if str(r["LORRY"]).strip().upper() not in (sess["unavailable"] | get_assigned_today() | _strict_excl | _state_excl)
-                        and _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp) - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0)) >= total_w
-                        and float(r["TON"]) >= _pref_dest_min
-                    ]
-                    _best_fleet_surplus = min(_all_eligible_surplus) if _all_eligible_surplus else _pref_surplus
-
-                    # Use preferred lorry if its surplus is within 1T of fleet best
-                    # (allow small slack so a corridor lorry isn't bypassed for 200 kg difference)
-                    if _pref_surplus <= _best_fleet_surplus + 1.0:
-                        _chosen = _pref_best
-                        for it in group_items:
-                            it["LORRY"] = _chosen
-                        _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
-                        if _chosen not in _session_routes:
-                            _session_routes[_chosen] = _dominant_route
-                        _record_lorry_state(_chosen, _grp_state)
-                        for it in _all_group:
-                            sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
-                        return
-                # Preferred lorry not tightest fit / unavailable → open weight-based assignment
+                    _chosen = _pref_avail[0]
+                    for it in group_items:
+                        it["LORRY"] = _chosen
+                    _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
+                    if _chosen not in _session_routes:
+                        _session_routes[_chosen] = _dominant_route
+                    _record_lorry_state(_chosen, _grp_state)
+                    for it in _all_group:
+                        sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
+                    return
+                # All preferred lorries full / unavailable → open weight-based assignment
 
             # ── Destination-based lorry size enforcement ───────────────────────
             _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
