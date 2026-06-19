@@ -2965,18 +2965,35 @@ def _handle_excel_upload(phone, sess, file_bytes):
             """Assign ONE lorry (or split) to cover ALL items in the group.
             All items in the group share the same route (one route = one lorry).
             """
-            # Pre-filter: mark items exceeding every available lorry's capacity as
-            # NO_LORRY before computing total_w.  Without this a 27T item in a 35T
-            # group inflates total_w so a 20T lorry ends up with only 8T of feasible
-            # cargo at 44% utilisation instead of the correct 10.5T lorry at 85%.
+            # Pre-filter: items that exceed every single lorry's capacity cannot
+            # ride alone.  Instead of immediately marking them NO_LORRY, try to
+            # split the single heavy DO across multiple lorries (e.g. a 27T DO
+            # split across two 14T lorries).  Only if no combination of available
+            # lorries can cover the total weight does the DO become NO_LORRY.
             _max_cap = (float(engine.eligible_lorries["TON"].max())
                         if not engine.eligible_lorries.empty else 0.0)
+            _excl_pre = sess["unavailable"] | get_assigned_today()
+            _avail_lorries_pre = [
+                (str(r["LORRY"]).strip().upper(), float(r["TON"]))
+                for _, r in engine.eligible_lorries.iterrows()
+                if str(r["LORRY"]).strip().upper() not in _excl_pre
+            ]
+            _fleet_total_cap = sum(c for _, c in _avail_lorries_pre)
             _all_group = list(group_items)
             if _max_cap > 0:
-                for it in _all_group:
+                _still_oversized = []
+                for it in list(_all_group):
                     if it.get("LORRY") is None and it["WEIGHT"] > _max_cap:
-                        it["LORRY"] = "NO_LORRY"
-                        _unassigned_reasons[it["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
+                        # Heavy item — can the fleet cover it across multiple lorries?
+                        if it["WEIGHT"] <= _fleet_total_cap:
+                            # Yes — create a synthetic single-item group and let the
+                            # normal split path handle it below.  We mark it with a
+                            # sentinel so it won't be excluded again on the recursive call.
+                            it["_ALLOW_MULTI_LORRY"] = True
+                        else:
+                            # Truly impossible — more than total fleet capacity.
+                            it["LORRY"] = "NO_LORRY"
+                            _unassigned_reasons[it["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
                 group_items = [it for it in _all_group if it.get("LORRY") != "NO_LORRY"]
             else:
                 _all_group = list(group_items)
@@ -3028,6 +3045,61 @@ def _handle_excel_upload(phone, sess, file_bytes):
             total_w  = sum(it["WEIGHT"] for it in group_items)
             route    = group_items[0]["ROUTE"]
             customer = group_items[0]["CUSTOMER NAME"]
+
+            # ── Multi-lorry split for single heavy items ──────────────────────
+            # A single DO whose weight exceeds the largest available lorry but
+            # fits across 2+ lorries in the fleet is split here.  We greedily
+            # fill the biggest available lorry, then recurse on the remainder.
+            # The sentinel _ALLOW_MULTI_LORRY is set upstream by the pre-filter.
+            if (len(group_items) == 1
+                    and group_items[0].get("_ALLOW_MULTI_LORRY")
+                    and total_w > _max_cap):
+                _excl_ml = sess["unavailable"] | get_assigned_today() | get_broken_lorries().keys()
+                _ml_lorries = sorted(
+                    [
+                        (str(r["LORRY"]).strip().upper(), float(r["TON"]))
+                        for _, r in engine.eligible_lorries.iterrows()
+                        if str(r["LORRY"]).strip().upper() not in _excl_ml
+                    ],
+                    key=lambda x: -x[1],   # largest first
+                )
+                _remaining_w = total_w
+                _orig_item   = group_items[0]
+                _part_num    = 0
+                _first_plate = None
+                for _ml_plate, _ml_cap in _ml_lorries:
+                    if _remaining_w <= 0:
+                        break
+                    _portion = min(_ml_cap, _remaining_w)
+                    _part_num += 1
+                    # Clone the item for this portion, giving it a unique internal key
+                    # so the summary can show it under each lorry separately.
+                    _part_item = dict(_orig_item)
+                    _part_item["WEIGHT"]            = round(_portion, 4)
+                    _part_item["_ALLOW_MULTI_LORRY"] = False
+                    _part_item["LORRY"]             = _ml_plate
+                    _part_item["SPLIT_PART"]        = _part_num   # 1, 2, 3…
+                    _part_item["DO NUMBER"]         = f"{_orig_item['DO NUMBER']}(p{_part_num})"
+                    # Register in _all_group so the export loop can see all parts
+                    _all_group.append(_part_item)
+                    _session_loads[_ml_plate] = float(_session_loads.get(_ml_plate, 0)) + _portion
+                    if _ml_plate not in _session_routes:
+                        _session_routes[_ml_plate] = route
+                    sess["assigned"][_part_item["DO NUMBER"]] = _ml_plate
+                    _remaining_w = round(_remaining_w - _portion, 4)
+                    if _first_plate is None:
+                        _first_plate = _ml_plate
+                # Mark original item with first lorry (the main record); it will be
+                # superseded by the cloned parts in the export.
+                if _remaining_w > 0:
+                    _orig_item["LORRY"] = "NO_LORRY"
+                    _unassigned_reasons[_orig_item["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
+                else:
+                    _orig_item["LORRY"] = _first_plate or "NO_LORRY"
+                for it in _all_group:
+                    if it.get("LORRY") == "NO_LORRY":
+                        sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                return
 
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
@@ -4278,18 +4350,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP"):
                 continue          # keep in raw_df for export blank; hide from UI
             do_num = item["DO NUMBER"]
-            if do_num not in seen_do:
-                seen_do[do_num] = len(pending_dos)
+            # Multi-lorry split parts get their own display entry (keyed by their
+            # synthetic DO NUMBER like "39877(p2)") so each lorry's section shows
+            # the portion it carries instead of the full 27T.
+            _display_key = do_num   # default: group under original DO number
+            if item.get("SPLIT_PART"):
+                _display_key = do_num   # already unique ("39877(p1)", "39877(p2)")
+            if _display_key not in seen_do:
+                seen_do[_display_key] = len(pending_dos)
+                # Strip the synthetic part suffix for the display label
+                _orig_num = do_num.split("(p")[0]
                 pending_dos.append({
-                    "DO NUMBER":     do_num,
+                    "DO NUMBER":     _orig_num,
                     "ALL_DO_NUMBERS": [do_num],
                     "ROUTE":         item["ROUTE"],
                     "CODE":          item["CODE"],
                     "CUSTOMER NAME": item["CUSTOMER NAME"],
                     "DATE":          item.get("DATE", ""),
                     "ITEMS":         [],          # list of item dicts
+                    "SPLIT_PART":    item.get("SPLIT_PART"),
                 })
-            pending_dos[seen_do[do_num]]["ITEMS"].append(item)
+            pending_dos[seen_do[_display_key]]["ITEMS"].append(item)
 
         # Compute TOTAL_TON and flatten split/single for display
         for do in pending_dos:
