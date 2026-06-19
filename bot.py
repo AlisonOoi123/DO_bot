@@ -2973,6 +2973,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _max_cap = (float(engine.eligible_lorries["TON"].max())
                         if not engine.eligible_lorries.empty else 0.0)
             _excl_pre = sess["unavailable"] | get_assigned_today()
+            # NOTE: strict-route exclusions can't be computed here because we
+            # don't yet know the route for every item that might be oversized.
+            # We compute a conservative (inclusive) fleet cap; the strict check
+            # is applied per-item when the multi-lorry split actually runs.
             _avail_lorries_pre = [
                 (str(r["LORRY"]).strip().upper(), float(r["TON"]))
                 for _, r in engine.eligible_lorries.iterrows()
@@ -2985,13 +2989,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 for it in list(_all_group):
                     if it.get("LORRY") is None and it["WEIGHT"] > _max_cap:
                         # Heavy item — can the fleet cover it across multiple lorries?
-                        if it["WEIGHT"] <= _fleet_total_cap:
-                            # Yes — create a synthetic single-item group and let the
-                            # normal split path handle it below.  We mark it with a
-                            # sentinel so it won't be excluded again on the recursive call.
+                        # Compute usable capacity excluding lorries strictly
+                        # forbidden from this item's route (e.g. BQU3875 can't
+                        # serve KV routes even for a multi-lorry split).
+                        _item_strict = _strict_route_excl(it.get("ROUTE", ""))
+                        _usable_cap = sum(
+                            c for p, c in _avail_lorries_pre
+                            if p not in _item_strict
+                        )
+                        if it["WEIGHT"] <= _usable_cap:
+                            # Fleet can cover it across multiple lorries — mark
+                            # for multi-lorry split below.
                             it["_ALLOW_MULTI_LORRY"] = True
                         else:
-                            # Truly impossible — more than total fleet capacity.
+                            # Truly impossible — more than usable fleet capacity.
                             it["LORRY"] = "NO_LORRY"
                             _unassigned_reasons[it["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
                 group_items = [it for it in _all_group if it.get("LORRY") != "NO_LORRY"]
@@ -3055,11 +3066,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and group_items[0].get("_ALLOW_MULTI_LORRY")
                     and total_w > _max_cap):
                 _excl_ml = sess["unavailable"] | get_assigned_today() | get_broken_lorries().keys()
+                _ml_strict = _strict_route_excl(route)   # e.g. BQU3875 excluded for KV routes
                 _ml_lorries = sorted(
                     [
                         (str(r["LORRY"]).strip().upper(), float(r["TON"]))
                         for _, r in engine.eligible_lorries.iterrows()
                         if str(r["LORRY"]).strip().upper() not in _excl_ml
+                        and str(r["LORRY"]).strip().upper() not in _ml_strict
                     ],
                     key=lambda x: -x[1],   # largest first
                 )
@@ -3144,17 +3157,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             excluded = excluded | _strict_excl
 
             # ── Cross-direction incompatibility for outstation lorries ──────────
-            # Any lorry already serving an OUTSTATION route (LARGE_LONG or
-            # MEDIUM_LONG) must not switch to a different outstation direction.
-            # This covers large (≥14T), medium (11–14T), AND small lorries like
-            # BQX9983 (10.5T) that serve NS/PH routes — without this, a small
-            # lorry with strong history for both NS05 and PH06 gets assigned both.
+            # A lorry already serving an OUTSTATION route (LARGE_LONG or
+            # MEDIUM_LONG) must not be mixed with a DIFFERENT direction — whether
+            # the current group is outstation OR urban.
+            #
+            # Without this, a lorry heading Pahang (outstation) also picks up
+            # urban KL/Selangor items that it literally cannot visit on the same
+            # trip. The previous guard had `_dest_grp not in _DEST_URBAN_GROUPS`
+            # which disabled the check entirely for urban groups — removed below.
             _session_incompatible_lm = {
                 p for p in _session_loads
                 if _session_routes.get(p)
                 and _classify_dest_group(
                     _session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
-                and _dest_grp not in _DEST_URBAN_GROUPS
                 and not _routes_on_same_way(route, _session_routes.get(p, ""))
             }
             excluded = excluded | _session_incompatible_lm
