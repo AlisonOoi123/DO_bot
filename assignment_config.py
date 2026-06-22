@@ -250,11 +250,13 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     "KV11A": ["VEA2818", "VKN8836", "W3826C", "BQX7228", "W3618U"],
     "KV12A": ["BQX7228", "W3826C",  "W3618U"],
     # ABI Southeast / Cheras-Kajang corridor (medium lorries)
-    "KV19A": ["BQX9983", "BMN3682", "BPE9788"],
-    "KV20A": ["BMN3682", "BQX9983", "BPE9788"],
-    "KV24":  ["BQX9983", "BMN3682", "BPE9788"],   # Semenyih (no history → SE fallback)
+    # BPE9788 removed — it belongs on Pahang (PH01-PH08) and must not be
+    # claimed by urban KV routes on days when PH cargo exists.
+    "KV19A": ["BQX9983", "BMN3682", "W3826C"],
+    "KV20A": ["BMN3682", "BQX9983", "BQY7823"],
+    "KV24":  ["BQX9983", "BMN3682"],              # Semenyih fallback
     # Negeri Sembilan corridor
-    "NS04":  ["BQX9983", "BPE9788", "BQY7823"],
+    "NS04":  ["BQX9983", "BMN3682", "BQY7823"],
     "NS05":  ["BQX9983", "BMN3682", "BQY7823"],
     "NS06":  ["BQX9983", "BQY7823", "BMN3682"],
     # Pahang interior
@@ -268,7 +270,9 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     "PH09":  ["VJN9910", "BQU3875", "VER2872", "BQY7823"],   # Kuantan — heaviest run
     "PH10":  ["BQX9983", "BPE9788"],
     "PH11":  ["BPE9788", "BQX9983", "BMN3682"],   # Temerloh (no history → PH fallback)
-    "TR02":  ["BQY7823", "VER2872", "WA6899M"],
+    # TR02 (Kemaman, Terengganu) — WA6899M removed (strict PH-only, cannot serve TR).
+    # BPE9788 / BQU3875 added as last-resort backups for heavy-load days.
+    "TR02":  ["BQY7823", "VER2872", "BPE9788", "BQU3875"],
     # ── VIVIAN routes ─────────────────────────────────────────────────────────
     # Johor corridor
     "JH01":  ["VJN8929", "VJA7981", "VNL6819"],
@@ -279,7 +283,8 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     # Klang Valley (VIVIAN) — small/medium lorries
     "KV03A": ["VCC3998", "BPE9878", "VNL6819", "WA9225H"],
     "KV13A": ["VKN8836", "WYS5281", "BPE9878", "VCC3998"],
-    "KV14A": ["VKN8836", "BPE9878", "WYS5281", "VCC3998"],
+    "KV14A": ["VKN8836", "BPE9878", "WYS5281", "VCC3998",    # VIVIAN preferred
+              "W3826C", "BQX7228", "W3618U", "WLD8738"],    # ABI fallback (Puchong is Selangor urban)
     "KV15A": ["VKN8836", "WYS5281", "VCC3998"],
     "KV16A": ["VKN8836", "WYS5281", "BPE9878"],
     "KV17A": ["VKN8836", "VCC3998", "WYS5281"],

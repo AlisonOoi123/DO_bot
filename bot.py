@@ -193,17 +193,39 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
 
     # Negative patterns: a day mentioned as CLOSED / OFF / not accepted.
     # Patterns: "<DAY> OFF", "<DAY> TUTUP", "<DAY> TAK TERIMA", "TUTUP <DAY>",
-    #           "CLOSED <DAY>", "TAK TERIMA <DAY>", "<DAY> TIDAK HANTAR"
+    #           "CLOSED <DAY>", "TAK TERIMA <DAY>", "<DAY> TIDAK HANTAR",
+    #           "KEDAI TUTUP" (shop closed on those days),
+    #           "JANGAN HANTAR <DAY>" (do not deliver on those days)
     _NEG_SUFFIX = (
-        r'\s+(?:OFF|TUTUP|TAK\s+TERIMA(?:\s+BARANG)?'
+        r'(?:[\s:]+\w+)*[\s:]+(?:OFF|TUTUP|TAK\s+TERIMA(?:\s+BARANG)?'
         r'|TIDAK\s+(?:TERIMA|HANTAR|ACCEPT|BOLEH)'
         r'|CLOSED|BLOCKED|SKIP|TOLAK)'
     )
     _NEG_PREFIX = (
         r'(?:TUTUP|CLOSED|OFF|TAK\s+TERIMA(?:\s+BARANG)?'
-        r'|TIDAK\s+(?:TERIMA|HANTAR))\s+'
+        r'|TIDAK\s+(?:TERIMA|HANTAR)'
+        r'|JANGAN\s+HANTAR(?:\s+BARANG)?)'
+        r'(?:\s+(?:DALAM|PADA|HARI|BARANG))*\s+'
     )
-    neg_days: set[int] = set()
+    # Sentence-level negation: if the whole clause contains a block keyword,
+    # all day keywords found in that same clause are treated as negated.
+    # Split on common clause separators (-->  /  ;  ,  &-free boundary).
+    _CLAUSE_NEG = re.compile(
+        r'\b(?:JANGAN\s+HANTAR(?:\s+BARANG)?'
+        r'|TIDAK\s+(?:TERIMA|HANTAR)'
+        r'|TAK\s+TERIMA(?:\s+BARANG)?'
+        r'|KEDAI\s+TUTUP|TUTUP|CLOSED|OFF)\b'
+    )
+    # Split remark into clauses on --> or ; separators
+    clauses = re.split(r'-->', txt)
+    clause_neg_days: set[int] = set()
+    for clause in clauses:
+        if _CLAUSE_NEG.search(clause):
+            for kw, wd in _REMARKS_KEYWORD_DAY:
+                if re.search(r'\b' + re.escape(kw) + r'\b', clause):
+                    clause_neg_days.add(wd)
+
+    neg_days: set[int] = set(clause_neg_days)
     for kw, wd in _REMARKS_KEYWORD_DAY:
         kw_re = r'\b' + re.escape(kw) + r'\b'
         if re.search(kw_re + _NEG_SUFFIX, txt):
@@ -217,8 +239,10 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
         if wd not in neg_days and re.search(r'\b' + re.escape(kw) + r'\b', txt):
             days.add(wd)
 
-    # If only negation was found (no positive days), treat as no restriction —
-    # the customer just noted which day(s) to avoid; all others are fine.
+    # If only negation was found (no positive days), invert: allow all weekdays
+    # except the blocked ones (Mon-Sat = 0-5, skip Sun=6 as no deliveries).
+    if not days and neg_days:
+        return {d for d in range(6) if d not in neg_days}
     return days if days else None
 
 
@@ -471,6 +495,24 @@ def _remarks_lorry_cap(remarks: str) -> float | None:
     for phrase, cap in _REMARKS_SIZE_ALIASES.items():
         if cap is not None and phrase in txt:
             caps.append(cap)
+    # 3. Free-text "N TON" size caps, tolerant of filler words & ordering, e.g.
+    #      "BELOW 5 TON"            "BELOW OR 5 TON LORRY"
+    #      "5 TON OR BELOW"         "5 TON LORRY AND BELOW"
+    #      "5 TON KE BAWAH"         "MAX 5 TON"
+    #    Any of these caps the lorry at N tonnes.
+    _below_words = r'(?:BELOW|MAX(?:IMUM)?|UNDER|KE\s*BAWAH|AND\s+BELOW|OR\s+BELOW)'
+    _ton_patterns = [
+        rf'{_below_words}\s+(?:OR\s+)?(\d+(?:\.\d+)?)\s*TON',   # BELOW [OR] N TON
+        rf'(\d+(?:\.\d+)?)\s*TON(?:\s+LORRY)?\s+(?:OR\s+|AND\s+)?{_below_words}',  # N TON [LORRY] [OR/AND] BELOW
+        rf'(\d+(?:\.\d+)?)\s*TON\s+KE\s*BAWAH',                  # N TON KE BAWAH
+        rf'(?:MAX(?:IMUM)?|MAKS)\s+(\d+(?:\.\d+)?)\s*TON',      # MAX N TON
+    ]
+    for _pat in _ton_patterns:
+        for _m in re.finditer(_pat, txt):
+            try:
+                caps.append(float(_m.group(1)))
+            except (ValueError, IndexError):
+                pass
     return min(caps) if caps else None
 
 
@@ -2167,30 +2209,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
             _remarks_raw = str(row.get("REMARKS", "")).strip()
 
-            # Remarks-day filter: if the remark explicitly specifies delivery days
-            # (e.g. "SELASA DAN JUMAAT", "FRIDAY") and today is NOT one of those
-            # days, mark the item as day-restricted — it should not be assigned.
-            _remarks_day_restricted = False
-            if _is_mine and _is_today:
-                _rm_days = _remarks_days_for(_remarks_raw)
-                if _rm_days is not None:
-                    # Compute trip weekday
-                    _td_obj = datetime.now().date()
-                    if sess.get("trip_day") == "tomorrow":
-                        _td_obj += __import__("datetime").timedelta(days=1)
-                        while _td_obj.weekday() == 6:
-                            _td_obj += __import__("datetime").timedelta(days=1)
-                    _trip_wd_check = _td_obj.weekday()
-                    if _trip_wd_check not in _rm_days:
-                        _remarks_day_restricted = True
+            # Remarks-day filter DISABLED by request: assignment now depends only
+            # on the trip day the user selected at login (today/tomorrow) plus the
+            # SCHD schedule check above. Delivery-day hints in REMARKS (e.g.
+            # "SABTU", "JANGAN HANTAR SELASA", "KEDAI TUTUP RABU") no longer block
+            # assignment — the user decides the day.
 
             _lorry_init = None
             if not _is_mine:
                 _lorry_init = "OTHER_USER"
             elif not _is_today:
                 _lorry_init = "NOT_TODAY"
-            elif _remarks_day_restricted:
-                _lorry_init = "REMARKS_SKIP"
             elif sess.get("_prefilled_count"):
                 # Case B: pre-filled file — rows that already have a valid lorry
                 # plate in LICENSE keep that assignment so session_loads is accurate.
@@ -2412,6 +2441,28 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _rt_key = f"{_rt_key}||{_sub_key}"
             route_buckets[_rt_key].append(it)
 
+        # Step 1.5 — Collapse same-route-prefix sub-buckets into one bucket.
+        # The geographic sub-bucketing above (state|city or state|octant) can split
+        # a single route like KV11A into several keys:
+        #   KV11A - PUDU…||SELANGOR|CHERAS
+        #   KV11A - PUDU…||WP|KUALA LUMPUR
+        # These must ride the same lorry (same route = same physical road).
+        # Pre-merge them here so the cross-route merge step (Step 2) sees one
+        # unified bucket per route, not scattered fragments.
+        _pfx_to_keys: dict[str, list] = {}
+        for _bk in list(route_buckets.keys()):
+            _bare_rt = _bk.split("||")[0]
+            _pfx = _extract_route_prefix(_bare_rt)
+            if _pfx:
+                _pfx_to_keys.setdefault(_pfx, []).append(_bk)
+        for _pfx, _bkeys in _pfx_to_keys.items():
+            if len(_bkeys) <= 1:
+                continue
+            # Merge all sub-buckets for this prefix into the first key
+            _primary = _bkeys[0]
+            for _other in _bkeys[1:]:
+                route_buckets[_primary].extend(route_buckets.pop(_other))
+
         # Step 2 — cluster same-way buckets into corridor super-groups
         # Each super-group is a list of route-bucket lists.
         max_lorry_cap = float(engine.eligible_lorries["TON"].max()) \
@@ -2484,13 +2535,36 @@ def _handle_excel_upload(phone, sess, file_bytes):
                              sum(it["WEIGHT"] for it in cand_bucket)
                 n_distinct = len({it["ROUTE"] for it in merged_items}) + 1
 
-                # Don't merge routes whose preferred-lorry sets are disjoint
+                # Don't merge routes whose preferred-lorry sets are disjoint —
+                # unless BOTH routes are urban (KL/Selangor) and their GPS centroids
+                # are within _MAX_CITY_MERGE_KM_OUTSTATION of each other, in which
+                # case proximity overrides the preferred-lorry constraint so nearby
+                # city routes (e.g. KV05A + KV19A, both around KL) can share one lorry.
                 _base_pref = set(_preferred_lorries_for_route(base_route))
                 _cand_pref = set(_preferred_lorries_for_route(cand_route))
+                _base_dest_g_pref = _classify_dest_group(base_route, "")
+                _cand_dest_g_pref = _classify_dest_group(cand_route, "")
+                _both_urban = (_base_dest_g_pref in _DEST_URBAN_GROUPS
+                               and _cand_dest_g_pref in _DEST_URBAN_GROUPS)
+                # Check GPS proximity between the two route centroids.
+                # Use live GPS from uploaded items first; fall back to static centroid DB.
+                _bc_pref = (_live_centroids.get(base_bkey)
+                            or _live_centroids.get(base_route)
+                            or _route_centroid(base_route))
+                _cc_pref = (_live_centroids.get(cand_bkey)
+                            or _live_centroids.get(cand_route)
+                            or _route_centroid(cand_route))
+                _geo_close = (
+                    _both_urban
+                    and _bc_pref and _cc_pref
+                    and _haversine_km(_bc_pref[0], _bc_pref[1], _cc_pref[0], _cc_pref[1])
+                        <= _MAX_CITY_MERGE_KM_OUTSTATION
+                )
                 _pref_overlap = (
                     not _base_pref
                     or not _cand_pref
                     or bool(_base_pref & _cand_pref)
+                    or _geo_close   # urban routes close together may share a lorry
                 )
 
                 # Don't merge buckets whose GPS bearing octants are incompatible,
@@ -2522,12 +2596,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     or _oct_base == "LOCAL" or _oct_cand == "LOCAL"
                     or _oct_cand != _OPPOSITE.get(_oct_base, "")
                 )
-                # State boundary check — different state = different lorry
+                # State boundary check — different state = different lorry.
+                # Exception: same route prefix (e.g. both KV01A) always merges —
+                # the route already accounts for cross-state travel.
                 _st_base = _state_from_bkey(base_bkey)
                 _st_cand = _state_from_bkey(cand_bkey)
                 _same_state = (
                     not _st_base or not _st_cand
                     or _st_base == _st_cand
+                    or base_route == cand_route  # same route code → allow cross-state merge
                 )
 
                 # City-proximity check for outstation routes: only merge city
@@ -2570,14 +2647,50 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             )
 
                 _corridor_merge = _same_corridor_group(base_route, cand_route)
+                _urban_prox_merge = _geo_close
+
+                # ── Priority-ordered merge rules (per user request) ───────────
+                # Group items onto the same lorry in this priority order:
+                #   1. SAME ROUTE  — identical route prefix (e.g. KV05A == KV05A)
+                #   2. SAME CITY   — same state AND same city
+                #   3. SAME STATE + NEAREST LONGITUDE — same state and centroids
+                #      close together (longitude/GPS within the merge radius)
+                _pfx_base = _extract_route_prefix(base_route)
+                _pfx_cand = _extract_route_prefix(cand_route)
+                _same_route_pfx = bool(_pfx_base) and _pfx_base == _pfx_cand
+
+                _base_cities2 = {it.get("CITY", "").strip().upper()
+                                 for it in base_bucket if it.get("CITY")}
+                _cand_cities2 = {it.get("CITY", "").strip().upper()
+                                 for it in cand_bucket if it.get("CITY")}
+                _same_city = (
+                    bool(_base_cities2 & _cand_cities2)
+                    and (not _st_base or not _st_cand or _st_base == _st_cand)
+                )
+
+                # Same-state + nearest-longitude: both in the same state and their
+                # GPS centroids are within the city-merge radius of each other.
+                _lon_close = False
+                if (_st_base and _st_cand and _st_base == _st_cand
+                        and _bc_pref and _cc_pref):
+                    _lon_close = (
+                        _haversine_km(_bc_pref[0], _bc_pref[1],
+                                      _cc_pref[0], _cc_pref[1])
+                        <= _MAX_CITY_MERGE_KM_OUTSTATION
+                    )
+
+                _priority_merge = _same_route_pfx or _same_city or _lon_close
+
                 if (
                     combined_w <= max_lorry_cap
                     and n_distinct <= _MAX_STOPS
-                    and (_routes_on_same_way(base_route, cand_route) or _corridor_merge)
-                    and _pref_overlap
+                    and (_routes_on_same_way(base_route, cand_route) or _corridor_merge
+                         or _urban_prox_merge or _priority_merge)
+                    and (_pref_overlap or _same_route_pfx or _same_city)
                     and _geo_ok
                     and _same_state
-                    and (_city_dist_ok or _corridor_merge)
+                    and (_city_dist_ok or _corridor_merge or _urban_prox_merge
+                         or _same_route_pfx or _same_city or _lon_close)
                 ):
                     merged_items += list(cand_bucket)
                     in_group[j]   = True
@@ -2852,18 +2965,46 @@ def _handle_excel_upload(phone, sess, file_bytes):
             """Assign ONE lorry (or split) to cover ALL items in the group.
             All items in the group share the same route (one route = one lorry).
             """
-            # Pre-filter: mark items exceeding every available lorry's capacity as
-            # NO_LORRY before computing total_w.  Without this a 27T item in a 35T
-            # group inflates total_w so a 20T lorry ends up with only 8T of feasible
-            # cargo at 44% utilisation instead of the correct 10.5T lorry at 85%.
+            # Pre-filter: items that exceed every single lorry's capacity cannot
+            # ride alone.  Instead of immediately marking them NO_LORRY, try to
+            # split the single heavy DO across multiple lorries (e.g. a 27T DO
+            # split across two 14T lorries).  Only if no combination of available
+            # lorries can cover the total weight does the DO become NO_LORRY.
             _max_cap = (float(engine.eligible_lorries["TON"].max())
                         if not engine.eligible_lorries.empty else 0.0)
+            _excl_pre = sess["unavailable"] | get_assigned_today()
+            # NOTE: strict-route exclusions can't be computed here because we
+            # don't yet know the route for every item that might be oversized.
+            # We compute a conservative (inclusive) fleet cap; the strict check
+            # is applied per-item when the multi-lorry split actually runs.
+            _avail_lorries_pre = [
+                (str(r["LORRY"]).strip().upper(), float(r["TON"]))
+                for _, r in engine.eligible_lorries.iterrows()
+                if str(r["LORRY"]).strip().upper() not in _excl_pre
+            ]
+            _fleet_total_cap = sum(c for _, c in _avail_lorries_pre)
             _all_group = list(group_items)
             if _max_cap > 0:
-                for it in _all_group:
+                _still_oversized = []
+                for it in list(_all_group):
                     if it.get("LORRY") is None and it["WEIGHT"] > _max_cap:
-                        it["LORRY"] = "NO_LORRY"
-                        _unassigned_reasons[it["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
+                        # Heavy item — can the fleet cover it across multiple lorries?
+                        # Compute usable capacity excluding lorries strictly
+                        # forbidden from this item's route (e.g. BQU3875 can't
+                        # serve KV routes even for a multi-lorry split).
+                        _item_strict = _strict_route_excl(it.get("ROUTE", ""))
+                        _usable_cap = sum(
+                            c for p, c in _avail_lorries_pre
+                            if p not in _item_strict
+                        )
+                        if it["WEIGHT"] <= _usable_cap:
+                            # Fleet can cover it across multiple lorries — mark
+                            # for multi-lorry split below.
+                            it["_ALLOW_MULTI_LORRY"] = True
+                        else:
+                            # Truly impossible — more than usable fleet capacity.
+                            it["LORRY"] = "NO_LORRY"
+                            _unassigned_reasons[it["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
                 group_items = [it for it in _all_group if it.get("LORRY") != "NO_LORRY"]
             else:
                 _all_group = list(group_items)
@@ -2916,25 +3057,73 @@ def _handle_excel_upload(phone, sess, file_bytes):
             route    = group_items[0]["ROUTE"]
             customer = group_items[0]["CUSTOMER NAME"]
 
+            # ── Multi-lorry split for single heavy items ──────────────────────
+            # A single DO whose weight exceeds the largest available lorry but
+            # fits across 2+ lorries in the fleet is split here.  We greedily
+            # fill the biggest available lorry, then recurse on the remainder.
+            # The sentinel _ALLOW_MULTI_LORRY is set upstream by the pre-filter.
+            if (len(group_items) == 1
+                    and group_items[0].get("_ALLOW_MULTI_LORRY")
+                    and total_w > _max_cap):
+                _excl_ml = sess["unavailable"] | get_assigned_today() | get_broken_lorries().keys()
+                _ml_strict = _strict_route_excl(route)   # e.g. BQU3875 excluded for KV routes
+                _ml_lorries = sorted(
+                    [
+                        (str(r["LORRY"]).strip().upper(), float(r["TON"]))
+                        for _, r in engine.eligible_lorries.iterrows()
+                        if str(r["LORRY"]).strip().upper() not in _excl_ml
+                        and str(r["LORRY"]).strip().upper() not in _ml_strict
+                    ],
+                    key=lambda x: -x[1],   # largest first
+                )
+                _remaining_w = total_w
+                _orig_item   = group_items[0]
+                _part_num    = 0
+                _first_plate = None
+                for _ml_plate, _ml_cap in _ml_lorries:
+                    if _remaining_w <= 0:
+                        break
+                    _portion = min(_ml_cap, _remaining_w)
+                    _part_num += 1
+                    # Clone the item for this portion, giving it a unique internal key
+                    # so the summary can show it under each lorry separately.
+                    _part_item = dict(_orig_item)
+                    _part_item["WEIGHT"]            = round(_portion, 4)
+                    _part_item["_ALLOW_MULTI_LORRY"] = False
+                    _part_item["LORRY"]             = _ml_plate
+                    _part_item["SPLIT_PART"]        = _part_num   # 1, 2, 3…
+                    _part_item["DO NUMBER"]         = f"{_orig_item['DO NUMBER']}(p{_part_num})"
+                    # Register in _all_group so the export loop can see all parts
+                    _all_group.append(_part_item)
+                    _session_loads[_ml_plate] = float(_session_loads.get(_ml_plate, 0)) + _portion
+                    if _ml_plate not in _session_routes:
+                        _session_routes[_ml_plate] = route
+                    sess["assigned"][_part_item["DO NUMBER"]] = _ml_plate
+                    _remaining_w = round(_remaining_w - _portion, 4)
+                    if _first_plate is None:
+                        _first_plate = _ml_plate
+                # Mark original item with first lorry (the main record); it will be
+                # superseded by the cloned parts in the export.
+                if _remaining_w > 0:
+                    _orig_item["LORRY"] = "NO_LORRY"
+                    _unassigned_reasons[_orig_item["DO NUMBER"]] = "LOAD_EXCEEDS_ALL_LORRIES"
+                else:
+                    _orig_item["LORRY"] = _first_plate or "NO_LORRY"
+                for it in _all_group:
+                    if it.get("LORRY") == "NO_LORRY":
+                        sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                return
+
             broken_map = get_broken_lorries()
             sess["unavailable"].update(broken_map.keys())
 
-            # ── Effective-capacity helper (accounts for 2-trip local runs) ─────
-            # LARGE lorries (≥11T): hard cap — outstation runs take the full day.
-            # MEDIUM/SMALL lorries on LOCAL routes: 2 trips (morning + afternoon).
-            # Any lorry on OUTSTATION routes: hard cap (1 trip).
+            # ── Effective-capacity helper ─────────────────────────────────────
+            # Per user preference: assign by SINGLE-trip physical capacity only —
+            # always pick the smallest lorry that fits in one trip. No 2-trip
+            # (morning+afternoon) capacity crediting, which previously let a small
+            # van "fit" a group it could not physically carry in one load.
             def _eff_cap_for(plate: str, grp_dest: str) -> float:
-                cap = float(_lorry_cap_map.get(plate, 0.0))
-                if cap >= 11.0:
-                    return cap   # large lorries never double-trip
-                lorry_dest = _classify_dest_group(
-                    _session_routes.get(plate, ""))
-                # Allow double capacity only when BOTH lorry's existing route
-                # AND the new group are LOCAL (KV/KL/Selangor).
-                if (lorry_dest in _DEST_URBAN_GROUPS
-                        and grp_dest in _DEST_URBAN_GROUPS):
-                    return cap * 2  # morning + afternoon trips
-                return cap
+                return float(_lorry_cap_map.get(plate, 0.0))
 
             # ── Destination group — must be defined BEFORE _session_full ─────────
             # LARGE_LONG  (Pahang/Kuantan/Terengganu/…): must use ≥14T lorry
@@ -2968,17 +3157,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             excluded = excluded | _strict_excl
 
             # ── Cross-direction incompatibility for outstation lorries ──────────
-            # Any lorry already serving an OUTSTATION route (LARGE_LONG or
-            # MEDIUM_LONG) must not switch to a different outstation direction.
-            # This covers large (≥14T), medium (11–14T), AND small lorries like
-            # BQX9983 (10.5T) that serve NS/PH routes — without this, a small
-            # lorry with strong history for both NS05 and PH06 gets assigned both.
+            # A lorry already serving an OUTSTATION route (LARGE_LONG or
+            # MEDIUM_LONG) must not be mixed with a DIFFERENT direction — whether
+            # the current group is outstation OR urban.
+            #
+            # Without this, a lorry heading Pahang (outstation) also picks up
+            # urban KL/Selangor items that it literally cannot visit on the same
+            # trip. The previous guard had `_dest_grp not in _DEST_URBAN_GROUPS`
+            # which disabled the check entirely for urban groups — removed below.
             _session_incompatible_lm = {
                 p for p in _session_loads
                 if _session_routes.get(p)
                 and _classify_dest_group(
                     _session_routes.get(p, "")) not in _DEST_URBAN_GROUPS
-                and _dest_grp not in _DEST_URBAN_GROUPS
                 and not _routes_on_same_way(route, _session_routes.get(p, ""))
             }
             excluded = excluded | _session_incompatible_lm
@@ -2988,13 +3179,26 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Uses _session_lorry_states (running tracker, updated after each
             # assignment) so it is never confused by pre-assigned rows from
             # other days that happen to share the same items list.
+            # A merged route bucket may legitimately span several COMPATIBLE
+            # states (e.g. KV11A covers SELANGOR + WP KUALA LUMPUR — adjacent
+            # urban states). Collect ALL states in the group, and exclude a
+            # lorry only if NONE of its committed states are compatible with
+            # ANY of the group's states. Exact-match exclusion here was wrongly
+            # stranding same-route items that cross an urban state line.
             _grp_state = (group_items[0].get("STATE", "").strip().upper()
                           if group_items else "")
+            _grp_states = {
+                it.get("STATE", "").strip().upper()
+                for it in group_items if it.get("STATE")
+            }
             _state_excl: set[str] = set()
-            if _grp_state:
+            if _grp_states:
                 _state_excl = {
                     p for p, sts in _session_lorry_states.items()
-                    if sts and _grp_state not in sts
+                    if sts and not any(
+                        _states_compatible(_gs, _ls)
+                        for _gs in _grp_states for _ls in sts
+                    )
                 }
             excluded = excluded | _state_excl
 
@@ -3034,40 +3238,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     and (_grp_cap_pre is None or float(_lorry_cap_map.get(p, 0)) <= _grp_cap_pre)
                 ]
                 if _pref_avail:
-                    # Among available preferred lorries pick the tightest fit.
+                    # OWNER-FIRST: use the tightest-fitting preferred lorry
+                    # unconditionally. Fall back to open fleet only when ALL
+                    # preferred lorries are full, unavailable, or size-capped
+                    # (i.e. _pref_avail is empty — handled below).
                     _pref_avail.sort(key=lambda p: _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)))
-                    _pref_best = _pref_avail[0]
-                    _pref_surplus = _eff_cap_for(_pref_best, _dest_grp) - float(_session_loads.get(_pref_best, 0)) - total_w
-
-                    # Only force-assign the preferred lorry if it is also the
-                    # tightest-fitting lorry in the whole eligible fleet.
-                    # If a non-preferred lorry has smaller surplus, let open
-                    # weight-based assignment find it instead.
-                    _all_eligible_surplus = [
-                        _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp)
-                        - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0))
-                        - total_w
-                        for _, r in engine.eligible_lorries.iterrows()
-                        if str(r["LORRY"]).strip().upper() not in (sess["unavailable"] | get_assigned_today() | _strict_excl | _state_excl)
-                        and _eff_cap_for(str(r["LORRY"]).strip().upper(), _dest_grp) - float(_session_loads.get(str(r["LORRY"]).strip().upper(), 0)) >= total_w
-                        and float(r["TON"]) >= _pref_dest_min
-                    ]
-                    _best_fleet_surplus = min(_all_eligible_surplus) if _all_eligible_surplus else _pref_surplus
-
-                    # Use preferred lorry if its surplus is within 1T of fleet best
-                    # (allow small slack so a corridor lorry isn't bypassed for 200 kg difference)
-                    if _pref_surplus <= _best_fleet_surplus + 1.0:
-                        _chosen = _pref_best
-                        for it in group_items:
-                            it["LORRY"] = _chosen
-                        _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
-                        if _chosen not in _session_routes:
-                            _session_routes[_chosen] = _dominant_route
-                        _record_lorry_state(_chosen, _grp_state)
-                        for it in _all_group:
-                            sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
-                        return
-                # Preferred lorry not tightest fit / unavailable → open weight-based assignment
+                    _chosen = _pref_avail[0]
+                    for it in group_items:
+                        it["LORRY"] = _chosen
+                    _session_loads[_chosen] = float(_session_loads.get(_chosen, 0)) + total_w
+                    if _chosen not in _session_routes:
+                        _session_routes[_chosen] = _dominant_route
+                    _record_lorry_state(_chosen, _grp_state)
+                    for it in _all_group:
+                        sess["assigned"][it["DO NUMBER"]] = it.get("LORRY", "NO_LORRY")
+                    return
+                # All preferred lorries full / unavailable → open weight-based assignment
 
             # ── Destination-based lorry size enforcement ───────────────────────
             _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
@@ -4091,6 +4277,79 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     sess["assigned"][_it["DO NUMBER"]] = "NO_LORRY"
             _pit[_pl] = _kept
 
+        # ── Reassign trimmed overflow to idle/available lorries ───────────────
+        # The hard capacity guard above may strand items as NO_LORRY when a small
+        # preferred lorry (e.g. a van) was chosen on its 2-trip effective capacity
+        # but can only physically carry one trip.  Those items must still ship if
+        # ANY eligible lorry has physical room — otherwise idle lorries sit unused
+        # while DOs go unassigned.  Recompute true physical loads from items, then
+        # place each stranded item on the tightest-fitting compatible lorry.
+        _phys_load: dict[str, float] = defaultdict(float)
+        for _it in items:
+            _lp = _it.get("LORRY")
+            if _lp and _lp not in ("NO_LORRY", "OTHER_USER", "NOT_TODAY",
+                                    "REMARKS_SKIP", "SPLIT", "SKIPPED", "", None):
+                _phys_load[_lp] += _it["WEIGHT"]
+
+        for _it in items:
+            if _it.get("LORRY") != "NO_LORRY":
+                continue
+            _w        = _it["WEIGHT"]
+            _it_route = _it.get("ROUTE", "")
+            _it_state = _it.get("STATE", "").strip().upper()
+            _it_dest  = _classify_dest_group(_it_route, _it.get("STATE", ""))
+            _it_min_t = _DEST_MIN_TON.get(_it_dest, 0.0)
+            _it_strict_r = _strict_route_excl(_it_route)
+            _it_urban = _it_dest in _DEST_URBAN_GROUPS
+
+            _cands = []
+            for _cp, _ccap in _lorry_cap_map.items():
+                _ccap = float(_ccap)
+                if _cp in sess.get("unavailable", set()):
+                    continue
+                _crem = _ccap - _phys_load.get(_cp, 0.0)
+                if _crem < _w:
+                    continue
+                if _ccap < _it_min_t:
+                    continue
+                if _it.get("MAX_TON") is not None and _ccap > _it["MAX_TON"]:
+                    continue
+                if _cp in _it_strict_r:
+                    continue
+                # Route/direction compatibility with whatever the lorry already carries
+                _cp_rt = _session_routes.get(_cp, "")
+                if _cp_rt and _it_route != _cp_rt:
+                    _cp_urban = _classify_dest_group(_cp_rt) in _DEST_URBAN_GROUPS
+                    if _it_urban or _cp_urban:
+                        if not _same_corridor_group(_it_route, _cp_rt):
+                            continue
+                    elif (not _same_corridor_group(_it_route, _cp_rt)
+                          and not _routes_on_same_way(_it_route, _cp_rt)):
+                        continue
+                # State compatibility
+                _cp_states = (_consol_lorry_states.get(_cp, set())
+                              | _session_lorry_states.get(_cp, set()))
+                if _it_state and _cp_states and not any(
+                        _states_compatible(_it_state, s) for s in _cp_states):
+                    continue
+                _cands.append((_crem, _cp))
+
+            if not _cands:
+                continue
+            _cands.sort()                      # tightest physical fit first
+            _pick = _cands[0][1]
+            _it["LORRY"] = _pick
+            _phys_load[_pick] += _w
+            _session_loads[_pick] = float(_session_loads.get(_pick, 0)) + _w
+            if _it_state:
+                _consol_lorry_states.setdefault(_pick, set()).add(_it_state)
+            _record_lorry_state(_pick, _it_state)
+            if _pick not in _session_routes:
+                _session_routes[_pick] = _it_route
+            _pit.setdefault(_pick, []).append(_it)
+            sess["assigned"][_it["DO NUMBER"]] = _pick
+            _unassigned_reasons.pop(_it["DO NUMBER"], None)
+
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
@@ -4106,18 +4365,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP"):
                 continue          # keep in raw_df for export blank; hide from UI
             do_num = item["DO NUMBER"]
-            if do_num not in seen_do:
-                seen_do[do_num] = len(pending_dos)
+            # Multi-lorry split parts get their own display entry (keyed by their
+            # synthetic DO NUMBER like "39877(p2)") so each lorry's section shows
+            # the portion it carries instead of the full 27T.
+            _display_key = do_num   # default: group under original DO number
+            if item.get("SPLIT_PART"):
+                _display_key = do_num   # already unique ("39877(p1)", "39877(p2)")
+            if _display_key not in seen_do:
+                seen_do[_display_key] = len(pending_dos)
+                # Strip the synthetic part suffix for the display label
+                _orig_num = do_num.split("(p")[0]
                 pending_dos.append({
-                    "DO NUMBER":     do_num,
+                    "DO NUMBER":     _orig_num,
                     "ALL_DO_NUMBERS": [do_num],
                     "ROUTE":         item["ROUTE"],
                     "CODE":          item["CODE"],
                     "CUSTOMER NAME": item["CUSTOMER NAME"],
                     "DATE":          item.get("DATE", ""),
                     "ITEMS":         [],          # list of item dicts
+                    "SPLIT_PART":    item.get("SPLIT_PART"),
                 })
-            pending_dos[seen_do[do_num]]["ITEMS"].append(item)
+            pending_dos[seen_do[_display_key]]["ITEMS"].append(item)
 
         # Compute TOTAL_TON and flatten split/single for display
         for do in pending_dos:
@@ -4329,7 +4597,7 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 p for p, sts in _lorry_states.items()
                 if sts and _grp_state
                 and _grp_state not in sts
-                and not _states_compatible(_grp_state, next(iter(sts)))
+                and not any(_states_compatible(_grp_state, _ls) for _ls in sts)
             }
 
             # Size exclusion: outstation → exclude small lorries (≤5T); urban → no upper cap
@@ -5650,6 +5918,7 @@ def _generate_trip_manifest(sess) -> bytes:
     from openpyxl.utils import get_column_letter
     from datetime import date as _date, datetime as _dt
     from collections import defaultdict as _dd
+    from lorry_engine import _haversine_km, _DEPOT, road_matrix_km, _osrm_table_km
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -5687,27 +5956,48 @@ def _generate_trip_manifest(sess) -> bytes:
 
     def _nn_sort(pairs: list) -> list:
         """
-        Greedy nearest-neighbour sort within a single date group.
-        Pairs with no coordinates are appended at the end in route order.
+        Order stops using a greedy nearest-neighbour chain starting from the
+        depot, so the driver travels the shortest practical path without
+        zig-zagging across the route.
+
+        Distances are REAL driving distances via OSRM (free OpenStreetMap
+        routing) when reachable, falling back to straight-line haversine when
+        OSRM is unavailable.
+
+        Stops with no GPS coordinates are appended at the end, sorted by route
+        then customer name.
         """
-        with_coords    = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
-        has_coords     = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
-        no_coords      = [(do, it)     for do, it, ll in with_coords if ll is None]
+        with_coords = [(do, it, _parse_latlon(it.get("ROW_IDX"))) for do, it in pairs]
+        has_coords  = [(do, it, ll) for do, it, ll in with_coords if ll is not None]
+        no_coords   = [(do, it)     for do, it, ll in with_coords if ll is None]
 
-        result: list = []
-        unvisited     = list(has_coords)
-        cur           = _DEPOT
+        if not has_coords:
+            no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
+            return no_coords
 
-        while unvisited:
-            nearest = min(unvisited, key=lambda x: _haversine(cur[0], cur[1], x[2][0], x[2][1]))
-            result.append((nearest[0], nearest[1]))
-            cur = nearest[2]
-            unvisited.remove(nearest)
+        # Build coordinate list: index 0 is the depot, 1..N are the stops.
+        coords = [(_DEPOT[0], _DEPOT[1])] + [ll for _, _, ll in has_coords]
+        dist = road_matrix_km(coords)     # real road km (OSRM) or haversine
+
+        # Greedy nearest-neighbour starting from the depot (index 0).
+        n = len(has_coords)
+        visited = [False] * n
+        ordered = []
+        cur = 0                           # current matrix index (0 = depot)
+        for _ in range(n):
+            nearest = min(
+                (i for i in range(n) if not visited[i]),
+                key=lambda i: dist[cur][i + 1],
+            )
+            visited[nearest] = True
+            do, it, _ll = has_coords[nearest]
+            ordered.append((do, it))
+            cur = nearest + 1             # +1 because depot occupies index 0
 
         # Append stops with no coordinates sorted by route then customer
         no_coords.sort(key=lambda x: (x[0]["ROUTE"], x[0]["CUSTOMER NAME"]))
-        result.extend(no_coords)
-        return result
+        ordered.extend(no_coords)
+        return ordered
 
     # ── Date helpers ──────────────────────────────────────────────────────────
     def _fmt_date(s) -> str:
@@ -5811,6 +6101,80 @@ def _generate_trip_manifest(sess) -> bytes:
         except Exception:
             return ""
 
+    # ── Trip-time estimation constants ───────────────────────────────────────
+    _DEPART_HOUR      = 7       # driver leaves HQ at 07:00
+    _DEADLINE_HOUR    = 13      # must return by 13:00
+    _AVG_SPEED_KMH    = 60.0   # average road speed
+    _ROAD_FACTOR      = 1.4    # haversine × factor ≈ road distance
+    _STOP_MIN         = 20     # average unloading time per stop (minutes)
+    _OUTSTATION_KM    = 150    # last-stop distance from HQ > this → overnight
+
+    def _est_return(sorted_pairs_: list) -> tuple[str, str, bool]:
+        """
+        Estimate return time to HQ and 1pm margin.
+        Returns (return_time_str, margin_str, is_outstation).
+        """
+        from datetime import timedelta as _td, datetime as _dtt
+        if not sorted_pairs_:
+            return ("—", "—", False)
+
+        # Last stop GPS
+        last_ll = None
+        for _do, _it in reversed(sorted_pairs_):
+            ll = _parse_latlon(_it.get("ROW_IDX"))
+            if ll:
+                last_ll = ll
+                break
+
+        # Outstation check
+        if last_ll:
+            dist_to_hq = _haversine(_DEPOT[0], _DEPOT[1], last_ll[0], last_ll[1]) * _ROAD_FACTOR
+            if dist_to_hq > _OUTSTATION_KM:
+                return ("OUTSTATION", f"{dist_to_hq:.0f} km back", True)
+
+        # Estimate travel + stop time
+        n_stops    = len(sorted_pairs_)
+        stop_min   = n_stops * _STOP_MIN
+
+        # Sum segment distances: HQ→stop1→stop2→…→last→HQ
+        coords = [_DEPOT]
+        for _do, _it in sorted_pairs_:
+            ll = _parse_latlon(_it.get("ROW_IDX"))
+            if ll:
+                coords.append(ll)
+        if last_ll:
+            coords.append(_DEPOT)
+
+        # Prefer real OSRM driving distance; fall back to haversine×road-factor.
+        total_km = 0.0
+        _osrm = _osrm_table_km(coords) if len(coords) >= 2 else None
+        if _osrm is not None:
+            for i in range(len(coords) - 1):
+                total_km += _osrm[i][i + 1]
+        else:
+            for i in range(len(coords) - 1):
+                total_km += _haversine(coords[i][0], coords[i][1],
+                                       coords[i+1][0], coords[i+1][1]) * _ROAD_FACTOR
+
+        drive_min  = (total_km / _AVG_SPEED_KMH) * 60
+        total_min  = stop_min + drive_min
+
+        depart = _dtt.today().replace(hour=_DEPART_HOUR, minute=0, second=0, microsecond=0)
+        arrive = depart + _td(minutes=total_min)
+        deadline = depart.replace(hour=_DEADLINE_HOUR)
+
+        margin_min = int((deadline - arrive).total_seconds() / 60)
+        margin_str = (f"+{margin_min}min early" if margin_min >= 0
+                      else f"⚠️ {abs(margin_min)}min LATE")
+        return_km  = (_haversine(_DEPOT[0], _DEPOT[1], last_ll[0], last_ll[1]) * _ROAD_FACTOR
+                      if last_ll else 0)
+        return (arrive.strftime("%H:%M"), f"{margin_str}  |  {return_km:.0f}km back", False)
+
+    _RTN_FILL = PatternFill("solid", fgColor="D9D9D9")  # light grey for return row
+    _RTN_FONT = Font(bold=True, italic=True, size=9, color="404040")
+    _LATE_FILL = PatternFill("solid", fgColor="FF0000")
+    _LATE_FONT = Font(bold=True, size=9, color="FFFFFF")
+
     # ── One sheet per lorry ───────────────────────────────────────────────────
     last_col = get_column_letter(len(HEADERS))
     for plate in sorted_lorries:
@@ -5822,28 +6186,26 @@ def _generate_trip_manifest(sess) -> bytes:
         ws = wb.create_sheet(title=plate[:31].replace("/", "-"))
         ws.freeze_panes = "A3"
 
-        # Title
+        sorted_pairs: list = _nn_sort(pairs)
+        ret_time, ret_note, is_outstation = _est_return(sorted_pairs)
+
+        # Title row (row 1) — includes return time summary
         ws.merge_cells(f"A1:{last_col}1")
         util_icon = "✅" if util_pct >= 75 else ("🟡" if util_pct >= 50 else "⚠️")
-        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T capacity   "
-                     f"|   {total_w}T loaded ({util_pct}%) {util_icon}   "
-                     f"|   Generated: {generated_str}")
+        if is_outstation:
+            ret_summary = "🌙 OUTSTATION — overnight, no 1pm return"
+        else:
+            late_flag = "⚠️" if "LATE" in ret_note else "🕐"
+            ret_summary = f"{late_flag} Est. return HQ: {ret_time}  ({ret_note})"
+        title_txt = (f"TRIP MANIFEST — {plate}   |   {cap}T cap   "
+                     f"|   {total_w}T ({util_pct}%) {util_icon}   "
+                     f"|   {ret_summary}   |   {generated_str}")
         t = ws.cell(1, 1, title_txt)
         t.font = _TITLE_FONT; t.fill = _TITLE_FILL
         t.alignment = Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[1].height = 22
 
         _apply_headers(ws, 2)
-
-        # Sort: group by date chronologically, then nearest-neighbour within each date
-        date_groups: dict[str, list] = _dd(list)
-        for do, it in pairs:
-            dk = _date_sortkey(do.get("DATE", ""))
-            date_groups[dk].append((do, it))
-
-        sorted_pairs: list = []
-        for dk in sorted(date_groups.keys()):
-            sorted_pairs.extend(_nn_sort(date_groups[dk]))
 
         prev_date = None
         for seq, (do, it) in enumerate(sorted_pairs, 1):
@@ -5871,8 +6233,37 @@ def _generate_trip_manifest(sess) -> bytes:
             if remarks_val:
                 ws.row_dimensions[dr].height = min(60, max(15, len(remarks_val) // 5 * 8))
 
-        # Footer
-        fr = len(sorted_pairs) + 3
+        # ↩ RETURN TO HQ row
+        rtn_row = len(sorted_pairs) + 3
+        is_late = not is_outstation and "LATE" in ret_note
+        rtn_fill = _LATE_FILL if is_late else _RTN_FILL
+        rtn_font = _LATE_FONT if is_late else _RTN_FONT
+        if is_outstation:
+            rtn_label = "🌙  OUTSTATION — driver stays overnight, no same-day return"
+        else:
+            rtn_label = f"↩  RETURN TO HQ — Eng Sheng Shah Alam"
+        ws.merge_cells(f"A{rtn_row}:E{rtn_row}")
+        c = ws.cell(rtn_row, 1, rtn_label)
+        c.font = rtn_font; c.fill = rtn_fill; c.border = _brd
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[rtn_row].height = 16
+
+        # Est return time in col 6-7, margin in col 7-last
+        c = ws.cell(rtn_row, 6, "—")
+        c.font = rtn_font; c.fill = rtn_fill; c.border = _brd
+        c.alignment = Alignment(horizontal="center")
+
+        ws.merge_cells(f"G{rtn_row}:{last_col}{rtn_row}")
+        if is_outstation:
+            rtn_detail = "1 day 1 trip — overnight stay"
+        else:
+            rtn_detail = f"Est. arrive HQ: {ret_time}   {ret_note}   (depart 07:00, 60km/h avg)"
+        c = ws.cell(rtn_row, 7, rtn_detail)
+        c.font = rtn_font; c.fill = rtn_fill; c.border = _brd
+        c.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Footer (total / utilisation)
+        fr = rtn_row + 1
         ws.merge_cells(f"A{fr}:E{fr}")
         c = ws.cell(fr, 1, f"TOTAL — {len(sorted_pairs)} stop(s)")
         c.font = _FOOT_FONT; c.fill = _FOOT_FILL; c.border = _brd
