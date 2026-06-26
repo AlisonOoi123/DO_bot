@@ -3480,6 +3480,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if not sug:
                             break
                         sug.sort(key=lambda x: x["TON_CAPACITY"], reverse=True)
+                    # Promote preferred lorries to the front of the bin-pack
+                    # selection so config priority is respected even when the
+                    # engine's route-history scoring would pick a different lorry.
+                    _bp_pref = _preferred_lorries_for_route(route)
+                    if _bp_pref:
+                        _bp_pref_idx = {p: i for i, p in enumerate(_bp_pref)}
+                        _sug_pref = sorted(
+                            [s for s in sug if s["LORRY"] in _bp_pref_idx
+                             and s["TON_CAPACITY"] >= remain],
+                            key=lambda s: _bp_pref_idx[s["LORRY"]],
+                        )
+                        if _sug_pref:
+                            _sug_rest = [s for s in sug if s["LORRY"] not in _bp_pref_idx]
+                            sug = _sug_pref + _sug_rest
                     lorry   = sug[0]["LORRY"]
                     cap     = sug[0]["TON_CAPACITY"]
                     portion = min(cap, remain)

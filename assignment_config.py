@@ -267,7 +267,7 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     "PH05":  ["BPE9788", "BQY7823", "BQX9983", "BMN3682"],
     "PH06":  ["BPE9788", "BMN3682", "BQX9983", "BQY7823"],
     "PH07":  ["BQX9983", "BPE9788", "BMN3682"],
-    "PH09":  ["VJN9910", "BQU3875", "VER2872", "BQY7823"],   # Kuantan — heaviest run
+    "PH09":  ["VJN9910", "BQU3875", "BPE9788", "BQX9983", "VER2872", "BQY7823"],   # Kuantan — heaviest run; BPE9788/BQX9983 before VER2872
     "PH10":  ["BQX9983", "BPE9788"],
     "PH11":  ["BPE9788", "BQX9983", "BMN3682"],   # Temerloh (no history → PH fallback)
     # TR02 (Kemaman, Terengganu) — WA6899M removed (strict PH-only, cannot serve TR).
