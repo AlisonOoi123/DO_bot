@@ -4077,7 +4077,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             break
                     if not _outstation_dir_ok:
                         break
-                if _swap_pa_ok and _swap_pb_ok and _outstation_dir_ok:
+                # REMARKS size cap: a swap must not place a capped item onto a
+                # lorry larger than its cap. A's items move to B and B's to A.
+                _cap_a2 = float(_lorry_cap_map.get(_best_pa, 0))
+                _cap_b2 = float(_lorry_cap_map.get(_best_pb, 0))
+                _swap_cap_ok = all(
+                    _it.get("MAX_TON") is None or _cap_b2 <= _it["MAX_TON"]
+                    for _it in _pit[_best_pa]
+                ) and all(
+                    _it.get("MAX_TON") is None or _cap_a2 <= _it["MAX_TON"]
+                    for _it in _pit[_best_pb]
+                )
+                if _swap_pa_ok and _swap_pb_ok and _outstation_dir_ok and _swap_cap_ok:
                     for _it in _pit[_best_pa]:
                         _it["LORRY"] = _best_pb
                         sess["assigned"][_it["DO NUMBER"]] = _best_pb
@@ -4148,7 +4159,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     not _src_states or not _dst_states2
                     or bool(_src_states & _dst_states2)
                 )
-                _merge_route_ok = _state_merge_ok and not any(
+                # REMARKS size cap (FIELD 3): never merge a capped item (e.g. a
+                # VAN DO, MAX_TON=2T) onto a lorry larger than its cap — that
+                # would silently override the size requirement the planner set.
+                _dst_cap = float(_lorry_cap_map.get(_best_dst, 0))
+                _cap_merge_ok = all(
+                    _it.get("MAX_TON") is None or _dst_cap <= _it["MAX_TON"]
+                    for _it in _pit[_best_src]
+                )
+                _merge_route_ok = _state_merge_ok and _cap_merge_ok and not any(
                     _best_dst in _strict_route_excl(r) for r in _src_routes
                 ) and not any(
                     _preferred_lorries_for_route(r)
@@ -4205,6 +4224,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if id(_it) in _rebal_moved:
                             continue
                         if _load_dst + _it["WEIGHT"] > _cap_dst:
+                            continue
+                        # REMARKS size cap: never move a capped item (VAN etc.)
+                        # onto a lorry larger than its cap.
+                        if (_it.get("MAX_TON") is not None
+                                and _cap_dst > _it["MAX_TON"]):
                             continue
                         # Don't make the source lorry itself underloaded
                         # (skip only when source has multiple items remaining)
