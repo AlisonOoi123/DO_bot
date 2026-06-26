@@ -2951,14 +2951,52 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if len(_cap_buckets) == 1:
                 _split_groups.append(_sg)   # uniform cap — no split needed
             else:
-                # Emit capped sub-groups first (they need small lorries),
-                # then the uncapped remainder.
-                for _ck, _citems in sorted(_cap_buckets.items(),
-                                           key=lambda x: (x[0] is None, x[0] or 0)):
-                    if _ck is not None:
-                        # Sort capped items by longitude so nearest stops share one van
-                        _citems.sort(key=lambda x: float(x.get("LONGITUD") or 999))
+                # Mixed caps: split into per-cap sub-groups.
+                # Uncapped items are the "pool" that capped sub-groups can draw from.
+                _uncapped_pool = list(_cap_buckets.get(None, []))
+
+                # Emit capped sub-groups first (tightest cap first) so small-lorry
+                # DOs claim the right vehicle before the main group is assigned.
+                for _ck, _citems in sorted(
+                    {k: v for k, v in _cap_buckets.items() if k is not None}.items()
+                ):
+                    # Sort capped (e.g. VAN) items by longitude
+                    _citems.sort(key=lambda x: float(x.get("LONGITUD") or 999))
+
+                    # Find the largest eligible lorry that satisfies this cap so we
+                    # know how many nearby uncapped items can share the same vehicle.
+                    _van_lorry_cap = max(
+                        (float(r["TON"]) for _, r in engine.eligible_lorries.iterrows()
+                         if float(r["TON"]) <= _ck),
+                        default=_ck,
+                    )
+
+                    # Pull in nearest uncapped same-route items up to van capacity
+                    _van_w = sum(x["WEIGHT"] for x in _citems)
+                    _van_lons = [float(x.get("LONGITUD") or 0)
+                                 for x in _citems if x.get("LONGITUD")]
+                    _van_clon = (sum(_van_lons) / len(_van_lons)) if _van_lons else 0
+
+                    _near = sorted(
+                        [u for u in _uncapped_pool if u.get("LONGITUD")],
+                        key=lambda x: abs(float(x.get("LONGITUD", 0)) - _van_clon),
+                    )
+                    _absorbed: list = []
+                    for _ui in _near:
+                        if _van_w + _ui["WEIGHT"] <= _van_lorry_cap:
+                            _van_w += _ui["WEIGHT"]
+                            _absorbed.append(_ui)
+                            _citems.append(_ui)
+                    for _a in _absorbed:
+                        _uncapped_pool.remove(_a)
+
+                    # Re-sort by longitude so the trip manifest is geographically ordered
+                    _citems.sort(key=lambda x: float(x.get("LONGITUD") or 999))
                     _split_groups.append(_citems)
+
+                # Remaining uncapped items form the normal sub-group
+                if _uncapped_pool:
+                    _split_groups.append(_uncapped_pool)
         sorted_groups = _split_groups
 
         # Session-level capacity tracker so groups can share a lorry when combined
