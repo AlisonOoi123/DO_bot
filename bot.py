@@ -3441,6 +3441,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
                         placed = False
                         for bin_ in bins:
+                            # Skip bins whose lorry exceeds this item's REMARKS size cap
+                            if (it.get("MAX_TON") is not None
+                                    and float(_lorry_cap_map.get(bin_["lorry"], 0)) > it["MAX_TON"]):
+                                continue
                             if bin_["remain"] >= it["WEIGHT"] - 0.001:
                                 bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
                                 bin_["remain"] -= it["WEIGHT"]
@@ -3862,10 +3866,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _b1_items, _b2_items = [], []
                     _b1_load = _b2_load = 0.0
                     for _sit in sorted(_gits, key=lambda x: x["WEIGHT"], reverse=True):
-                        if _b1_load + _sit["WEIGHT"] <= _b1_rem + 1.0:
+                        _sit_max = _sit.get("MAX_TON")
+                        _b1_ok = (_sit_max is None or float(_lorry_cap_map.get(_b1, 0)) <= _sit_max)
+                        _b2_ok = (_sit_max is None or float(_lorry_cap_map.get(_b2, 0)) <= _sit_max)
+                        if _b1_ok and _b1_load + _sit["WEIGHT"] <= _b1_rem + 1.0:
                             _b1_items.append(_sit)
                             _b1_load += _sit["WEIGHT"]
-                        elif _b2_load + _sit["WEIGHT"] <= _b2_rem + 1.0:
+                        elif _b2_ok and _b2_load + _sit["WEIGHT"] <= _b2_rem + 1.0:
                             _b2_items.append(_sit)
                             _b2_load += _sit["WEIGHT"]
                         else:
