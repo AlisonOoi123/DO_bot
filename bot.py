@@ -2935,6 +2935,32 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for _grp in sorted_groups:
             _grp.sort(key=lambda it: _parse_date_sortkey(it.get("DATE", "")))
 
+        # ── Split groups by MAX_TON cap ───────────────────────────────────────
+        # A single VAN-only DO inside a large group (e.g. KV20A 22T) would cap
+        # the whole group at 2T and cause everything to fail.  Instead, split
+        # each group into per-cap sub-groups so:
+        #   • VAN DOs (MAX_TON=2T) from the same route group together and fill
+        #     one van sorted by nearest longitude.
+        #   • Uncapped DOs keep their original group and get a normal lorry.
+        _split_groups: list[list] = []
+        for _sg in sorted_groups:
+            _cap_buckets: dict = {}
+            for _it in _sg:
+                _ck = _it.get("MAX_TON")   # None means no cap
+                _cap_buckets.setdefault(_ck, []).append(_it)
+            if len(_cap_buckets) == 1:
+                _split_groups.append(_sg)   # uniform cap — no split needed
+            else:
+                # Emit capped sub-groups first (they need small lorries),
+                # then the uncapped remainder.
+                for _ck, _citems in sorted(_cap_buckets.items(),
+                                           key=lambda x: (x[0] is None, x[0] or 0)):
+                    if _ck is not None:
+                        # Sort capped items by longitude so nearest stops share one van
+                        _citems.sort(key=lambda x: float(x.get("LONGITUD") or 999))
+                    _split_groups.append(_citems)
+        sorted_groups = _split_groups
+
         # Session-level capacity tracker so groups can share a lorry when combined
         # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
         # Seed session loads from pre-filled items (Case B re-upload)
