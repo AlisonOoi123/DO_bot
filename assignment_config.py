@@ -236,9 +236,9 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     # North KL corridor — Rawang / Tanjung Malim
     "KV01A": ["BQY7823", "BMN3682", "VER2872"],
     "KV02A": ["BQY7823", "VER2872", "BQX9983", "BMN3682"],
-    "KV04A": ["W3826C",  "W3618U",  "BQX7228", "BMN3682"],
+    "KV04A": ["W3826C",  "W3618U",  "BQX7228", "BMN3682", "BPE9788"],
     # Selayang / Batu Caves
-    "KV05A": ["BQX7228", "W3618U",  "W3826C"],
+    "KV05A": ["BQX7228", "W3618U",  "W3826C",  "BPE9788"],
     # Inner-KL tight streets (4.2T / van)
     "KV06A": ["W3826C",  "BQX7228", "W3618U"],
     "KV07A": ["W3618U",  "W3826C",  "BQX7228"],
@@ -250,10 +250,9 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     "KV11A": ["VEA2818", "VKN8836", "W3826C", "BQX7228", "W3618U"],
     "KV12A": ["BQX7228", "W3826C",  "W3618U"],
     # ABI Southeast / Cheras-Kajang corridor (medium lorries)
-    # BPE9788 removed — it belongs on Pahang (PH01-PH08) and must not be
-    # claimed by urban KV routes on days when PH cargo exists.
-    "KV19A": ["BQX9983", "BMN3682", "W3826C"],
-    "KV20A": ["BMN3682", "BQX9983", "BQY7823"],
+    # BPE9788 as last-resort fallback: primary PH duty, but can serve urban when PH is already covered.
+    "KV19A": ["BQX9983", "BMN3682", "W3826C", "BPE9788"],
+    "KV20A": ["BMN3682", "BPE9788", "BQX9983", "BQY7823"],
     "KV24":  ["BQX9983", "BMN3682"],              # Semenyih fallback
     # Negeri Sembilan corridor
     "NS04":  ["BQX9983", "BMN3682", "BQY7823"],
