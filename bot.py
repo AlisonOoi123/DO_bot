@@ -3289,6 +3289,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _grp_caps_pre = [it["MAX_TON"] for it in group_items
                              if it.get("MAX_TON") is not None]
             _grp_cap_pre = min(_grp_caps_pre) if _grp_caps_pre else None
+            # DEBUG: trace VAN groups
+            if _grp_cap_pre is not None:
+                import logging as _logging
+                _VEA = "VEA2818"
+                _vea_in_excl = _VEA in excluded
+                _vea_in_elig = _VEA in set(engine.eligible_lorries["LORRY"].str.upper())
+                _vea_ton = _lorry_cap_map.get(_VEA)
+                _vea_unavail = _VEA in sess.get("unavailable", set())
+                _vea_assigned_today = _VEA in get_assigned_today()
+                _logging.warning(
+                    f"[VAN-DBG] cap={_grp_cap_pre}T group={len(group_items)}items "
+                    f"totalW={total_w:.4f}T dos={[it['DO NUMBER'] for it in group_items]} "
+                    f"excl_count={len(excluded)} "
+                    f"VEA2818: elig={_vea_in_elig} ton={_vea_ton} "
+                    f"in_excl={_vea_in_excl} unavail={_vea_unavail} assigned_today={_vea_assigned_today}"
+                )
             if _preferred:
                 # Preferred lorries are a hint — weight fit wins.
                 # Hard-exclude preferred lorries if: truly unavailable, full,
@@ -3392,6 +3408,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 customer_name=customer,
                 today_date_str=_today(),
             )
+
+            if _grp_cap_pre is not None:
+                import logging as _logging
+                _logging.warning(
+                    f"[VAN-DBG2] suggest result={[s['LORRY'] for s in suggestions]} "
+                    f"excl_size={len(excluded)} VEA2818_in_excl={'VEA2818' in excluded} "
+                    f"total_w={total_w:.4f}T cap={_grp_cap_pre}T"
+                )
 
             if suggestions:
                 single_cap  = suggestions[0]["TON_CAPACITY"]
