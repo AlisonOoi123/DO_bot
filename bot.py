@@ -2207,7 +2207,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _is_today = False
                     _not_today_count += 1
 
-            _remarks_raw = str(row.get("REMARKS", "")).strip()
+            # Accept common column-name variations for the remarks field.
+            _remarks_raw = ""
+            for _rcol in ("REMARKS", "REMARK", "DELIVERY REMARKS", "FIELD 3", "NOTES", "INSTRUCTION"):
+                _rv = row.get(_rcol)
+                if _rv is not None and str(_rv).strip().upper() not in ("", "NAN", "NONE"):
+                    _remarks_raw = str(_rv).strip()
+                    break
 
             # Remarks-day filter DISABLED by request: assignment now depends only
             # on the trip day the user selected at login (today/tomorrow) plus the
@@ -3586,7 +3592,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -5340,7 +5346,8 @@ def _build_summary(sess) -> str:
                 "LARGE_LONG": "🟥", "MEDIUM_LONG": "🟧",
                 "SELANGOR": "🟦", "KL": "🟩", "KL_SELANGOR": "🟩",
             }.get(_classify_dest_group(it.get("ROUTE", ""), it.get("STATE", "")), "")
-            lines.append(f"  {dn_short}  {_dest_lbl}{rcode}  {cust}  {w}T{dt_tag}")
+            _cap_tag = f" 🚐≤{it['MAX_TON']}T" if it.get("MAX_TON") is not None else ""
+            lines.append(f"  {dn_short}  {_dest_lbl}{rcode}  {cust}  {w}T{_cap_tag}{dt_tag}")
 
         lines.append("")   # blank line between lorries
 
