@@ -252,7 +252,7 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     # ABI Southeast / Cheras-Kajang corridor (medium lorries)
     # BPE9788 as last-resort fallback: primary PH duty, but can serve urban when PH is already covered.
     "KV19A": ["BQX9983", "BMN3682", "W3826C", "BPE9788"],
-    "KV20A": ["BMN3682", "BPE9788", "BQX9983", "BQY7823"],
+    "KV20A": ["VEA2818", "BMN3682", "BPE9788", "BQX9983", "BQY7823"],
     "KV24":  ["BQX9983", "BMN3682"],              # Semenyih fallback
     # Negeri Sembilan corridor
     "NS04":  ["BQX9983", "BMN3682", "BQY7823"],
