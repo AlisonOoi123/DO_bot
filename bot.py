@@ -2960,8 +2960,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 for _ck, _citems in sorted(
                     {k: v for k, v in _cap_buckets.items() if k is not None}.items()
                 ):
-                    # Sort capped (e.g. VAN) items by longitude
-                    _citems.sort(key=lambda x: float(x.get("LONGITUD") or 999))
+                    # Sort capped (e.g. VAN) items by longitude (parsed GPS_LON
+                    # float — LONGITUD is a raw "lat lon" string not in the item).
+                    _citems.sort(key=lambda x: x.get("GPS_LON") or 999)
 
                     # Find the largest eligible lorry that satisfies this cap so we
                     # know how many nearby uncapped items can share the same vehicle.
@@ -3455,6 +3456,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # can carry the full remainder (partial-load pass).
                 remain = total_w
                 bins   = []
+                # Honour REMARKS size cap (VAN/BELOW 5 TON etc.) throughout the
+                # bin-pack loop — the same cap applied in the single-lorry path
+                # must carry through here, otherwise a VAN group with no ≤2T
+                # lorry available in the single pass falls into bin-pack and
+                # picks a 13T lorry, ignoring the cap entirely.
+                _bp_cap_excl: set = set()
+                if _grp_cap_pre is not None:
+                    _bp_cap_excl = {
+                        str(r["LORRY"]).strip().upper()
+                        for _, r in engine.eligible_lorries.iterrows()
+                        if float(r["TON"]) > _grp_cap_pre
+                    }
                 for _ in range(10):
                     if remain <= 0:
                         break
@@ -3467,7 +3480,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -3538,7 +3551,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -3575,7 +3588,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
