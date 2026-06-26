@@ -1810,10 +1810,10 @@ def _get_valid_users() -> list[str]:
 def _start(phone, sess):
     sess["state"] = "AWAIT_USER_ID"
     users = _get_valid_users()
-    # SELAYANG is type-only; all others get clickable buttons (max 3)
-    NO_BUTTON  = {"SELAYANG"}
-    btn_users  = [u for u in users if u not in NO_BUTTON][:3]
-    type_users = [u for u in users if u in NO_BUTTON or u not in btn_users]
+    # ABI, VIVIAN, BIG get clickable buttons; everything else (SELAYANG, SPARE, …) is type-only
+    BUTTON_ORDER = ["ABI", "VIVIAN", "BIG"]
+    btn_users  = [u for u in BUTTON_ORDER if u in users]
+    type_users = [u for u in users if u not in btn_users]
     body = "👋 *Lorry Assignment Bot*\n\nPlease tap your name below or type it to continue."
     if type_users:
         body += f"\nOr type: {', '.join(u.title() for u in type_users)}"
