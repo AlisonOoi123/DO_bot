@@ -2207,13 +2207,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _is_today = False
                     _not_today_count += 1
 
-            # Accept common column-name variations for the remarks field.
-            _remarks_raw = ""
-            for _rcol in ("REMARKS", "REMARK", "DELIVERY REMARKS", "FIELD 3", "NOTES", "INSTRUCTION"):
-                _rv = row.get(_rcol)
-                if _rv is not None and str(_rv).strip().upper() not in ("", "NAN", "NONE"):
-                    _remarks_raw = str(_rv).strip()
-                    break
+            _remarks_raw = str(row.get("REMARKS", "")).strip()
 
             # Remarks-day filter DISABLED by request: assignment now depends only
             # on the trip day the user selected at login (today/tomorrow) plus the
@@ -2966,8 +2960,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 for _ck, _citems in sorted(
                     {k: v for k, v in _cap_buckets.items() if k is not None}.items()
                 ):
-                    # Sort capped (e.g. VAN) items by longitude (use parsed GPS_LON float)
-                    _citems.sort(key=lambda x: x.get("GPS_LON") or 999)
+                    # Sort capped (e.g. VAN) items by longitude
+                    _citems.sort(key=lambda x: float(x.get("LONGITUD") or 999))
 
                     # Find the largest eligible lorry that satisfies this cap so we
                     # know how many nearby uncapped items can share the same vehicle.
@@ -3289,22 +3283,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _grp_caps_pre = [it["MAX_TON"] for it in group_items
                              if it.get("MAX_TON") is not None]
             _grp_cap_pre = min(_grp_caps_pre) if _grp_caps_pre else None
-            # DEBUG: trace VAN groups
-            if _grp_cap_pre is not None:
-                import logging as _logging
-                _VEA = "VEA2818"
-                _vea_in_excl = _VEA in excluded
-                _vea_in_elig = _VEA in set(engine.eligible_lorries["LORRY"].str.upper())
-                _vea_ton = _lorry_cap_map.get(_VEA)
-                _vea_unavail = _VEA in sess.get("unavailable", set())
-                _vea_assigned_today = _VEA in get_assigned_today()
-                _logging.warning(
-                    f"[VAN-DBG] cap={_grp_cap_pre}T group={len(group_items)}items "
-                    f"totalW={total_w:.4f}T dos={[it['DO NUMBER'] for it in group_items]} "
-                    f"excl_count={len(excluded)} "
-                    f"VEA2818: elig={_vea_in_elig} ton={_vea_ton} "
-                    f"in_excl={_vea_in_excl} unavail={_vea_unavail} assigned_today={_vea_assigned_today}"
-                )
             if _preferred:
                 # Preferred lorries are a hint — weight fit wins.
                 # Hard-exclude preferred lorries if: truly unavailable, full,
@@ -3409,14 +3387,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 today_date_str=_today(),
             )
 
-            if _grp_cap_pre is not None:
-                import logging as _logging
-                _logging.warning(
-                    f"[VAN-DBG2] suggest result={[s['LORRY'] for s in suggestions]} "
-                    f"excl_size={len(excluded)} VEA2818_in_excl={'VEA2818' in excluded} "
-                    f"total_w={total_w:.4f}T cap={_grp_cap_pre}T"
-                )
-
             if suggestions:
                 single_cap  = suggestions[0]["TON_CAPACITY"]
                 single_util = total_w / single_cap if single_cap > 0 else 0
@@ -3485,17 +3455,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # can carry the full remainder (partial-load pass).
                 remain = total_w
                 bins   = []
-                # Honour REMARKS size cap (VAN/BELOW 5 TON etc.) throughout the
-                # bin-pack loop — the same cap applied in the single-lorry path
-                # must carry through here, otherwise a VAN group with no ≤2T
-                # lorry available falls into bin-pack and picks a 13T lorry.
-                _bp_cap_excl: set = set()
-                if _grp_cap_pre is not None:
-                    _bp_cap_excl = {
-                        str(r["LORRY"]).strip().upper()
-                        for _, r in engine.eligible_lorries.iterrows()
-                        if float(r["TON"]) > _grp_cap_pre
-                    }
                 for _ in range(10):
                     if remain <= 0:
                         break
@@ -3508,7 +3467,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -3579,7 +3538,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -3616,7 +3575,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -5370,8 +5329,7 @@ def _build_summary(sess) -> str:
                 "LARGE_LONG": "🟥", "MEDIUM_LONG": "🟧",
                 "SELANGOR": "🟦", "KL": "🟩", "KL_SELANGOR": "🟩",
             }.get(_classify_dest_group(it.get("ROUTE", ""), it.get("STATE", "")), "")
-            _cap_tag = f" 🚐≤{it['MAX_TON']}T" if it.get("MAX_TON") is not None else ""
-            lines.append(f"  {dn_short}  {_dest_lbl}{rcode}  {cust}  {w}T{_cap_tag}{dt_tag}")
+            lines.append(f"  {dn_short}  {_dest_lbl}{rcode}  {cust}  {w}T{dt_tag}")
 
         lines.append("")   # blank line between lorries
 
