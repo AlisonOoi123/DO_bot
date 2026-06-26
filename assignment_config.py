@@ -232,86 +232,9 @@ LORRY_STRICT_ROUTE: dict[str, set[str]] = {
 # When ABI is logged in only ABI+SPARE lorries are eligible, and when VIVIAN is
 # logged in only VIVIAN+SPARE — so both owners' preferences can coexist here.
 ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
-    # ── ABI routes ────────────────────────────────────────────────────────────
-    # North KL corridor — Rawang / Tanjung Malim
-    "KV01A": ["BQY7823", "BMN3682", "VER2872"],
-    "KV02A": ["BQY7823", "VER2872", "BQX9983", "BMN3682"],
-    "KV04A": ["W3826C",  "W3618U",  "BQX7228", "BMN3682", "BPE9788"],
-    # Selayang / Batu Caves
-    "KV05A": ["BQX7228", "W3618U",  "W3826C",  "BPE9788"],
-    # Inner-KL tight streets (4.2T / van)
-    "KV06A": ["W3826C",  "BQX7228", "W3618U"],
-    "KV07A": ["W3618U",  "W3826C",  "BQX7228"],
-    "KV08A": ["BQX7228", "W3826C",  "W3618U"],
-    "KV09A": ["BQX7228", "W3618U",  "W3826C"],
-    # Central KL
-    "KV10A": ["W3826C",  "BQX7228", "W3618U"],
-    # Pudu / Ampang shophouse (van / small lorry only)
-    "KV11A": ["VEA2818", "VKN8836", "W3826C", "BQX7228", "W3618U"],
-    "KV12A": ["BQX7228", "W3826C",  "W3618U"],
-    # ABI Southeast / Cheras-Kajang corridor (medium lorries)
-    # BPE9788 as last-resort fallback: primary PH duty, but can serve urban when PH is already covered.
-    "KV19A": ["BQX9983", "BMN3682", "W3826C", "BPE9788"],
-    "KV20A": ["VEA2818", "BMN3682", "BPE9788", "BQX9983", "BQY7823"],
-    "KV24":  ["BQX9983", "BMN3682"],              # Semenyih fallback
-    # Negeri Sembilan corridor
-    "NS04":  ["BQX9983", "BMN3682", "BQY7823"],
-    "NS05":  ["BQX9983", "BMN3682", "BQY7823"],
-    "NS06":  ["BQX9983", "BQY7823", "BMN3682"],
-    # Pahang interior
-    "PH01":  ["BPE9788", "BQX9983", "BMN3682"],
-    "PH02":  ["BQX9983", "BPE9788", "BMN3682"],
-    "PH03":  ["BPE9788", "BQX9983", "BQY7823"],
-    "PH04":  ["BPE9788", "BQY7823", "BQX9983"],
-    "PH05":  ["BPE9788", "BQY7823", "BQX9983", "BMN3682"],
-    "PH06":  ["BPE9788", "BMN3682", "BQX9983", "BQY7823"],
-    "PH07":  ["BQX9983", "BPE9788", "BMN3682"],
-    "PH09":  ["VJN9910", "BQU3875", "BPE9788", "BQX9983", "VER2872", "BQY7823"],   # Kuantan — heaviest run; BPE9788/BQX9983 before VER2872
-    "PH10":  ["BQX9983", "BPE9788"],
-    "PH11":  ["BPE9788", "BQX9983", "BMN3682"],   # Temerloh (no history → PH fallback)
-    # TR02 (Kemaman, Terengganu) — WA6899M removed (strict PH-only, cannot serve TR).
-    # BPE9788 / BQU3875 added as last-resort backups for heavy-load days.
-    "TR02":  ["BQY7823", "VER2872", "BPE9788", "BQU3875"],
-    # ── VIVIAN routes ─────────────────────────────────────────────────────────
-    # Johor corridor
-    "JH01":  ["VJN8929", "VJA7981", "VNL6819"],
-    "JH05":  ["VJN8929", "WA9225H", "VNL6819"],
-    "JH06":  ["VJN8929", "VJA7981"],
-    "JH09":  ["BPR9226", "WA9225H", "VJN8929"],
-    "JH10":  ["VJN8929", "VJA7981", "VNL6819"],   # no history → JH fallback
-    # Klang Valley (VIVIAN) — small/medium lorries
-    "KV03A": ["VCC3998", "BPE9878", "VNL6819", "WA9225H"],
-    "KV13A": ["VKN8836", "WYS5281", "BPE9878", "VCC3998"],
-    "KV14A": ["VKN8836", "BPE9878", "WYS5281", "VCC3998",    # VIVIAN preferred
-              "W3826C", "BQX7228", "W3618U", "WLD8738"],    # ABI fallback (Puchong is Selangor urban)
-    "KV15A": ["VKN8836", "WYS5281", "VCC3998"],
-    "KV16A": ["VKN8836", "WYS5281", "BPE9878"],
-    "KV17A": ["VKN8836", "VCC3998", "WYS5281"],
-    "KV18A": ["VKN8836", "WYS5281", "VCC3998", "BPE9878"],
-    "KV21A": ["VCC3998", "BPE9878", "VKN8836", "WYS5281"],
-    "KV22A": ["VKN8836", "WYS5281", "BPE9878", "VCC3998"],
-    "KV23A": ["WYS5281", "VCC3998", "BPE9878"],
-    "KV24A": ["VCC3998", "BPE9878", "WYS5281", "VKN8836"],
-    "KV25A": ["VCC3998", "BPE9878", "VNL6819", "WYS5281"],
-    "MC01":  ["VNL6819", "VJA7981", "VJN8929"],
-    "NS01":  ["BPE9878", "VCC3998", "WYS5281"],
-    "PK01":  ["VJA7981", "WA9225H", "VJN8929", "VNL6819"],
-    "PK02":  ["VJA7981", "VJN8929", "VNL6819"],
-    "PK04":  ["VNL6819", "VJA7981", "VJN8929"],
-    "PK05":  ["VJA7981", "VNL6819", "VJN8929"],
-    # ── Generic cluster fallbacks (routes without specific history) ────────────
-    # Matched only when no specific route code above matches (2-char prefix).
-    # ABI long-haul (large outstation)
-    "TR":    ["VER2872", "VJN9910", "BQY7823"],
-    "KB":    ["VJN9910", "BQY7823", "VER2872"],
-    "KD":    ["VJN9910", "BQY7823", "BQX9983"],
-    "PN":    ["VJN9910", "BQY7823", "BQX9983"],
-    "SB":    ["VJN9910", "BQX9983"],
-    "SR":    ["VJN9910", "BQX9983"],
-    # VIVIAN long-haul fallbacks
-    "JH":    ["VJN8929", "VJA7981", "VNL6819"],
-    "PK":    ["VJA7981", "VNL6819", "VJN8929"],
-    "MC":    ["VNL6819", "VJA7981", "VJN8929"],
+    # All route-specific preferred lists removed — assignment is purely
+    # weight/capacity based (tightest fit wins).
+    # Only hard constraint: LORRY_STRICT_ROUTE above (BQU3875/WA6899M → PH only).
 }
 
 
