@@ -2971,15 +2971,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         default=_ck,
                     )
 
-                    # Pull in nearest uncapped same-route items up to van capacity
+                    # Pull in nearest uncapped same-route items up to van capacity.
+                    # Use parsed GPS_LON (float) — LONGITUD is a raw "lat lon" string.
                     _van_w = sum(x["WEIGHT"] for x in _citems)
-                    _van_lons = [float(x.get("LONGITUD") or 0)
-                                 for x in _citems if x.get("LONGITUD")]
+                    _van_lons = [x["GPS_LON"] for x in _citems if x.get("GPS_LON") is not None]
                     _van_clon = (sum(_van_lons) / len(_van_lons)) if _van_lons else 0
 
                     _near = sorted(
-                        [u for u in _uncapped_pool if u.get("LONGITUD")],
-                        key=lambda x: abs(float(x.get("LONGITUD", 0)) - _van_clon),
+                        [u for u in _uncapped_pool if u.get("GPS_LON") is not None],
+                        key=lambda x: abs(x["GPS_LON"] - _van_clon),
                     )
                     _absorbed: list = []
                     for _ui in _near:
@@ -2991,7 +2991,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _uncapped_pool.remove(_a)
 
                     # Re-sort by longitude so the trip manifest is geographically ordered
-                    _citems.sort(key=lambda x: float(x.get("LONGITUD") or 999))
+                    _citems.sort(key=lambda x: x.get("GPS_LON") or 999)
                     _split_groups.append(_citems)
 
                 # Remaining uncapped items form the normal sub-group
