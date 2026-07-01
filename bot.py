@@ -4580,17 +4580,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
         # ── Geographic / state clustering enforcement ─────────────────────────
-        # A lorry may carry as many stops of the SAME route code as it likes,
-        # however far apart — a single route (e.g. all of PH03) always rides one
-        # lorry.  When a lorry mixes DIFFERENT route codes, the two stops must:
-        #   1. be in the SAME state (KL/Selangor count as one urban state), AND
-        #   2. either be in the SAME city, OR be within _MAX_GEO_GAP_DEG
-        #      (straight-line degrees ≈ 32 km) of each other.
+        # Route code is atomic: all stops of the SAME route code always ride one
+        # lorry, however far apart (a route may legitimately span several cities,
+        # e.g. PH04 = Benta + Kuala Lipis + Lipis).  A lorry may carry MULTIPLE
+        # route codes only when the codes are mutually reachable ("chain") under:
+        #     same state (KL/Selangor count as one urban state)  AND
+        #     (share a city  OR  nearest stops within _MAX_GEO_GAP_DEG ≈ 32 km).
         # This stops e.g. a Selangor (KV) lorry also carrying a Pahang (PH04)
-        # drop just because their coordinates happened to fall within 0.29°.
-        # Split any lorry that violates this: keep its heaviest cluster, detach
-        # the rest, and re-home each detached item onto a lorry whose chain stays
-        # valid (fill compatible lorries first, then idle ones), else unassign.
+        # drop, while never splitting a single route code across lorries.
         _GEO_GAP = _MAX_GEO_GAP_DEG
         _GEO_VALID = {"NO_LORRY", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP",
                       "SPLIT", "SKIPPED", "", None}
@@ -4617,23 +4614,40 @@ def _handle_excel_upload(phone, sess, file_bytes):
         def _geo_deg(_a, _b):
             return ((_a[0] - _b[0]) ** 2 + (_a[1] - _b[1]) ** 2) ** 0.5
 
-        def _pair_ok(_a, _b):
-            """Two neighbouring stops (point tuples) allowed on one lorry?"""
-            if _a[2] == _b[2]:
-                return True                       # same route code — always OK
-            if not _states_compatible(_a[3], _b[3]):
-                return False                      # different route ⇒ must same state
-            if _a[4] == _b[4]:
-                return True                       # same state, same city — OK
-            return _geo_deg(_a[:2], _b[:2]) <= _GEO_GAP   # diff city ⇒ within gap
+        def _grp_compat(_ga, _gb):
+            """Two route-code groups (lists of point tuples) may share a lorry?"""
+            if not _states_compatible(_ga[0][3], _gb[0][3]):
+                return False
+            if {_p[4] for _p in _ga} & {_p[4] for _p in _gb}:
+                return True                       # share at least one city
+            return min(_geo_deg(_a[:2], _b[:2]) for _a in _ga for _b in _gb) <= _GEO_GAP
 
-        def _chain_ok(_pts):
-            """Sorted by longitude, every neighbouring pair must satisfy _pair_ok."""
-            _s = sorted(_pts, key=lambda p: p[1])
-            return all(_pair_ok(_s[_i], _s[_i + 1]) for _i in range(len(_s) - 1))
+        def _lorry_geo_ok(_pts):
+            """True if the route-code groups in _pts form one connected chain
+            under _grp_compat (same-code stops are one group, always allowed)."""
+            _groups: dict = {}
+            for _p in _pts:
+                _groups.setdefault(_p[2], []).append(_p)
+            _codes = list(_groups)
+            if len(_codes) <= 1:
+                return True
+            _adj = {_c: set() for _c in _codes}
+            for _i in range(len(_codes)):
+                for _j in range(_i + 1, len(_codes)):
+                    if _grp_compat(_groups[_codes[_i]], _groups[_codes[_j]]):
+                        _adj[_codes[_i]].add(_codes[_j])
+                        _adj[_codes[_j]].add(_codes[_i])
+            _seen = {_codes[0]}
+            _stack = [_codes[0]]
+            while _stack:
+                for _n in _adj[_stack.pop()]:
+                    if _n not in _seen:
+                        _seen.add(_n)
+                        _stack.append(_n)
+            return len(_seen) == len(_codes)
 
-        # Split each lorry into clusters; keep the heaviest, detach the rest.
-        # A break occurs wherever two neighbouring stops fail _pair_ok.
+        # Split each lorry: keep the heaviest route-code group plus any groups
+        # that keep the whole set chain-connected; detach the incompatible ones.
         _geo_by_lorry: dict[str, list] = {}
         for _it in items:
             _l = _it.get("LORRY")
@@ -4642,20 +4656,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         _detached: list = []
         for _l, _its in _geo_by_lorry.items():
-            _srt = sorted(_its, key=lambda x: x["GPS_LON"])
-            _segs = [[_srt[0]]]
-            for _prev, _cur in zip(_srt, _srt[1:]):
-                if _pair_ok(_pt_of(_prev), _pt_of(_cur)):
-                    _segs[-1].append(_cur)
-                else:
-                    _segs.append([_cur])
-            if len(_segs) == 1:
+            if _lorry_geo_ok([_pt_of(_x) for _x in _its]):
                 continue
-            _segs.sort(key=lambda s: sum(x["WEIGHT"] for x in s), reverse=True)
-            for _seg in _segs[1:]:
-                for _it in _seg:
-                    _it["LORRY"] = "NO_LORRY"
-                    _detached.append(_it)
+            _grp_items: dict = {}
+            for _it in _its:
+                _grp_items.setdefault(_rcode(_it), []).append(_it)
+            _ordered = sorted(_grp_items.items(),
+                              key=lambda kv: sum(x["WEIGHT"] for x in kv[1]),
+                              reverse=True)
+            _kept = [_ordered[0][0]]
+            _changed = True
+            while _changed:
+                _changed = False
+                for _code, _ in _ordered:
+                    if _code in _kept:
+                        continue
+                    _trial = [_pt_of(_x) for _c in (_kept + [_code])
+                              for _x in _grp_items[_c]]
+                    if _lorry_geo_ok(_trial):
+                        _kept.append(_code)
+                        _changed = True
+            for _code, _gits in _ordered:
+                if _code not in _kept:
+                    for _it in _gits:
+                        _it["LORRY"] = "NO_LORRY"
+                        _detached.append(_it)
 
         if _detached:
             # Recompute physical loads and each lorry's current point tuples.
@@ -4669,12 +4694,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if _p:
                         _lpts[_l].append(_p)
 
-            # Re-home detached items; process nearby items together so a cluster
-            # tends to land on one lorry.
-            _detached.sort(key=lambda x: (x.get("ROUTE", ""), x.get("GPS_LON") or 0))
+            # Re-home detached items, same route code first so a route stays whole.
+            _detached.sort(key=lambda x: (_rcode(x), x.get("GPS_LON") or 0))
             for _it in _detached:
                 _w = _it["WEIGHT"]
                 _pt = _pt_of(_it)
+                _rc = _rcode(_it)
                 _dest = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
                 _min_t = _DEST_MIN_TON.get(_dest, 0.0)
                 _strict = _strict_route_excl(_it.get("ROUTE", ""))
@@ -4693,12 +4718,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         continue
                     if _cp in _strict:
                         continue
-                    if not _chain_ok(_lpts.get(_cp, []) + [_pt]):
+                    if not _lorry_geo_ok(_lpts.get(_cp, []) + [_pt]):
                         continue
-                    # Prefer filling an occupied compatible lorry, then idle;
-                    # within that, the tightest physical fit.
-                    _occupied = 0 if _lpts.get(_cp) else 1
-                    _key = (_occupied, _ccap - _phys2.get(_cp, 0.0))
+                    # Prefer a lorry already carrying this route code (keeps the
+                    # route whole), then any occupied compatible lorry, then idle;
+                    # within a tier, the tightest physical fit.
+                    _has_same = any(_p[2] == _rc for _p in _lpts.get(_cp, []))
+                    _tier = 0 if _has_same else (1 if _lpts.get(_cp) else 2)
+                    _key = (_tier, _ccap - _phys2.get(_cp, 0.0))
                     if _best is None or _key < _best_key:
                         _best, _best_key = _cp, _key
                 if _best:
