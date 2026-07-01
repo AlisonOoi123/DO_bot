@@ -4557,17 +4557,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
-        # ── Geographic consecutive-gap enforcement ────────────────────────────
+        # ── Geographic / state clustering enforcement ─────────────────────────
         # A lorry may carry as many stops of the SAME route code as it likes,
         # however far apart — a single route (e.g. all of PH03) always rides one
-        # lorry.  But when a lorry mixes DIFFERENT route codes, the stops (sorted
-        # by longitude) must chain together with no gap between neighbouring
-        # different-code stops exceeding _MAX_GEO_GAP_DEG (straight-line degrees).
+        # lorry.  When a lorry mixes DIFFERENT route codes, the two stops must:
+        #   1. be in the SAME state (KL/Selangor count as one urban state), AND
+        #   2. either be in the SAME city, OR be within _MAX_GEO_GAP_DEG
+        #      (straight-line degrees ≈ 32 km) of each other.
+        # This stops e.g. a Selangor (KV) lorry also carrying a Pahang (PH04)
+        # drop just because their coordinates happened to fall within 0.29°.
         # Split any lorry that violates this: keep its heaviest cluster, detach
         # the rest, and re-home each detached item onto a lorry whose chain stays
-        # valid (fill compatible lorries first, then idle ones), else leave it
-        # unassigned.  Prevents mixing far-apart routes (e.g. Raub + Port Dickson)
-        # while never breaking up a single route code.
+        # valid (fill compatible lorries first, then idle ones), else unassign.
         _GEO_GAP = _MAX_GEO_GAP_DEG
         _GEO_VALID = {"NO_LORRY", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP",
                       "SPLIT", "SKIPPED", "", None}
@@ -4582,26 +4583,39 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _m = re.match(r"([A-Z]+\d+[A-Z]?)", _r)
             return _m.group(1) if _m else _r[:6]
 
+        def _pt_of(_it):
+            """(lat, lon, route_code, state, city) or None when GPS missing."""
+            _g = _gps_of(_it)
+            if not _g:
+                return None
+            return (_g[0], _g[1], _rcode(_it),
+                    str(_it.get("STATE", "")).strip().upper(),
+                    str(_it.get("CITY", "")).strip().upper())
+
         def _geo_deg(_a, _b):
             return ((_a[0] - _b[0]) ** 2 + (_a[1] - _b[1]) ** 2) ** 0.5
 
+        def _pair_ok(_a, _b):
+            """Two neighbouring stops (point tuples) allowed on one lorry?"""
+            if _a[2] == _b[2]:
+                return True                       # same route code — always OK
+            if not _states_compatible(_a[3], _b[3]):
+                return False                      # different route ⇒ must same state
+            if _a[4] == _b[4]:
+                return True                       # same state, same city — OK
+            return _geo_deg(_a[:2], _b[:2]) <= _GEO_GAP   # diff city ⇒ within gap
+
         def _chain_ok(_pts):
-            """_pts: list of (lat, lon, rcode). Sorted by longitude, the gap
-            between two neighbouring stops is only checked when their route
-            codes differ; same-code neighbours may be any distance apart."""
+            """Sorted by longitude, every neighbouring pair must satisfy _pair_ok."""
             _s = sorted(_pts, key=lambda p: p[1])
-            for _i in range(len(_s) - 1):
-                if _s[_i][2] != _s[_i + 1][2] and \
-                        _geo_deg(_s[_i][:2], _s[_i + 1][:2]) > _GEO_GAP:
-                    return False
-            return True
+            return all(_pair_ok(_s[_i], _s[_i + 1]) for _i in range(len(_s) - 1))
 
         # Split each lorry into clusters; keep the heaviest, detach the rest.
-        # A break only occurs between DIFFERENT route codes that are too far.
+        # A break occurs wherever two neighbouring stops fail _pair_ok.
         _geo_by_lorry: dict[str, list] = {}
         for _it in items:
             _l = _it.get("LORRY")
-            if _l not in _GEO_VALID and _gps_of(_it):
+            if _l not in _GEO_VALID and _pt_of(_it):
                 _geo_by_lorry.setdefault(_l, []).append(_it)
 
         _detached: list = []
@@ -4609,11 +4623,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _srt = sorted(_its, key=lambda x: x["GPS_LON"])
             _segs = [[_srt[0]]]
             for _prev, _cur in zip(_srt, _srt[1:]):
-                if _rcode(_prev) != _rcode(_cur) and \
-                        _geo_deg(_gps_of(_prev), _gps_of(_cur)) > _GEO_GAP:
-                    _segs.append([_cur])
-                else:
+                if _pair_ok(_pt_of(_prev), _pt_of(_cur)):
                     _segs[-1].append(_cur)
+                else:
+                    _segs.append([_cur])
             if len(_segs) == 1:
                 continue
             _segs.sort(key=lambda s: sum(x["WEIGHT"] for x in s), reverse=True)
@@ -4623,24 +4636,23 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _detached.append(_it)
 
         if _detached:
-            # Recompute physical loads and each lorry's current (lat,lon,rcode).
+            # Recompute physical loads and each lorry's current point tuples.
             _phys2: dict[str, float] = defaultdict(float)
             _lpts: dict[str, list] = defaultdict(list)
             for _it in items:
                 _l = _it.get("LORRY")
                 if _l not in _GEO_VALID:
                     _phys2[_l] += _it["WEIGHT"]
-                    _g = _gps_of(_it)
-                    if _g:
-                        _lpts[_l].append((_g[0], _g[1], _rcode(_it)))
+                    _p = _pt_of(_it)
+                    if _p:
+                        _lpts[_l].append(_p)
 
             # Re-home detached items; process nearby items together so a cluster
             # tends to land on one lorry.
             _detached.sort(key=lambda x: (x.get("ROUTE", ""), x.get("GPS_LON") or 0))
             for _it in _detached:
                 _w = _it["WEIGHT"]
-                _g = _gps_of(_it)
-                _pt = (_g[0], _g[1], _rcode(_it))
+                _pt = _pt_of(_it)
                 _dest = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
                 _min_t = _DEST_MIN_TON.get(_dest, 0.0)
                 _strict = _strict_route_excl(_it.get("ROUTE", ""))
