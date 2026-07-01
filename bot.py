@@ -4744,6 +4744,66 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for item in items:
                 sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
+        # ── Same-route consolidation ──────────────────────────────────────────
+        # Pull scattered stops of ONE route code together so a route is not split
+        # between a full lorry and a near-empty van (e.g. two KV05A drops at the
+        # same Batu Caves address — 1.883T on WLD8738 and 0.025T alone on the van).
+        # For each route code on ≥2 lorries, move the lighter lorry's items onto a
+        # heavier same-route lorry that has room, respecting size caps, outstation
+        # minimum and the geo/state chain.  Leaves the van free for a real load.
+        _cons_phys: dict[str, float] = defaultdict(float)
+        _cons_routes: dict = defaultdict(lambda: defaultdict(list))  # rcode→lorry→items
+        for _it in items:
+            _l = _it.get("LORRY")
+            if _l not in _GEO_VALID:
+                _cons_phys[_l] += _it["WEIGHT"]
+                _cons_routes[_rcode(_it)][_l].append(_it)
+
+        for _rc, _lor_map in _cons_routes.items():
+            if len(_lor_map) < 2:
+                continue
+            # Only consolidate URBAN routes (the van-scrap problem). Outstation
+            # routes are split across lorries out of capacity necessity — merging
+            # them would overload a truck, so leave them alone.
+            _any_it = next((x for _l in _lor_map for x in _lor_map[_l]), None)
+            if _any_it is None or _classify_dest_group(
+                    _any_it.get("ROUTE", ""), _any_it.get("STATE", "")) not in _DEST_URBAN_GROUPS:
+                continue
+            # Move from the lightest-loaded lorry (for this route) to the heaviest.
+            _srcs = sorted(_lor_map, key=lambda l: sum(x["WEIGHT"] for x in _lor_map[l]))
+            for _src in _srcs:
+                _src_items = _lor_map.get(_src) or []
+                if not _src_items:
+                    continue
+                _src_w = sum(x["WEIGHT"] for x in _src_items)
+                _tgts = sorted((l for l in _lor_map if l != _src and _lor_map[l]),
+                               key=lambda l: -sum(x["WEIGHT"] for x in _lor_map[l]))
+                for _tgt in _tgts:
+                    _tcap = float(_lorry_cap_map.get(_tgt, 0))
+                    if _cons_phys[_tgt] + _src_w > _tcap:
+                        continue
+                    if any(_x.get("MAX_TON") is not None and _tcap > _x["MAX_TON"]
+                           for _x in _src_items):
+                        continue
+                    if _tcap < min(_DEST_MIN_TON.get(
+                            _classify_dest_group(_x.get("ROUTE", ""), _x.get("STATE", "")), 0.0)
+                            for _x in _src_items):
+                        continue
+                    _tgt_pts = [_pt_of(_x) for _x in items
+                                if _x.get("LORRY") == _tgt and _pt_of(_x)]
+                    _add_pts = [_pt_of(_x) for _x in _src_items if _pt_of(_x)]
+                    if not _lorry_geo_ok(_tgt_pts + _add_pts):
+                        continue
+                    for _x in _src_items:
+                        _x["LORRY"] = _tgt
+                        sess["assigned"][_x["DO NUMBER"]] = _tgt
+                    _cons_phys[_tgt] += _src_w
+                    _cons_phys[_src] -= _src_w
+                    _session_loads[_tgt] = float(_session_loads.get(_tgt, 0)) + _src_w
+                    _lor_map[_tgt].extend(_src_items)
+                    _lor_map[_src] = []
+                    break
+
         # ── (legacy for-loop removed — replaced by _assign_one above) ────────
         # The block below was the old heaviest-first loop.  Keep a dummy
         # reference so diff is minimal.
