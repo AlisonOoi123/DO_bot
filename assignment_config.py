@@ -196,14 +196,17 @@ REMARKS_FIELD3_TON_CAP: dict[str, float | None] = {
 # Free-text remark phrases (mixed Malay/English) that imply a size cap but do
 # not use the canonical FIELD 3 wording.  Mapped to the same tonnage caps.
 REMARKS_SIZE_ALIASES: dict[str, float | None] = {
-    "LORRY KECIL SAHAJA":        5.0,
-    "LORRY KECIL SAJA":          5.0,
-    "LORRY KECIL":               5.0,
-    "LORI KECIL":                5.0,
-    "SMALL LORRY":               5.0,
-    "LORI BESAR TIDAK BOLEH":    5.0,   # big lorry can't enter → small only
-    "LORRY BESAR TIDAK BOLEH":   5.0,
-    "LORI BESAR TAK BOLEH":      5.0,
+    # "small lorry" / "lorry kecil" in the remarks → van class only (≤ 2T),
+    # per operator: these drops need a lorry under 2 TON.
+    "LORRY KECIL SAHAJA":        2.0,
+    "LORRY KECIL SAJA":          2.0,
+    "LORRY KECIL":               2.0,
+    "LORI KECIL":                2.0,
+    "SMALL LORRY":               2.0,
+    "LORRY SMALL":               2.0,   # "only lorry small" word order
+    "LORI BESAR TIDAK BOLEH":    2.0,   # big lorry can't enter → van only
+    "LORRY BESAR TIDAK BOLEH":   2.0,
+    "LORI BESAR TAK BOLEH":      2.0,
     "BIG LORRY":                 None,
     "LORI BESAR":                None,
     "LORRY BESAR":               None,
