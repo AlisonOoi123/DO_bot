@@ -487,13 +487,24 @@ def _remarks_lorry_cap(remarks: str) -> float | None:
     if not txt or txt in ("NAN", "NONE"):
         return None
     caps: list[float] = []
+
+    def _phrase_in(phrase: str, text: str) -> bool:
+        """Whole-word keyword match (case-insensitive, already upper).
+        Word-boundary so short keywords like VAN don't match CARAVAN, and
+        LORI/LORRY spelling variants are both accepted for the same phrase."""
+        if not phrase:
+            return False
+        # Accept LORI/LORRY interchangeably in either the phrase or the text.
+        _p = re.escape(phrase).replace(r"LORRY", r"LOR(?:RY|I)").replace(r"LORI", r"LOR(?:RY|I)")
+        return re.search(rf"\b{_p}\b", text) is not None
+
     # 1. Canonical FIELD 3 phrases
     for phrase, cap in _load_remarks_field3().items():
-        if cap is not None and phrase and phrase in txt:
+        if cap is not None and _phrase_in(phrase, txt):
             caps.append(cap)
     # 2. Free-text aliases
     for phrase, cap in _REMARKS_SIZE_ALIASES.items():
-        if cap is not None and phrase in txt:
+        if cap is not None and _phrase_in(phrase, txt):
             caps.append(cap)
     # 3. Free-text "N TON" size caps, tolerant of filler words & ordering, e.g.
     #      "BELOW 5 TON"            "BELOW OR 5 TON LORRY"

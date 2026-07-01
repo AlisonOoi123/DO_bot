@@ -214,12 +214,12 @@ ROUTE_CORRIDOR_GROUPS: dict[str, list[str]] = {
 }
 
 # ── Strict lorry-route reservations ──────────────────────────────────────────
-# Lorries physically or contractually bound to specific route directions.
-# plate → set of route-code prefixes (2–5 chars) it is ALLOWED to serve.
-LORRY_STRICT_ROUTE: dict[str, set[str]] = {
-    "BQU3875": {"PH"},    # 21T — Pahang routes only
-    "WA6899M": {"PH"},    # 13T spare — Pahang routes only
-}
+# No lorry is bound to a specific route direction any more — assignment is
+# purely weight/capacity based.  A large lorry serves an outstation route when
+# one is needed; otherwise it is free to serve urban routes.  The ONLY hard
+# rule is the outstation minimum tonnage (OUTSTATION_MIN_TON): lorries ≤5T can
+# never run an outstation route, only KL/Selangor urban routes.
+LORRY_STRICT_ROUTE: dict[str, set[str]] = {}
 
 # ── Preferred lorry per route ─────────────────────────────────────────────────
 # Ordered list: first plate is primary, remainder are backups.
