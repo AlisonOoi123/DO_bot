@@ -3506,6 +3506,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         for _, r in engine.eligible_lorries.iterrows()
                         if float(r["TON"]) < _dest_min_t
                     }
+                # Lorries picked as bins in THIS group's bin-pack. They must not be
+                # re-picked within the same group, but are only committed to
+                # sess["unavailable"] AFTER item distribution — a bin that ends up
+                # empty leaves its lorry free for later groups (NS, PH03, …)
+                # instead of being stranded idle-but-unavailable.
+                _bp_picked: set = set()
                 for _ in range(10):
                     if remain <= 0:
                         break
@@ -3518,7 +3524,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -3553,13 +3559,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # fit in the next bin — which needs its full capacity available,
                     # not just the remaining-weight arithmetic.
                     bins.append({"lorry": lorry, "rows": [], "remain": cap})
-                    # Urban lorries do 2 trips — only mark unavailable for outstation
-                    # so subsequent urban groups can still share them.
-                    if _dest_grp not in _DEST_URBAN_GROUPS:
-                        sess["unavailable"].add(lorry)
-                    else:
-                        # Track in session loads so capacity is accounted for
-                        _session_loads[lorry] = float(_session_loads.get(lorry, 0)) + cap
+                    # Reserve this lorry for the current group only (local set);
+                    # do NOT commit to sess["unavailable"]/_session_loads yet — that
+                    # happens after distribution, for bins that actually get items.
+                    _bp_picked.add(lorry)
                     remain = round(remain - cap, 6)
 
                 if remain <= 0 and bins:
@@ -3589,7 +3592,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -3601,16 +3604,25 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 extra_cap   = extra_sug[0]["TON_CAPACITY"]
                                 new_bin = {"lorry": extra_lorry, "rows": [], "remain": extra_cap}
                                 bins.append(new_bin)
-                                if _dest_grp not in _DEST_URBAN_GROUPS:
-                                    sess["unavailable"].add(extra_lorry)
-                                else:
-                                    _session_loads[extra_lorry] = float(_session_loads.get(extra_lorry, 0)) + extra_cap
+                                _bp_picked.add(extra_lorry)
                                 new_bin["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
                                 new_bin["remain"] -= it["WEIGHT"]
                                 item_bin2[it["DO NUMBER"]] = extra_lorry
                             else:
                                 item_bin2[it["DO NUMBER"]] = "NO_LORRY"
                                 _unassigned_reasons[it["DO NUMBER"]] = "CAPACITY_FULL"
+                    # Commit only bins that actually received items. Empty bins'
+                    # lorries stay available for later groups (NS, PH03, PH04, …)
+                    # instead of being stranded idle-but-unavailable.
+                    for _b in bins:
+                        if not _b["rows"]:
+                            continue
+                        _blorry = _b["lorry"]
+                        _bweight = sum(x["W"] for x in _b["rows"])
+                        if _dest_grp not in _DEST_URBAN_GROUPS:
+                            sess["unavailable"].add(_blorry)
+                        else:
+                            _session_loads[_blorry] = float(_session_loads.get(_blorry, 0)) + _bweight
                     for it in group_items:
                         it["LORRY"] = item_bin2.get(it["DO NUMBER"], "NO_LORRY")
                         if it["LORRY"] == "NO_LORRY":
