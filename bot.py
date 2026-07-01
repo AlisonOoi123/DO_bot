@@ -2175,6 +2175,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 sess["_prefilled_count"] = len(prefilled_rows)
             # result is None → all plates were sentinels, fall through to auto-assign
 
+        # ── Auto-free this user's lorries before assigning ────────────────────
+        # Every DO-file upload is a fresh planning run: release the user's own
+        # plates from today's "assigned today" log so ALL their lorries are
+        # available for assignment.  Re-uploading a result file (or running
+        # twice in a day) must not leave lorries wrongly blocked — capacity is
+        # still tracked accurately from the file's pre-filled loads (Case B),
+        # so this cannot double-book a lorry beyond its tonnage.  Other users'
+        # plates are preserved.
+        _eng_for_clear = sess.get("engine")
+        if _eng_for_clear is not None:
+            try:
+                clear_daily_log_for_user(_eng_for_clear)
+                sess["unavailable"] = set()
+            except Exception:
+                pass
+
         # ── Build item list: one item per Excel row ─────────────────────────
         # Each row is an independent item that needs its own lorry.
         # Items with the same DO NUMBER belong to the same customer/route
