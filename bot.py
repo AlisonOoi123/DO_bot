@@ -4558,13 +4558,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
         # ── Geographic consecutive-gap enforcement ────────────────────────────
-        # Each lorry's stops, sorted by longitude, must form a chain where no
-        # neighbouring gap exceeds _MAX_GEO_GAP_DEG (straight-line degrees).
-        # Split any lorry that violates this: keep its heaviest geo-cluster,
-        # detach the rest, then re-home each detached item onto a lorry whose
-        # chain stays valid (fill compatible lorries first, then idle ones),
-        # otherwise leave it unassigned.  Enforces "nearest-longitud" clustering
-        # so a single lorry never mixes far-apart drops (e.g. Raub + Port Dickson).
+        # A lorry may carry as many stops of the SAME route code as it likes,
+        # however far apart — a single route (e.g. all of PH03) always rides one
+        # lorry.  But when a lorry mixes DIFFERENT route codes, the stops (sorted
+        # by longitude) must chain together with no gap between neighbouring
+        # different-code stops exceeding _MAX_GEO_GAP_DEG (straight-line degrees).
+        # Split any lorry that violates this: keep its heaviest cluster, detach
+        # the rest, and re-home each detached item onto a lorry whose chain stays
+        # valid (fill compatible lorries first, then idle ones), else leave it
+        # unassigned.  Prevents mixing far-apart routes (e.g. Raub + Port Dickson)
+        # while never breaking up a single route code.
         _GEO_GAP = _MAX_GEO_GAP_DEG
         _GEO_VALID = {"NO_LORRY", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP",
                       "SPLIT", "SKIPPED", "", None}
@@ -4573,16 +4576,28 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _la, _lo = _it.get("GPS_LAT"), _it.get("GPS_LON")
             return (_la, _lo) if (_la is not None and _lo is not None) else None
 
+        def _rcode(_it):
+            """Canonical route code, e.g. 'PH03', 'KV12A', 'NS04'."""
+            _r = str(_it.get("ROUTE", "")).strip().upper()
+            _m = re.match(r"([A-Z]+\d+[A-Z]?)", _r)
+            return _m.group(1) if _m else _r[:6]
+
         def _geo_deg(_a, _b):
             return ((_a[0] - _b[0]) ** 2 + (_a[1] - _b[1]) ** 2) ** 0.5
 
         def _chain_ok(_pts):
-            """True if all consecutive gaps (sorted by longitude) ≤ _GEO_GAP."""
+            """_pts: list of (lat, lon, rcode). Sorted by longitude, the gap
+            between two neighbouring stops is only checked when their route
+            codes differ; same-code neighbours may be any distance apart."""
             _s = sorted(_pts, key=lambda p: p[1])
-            return all(_geo_deg(_s[i], _s[i + 1]) <= _GEO_GAP
-                       for i in range(len(_s) - 1))
+            for _i in range(len(_s) - 1):
+                if _s[_i][2] != _s[_i + 1][2] and \
+                        _geo_deg(_s[_i][:2], _s[_i + 1][:2]) > _GEO_GAP:
+                    return False
+            return True
 
-        # Split each lorry into geo-clusters; keep the heaviest, detach the rest.
+        # Split each lorry into clusters; keep the heaviest, detach the rest.
+        # A break only occurs between DIFFERENT route codes that are too far.
         _geo_by_lorry: dict[str, list] = {}
         for _it in items:
             _l = _it.get("LORRY")
@@ -4594,7 +4609,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _srt = sorted(_its, key=lambda x: x["GPS_LON"])
             _segs = [[_srt[0]]]
             for _prev, _cur in zip(_srt, _srt[1:]):
-                if _geo_deg(_gps_of(_prev), _gps_of(_cur)) > _GEO_GAP:
+                if _rcode(_prev) != _rcode(_cur) and \
+                        _geo_deg(_gps_of(_prev), _gps_of(_cur)) > _GEO_GAP:
                     _segs.append([_cur])
                 else:
                     _segs[-1].append(_cur)
@@ -4607,7 +4623,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _detached.append(_it)
 
         if _detached:
-            # Recompute physical loads and each lorry's current GPS points.
+            # Recompute physical loads and each lorry's current (lat,lon,rcode).
             _phys2: dict[str, float] = defaultdict(float)
             _lpts: dict[str, list] = defaultdict(list)
             for _it in items:
@@ -4616,14 +4632,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _phys2[_l] += _it["WEIGHT"]
                     _g = _gps_of(_it)
                     if _g:
-                        _lpts[_l].append(_g)
+                        _lpts[_l].append((_g[0], _g[1], _rcode(_it)))
 
             # Re-home detached items; process nearby items together so a cluster
             # tends to land on one lorry.
             _detached.sort(key=lambda x: (x.get("ROUTE", ""), x.get("GPS_LON") or 0))
             for _it in _detached:
                 _w = _it["WEIGHT"]
-                _pt = _gps_of(_it)
+                _g = _gps_of(_it)
+                _pt = (_g[0], _g[1], _rcode(_it))
                 _dest = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
                 _min_t = _DEST_MIN_TON.get(_dest, 0.0)
                 _strict = _strict_route_excl(_it.get("ROUTE", ""))
