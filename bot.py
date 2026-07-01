@@ -2219,6 +2219,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
         items = []
         _other_user_count  = 0
         _not_today_count   = 0
+        # Lorry tonnage lookup for enforcing REMARKS size caps on pre-filled rows.
+        _prefill_cap_map: dict[str, float] = {}
+        _eng_pf = sess.get("engine")
+        if _eng_pf is not None:
+            try:
+                _prefill_cap_map = {
+                    str(r["LORRY"]).strip().upper(): float(r["TON"])
+                    for _, r in _eng_pf.eligible_lorries.iterrows()
+                }
+            except Exception:
+                _prefill_cap_map = {}
         for idx, row in raw.iterrows():
             route_str = str(row["ROUTE"]).strip()
             pfx = _extract_route_prefix(route_str)
@@ -2254,7 +2265,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _existing_lic = str(row.get("LICENSE", "")).strip()
                 _lic_key = _existing_lic.lower()
                 if _lic_key and _lic_key not in {"", "nan", "none", "n/a", "-"}:
-                    _lorry_init = _existing_lic.upper()
+                    _plate_up = _existing_lic.upper()
+                    # Enforce the REMARKS size cap even on pre-filled rows: a DO
+                    # whose remark demands a small lorry (e.g. "small lorry" → ≤2T)
+                    # must NOT keep a pre-set oversized lorry. Drop the pre-fill so
+                    # it is reassigned to a compliant lorry.
+                    _cap_pf = _remarks_lorry_cap(_remarks_raw)
+                    _plate_ton_pf = _prefill_cap_map.get(_plate_up)
+                    if (_cap_pf is not None and _plate_ton_pf is not None
+                            and _plate_ton_pf > _cap_pf):
+                        _lorry_init = None
+                    else:
+                        _lorry_init = _plate_up
 
             # Parse GPS coordinates from LONGITUD column (format: "lat lon")
             _gps_lat, _gps_lon = None, None
