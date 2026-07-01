@@ -36,6 +36,12 @@ OUTSTATION_MIN_TON    = 5.001
 DEPOT_LAT  = 3.0340
 DEPOT_LON  = 101.5563
 
+# Geographic clustering: a lorry's stops, sorted by longitude, must form a
+# chain where no gap between neighbouring stops exceeds this straight-line
+# distance (in degrees: sqrt(dlat² + dlon²)).  0.29° ≈ 32 km.  Applies to ALL
+# routes — items too far from their neighbours are moved to another lorry.
+MAX_GEO_GAP_DEG               = 0.29
+
 CROSS_BEARING_LIMIT           = 90.0   # max bearing diff (°) for same-direction merge
 MAX_CITY_MERGE_KM_OUTSTATION  = 60.0   # max GPS distance (km) when merging outstation city clusters
 OUTSTATION_DIST_KM            = 50.0   # routes ≥ this distance from depot are "outstation"

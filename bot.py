@@ -27,6 +27,7 @@ from assignment_config import (
     DEPOT_LAT, DEPOT_LON,
     CROSS_BEARING_LIMIT as _CROSS_BEARING_LIMIT,
     MAX_CITY_MERGE_KM_OUTSTATION as _MAX_CITY_MERGE_KM_OUTSTATION,
+    MAX_GEO_GAP_DEG        as _MAX_GEO_GAP_DEG,
     # Destination classification
     DEST_MIN_TON         as _DEST_MIN_TON,
     DEST_LARGE_LONG_CLUSTERS  as _DEST_LARGE_LONG_CLUSTERS,
@@ -4555,6 +4556,115 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         for item in items:
             sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
+
+        # ── Geographic consecutive-gap enforcement ────────────────────────────
+        # Each lorry's stops, sorted by longitude, must form a chain where no
+        # neighbouring gap exceeds _MAX_GEO_GAP_DEG (straight-line degrees).
+        # Split any lorry that violates this: keep its heaviest geo-cluster,
+        # detach the rest, then re-home each detached item onto a lorry whose
+        # chain stays valid (fill compatible lorries first, then idle ones),
+        # otherwise leave it unassigned.  Enforces "nearest-longitud" clustering
+        # so a single lorry never mixes far-apart drops (e.g. Raub + Port Dickson).
+        _GEO_GAP = _MAX_GEO_GAP_DEG
+        _GEO_VALID = {"NO_LORRY", "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP",
+                      "SPLIT", "SKIPPED", "", None}
+
+        def _gps_of(_it):
+            _la, _lo = _it.get("GPS_LAT"), _it.get("GPS_LON")
+            return (_la, _lo) if (_la is not None and _lo is not None) else None
+
+        def _geo_deg(_a, _b):
+            return ((_a[0] - _b[0]) ** 2 + (_a[1] - _b[1]) ** 2) ** 0.5
+
+        def _chain_ok(_pts):
+            """True if all consecutive gaps (sorted by longitude) ≤ _GEO_GAP."""
+            _s = sorted(_pts, key=lambda p: p[1])
+            return all(_geo_deg(_s[i], _s[i + 1]) <= _GEO_GAP
+                       for i in range(len(_s) - 1))
+
+        # Split each lorry into geo-clusters; keep the heaviest, detach the rest.
+        _geo_by_lorry: dict[str, list] = {}
+        for _it in items:
+            _l = _it.get("LORRY")
+            if _l not in _GEO_VALID and _gps_of(_it):
+                _geo_by_lorry.setdefault(_l, []).append(_it)
+
+        _detached: list = []
+        for _l, _its in _geo_by_lorry.items():
+            _srt = sorted(_its, key=lambda x: x["GPS_LON"])
+            _segs = [[_srt[0]]]
+            for _prev, _cur in zip(_srt, _srt[1:]):
+                if _geo_deg(_gps_of(_prev), _gps_of(_cur)) > _GEO_GAP:
+                    _segs.append([_cur])
+                else:
+                    _segs[-1].append(_cur)
+            if len(_segs) == 1:
+                continue
+            _segs.sort(key=lambda s: sum(x["WEIGHT"] for x in s), reverse=True)
+            for _seg in _segs[1:]:
+                for _it in _seg:
+                    _it["LORRY"] = "NO_LORRY"
+                    _detached.append(_it)
+
+        if _detached:
+            # Recompute physical loads and each lorry's current GPS points.
+            _phys2: dict[str, float] = defaultdict(float)
+            _lpts: dict[str, list] = defaultdict(list)
+            for _it in items:
+                _l = _it.get("LORRY")
+                if _l not in _GEO_VALID:
+                    _phys2[_l] += _it["WEIGHT"]
+                    _g = _gps_of(_it)
+                    if _g:
+                        _lpts[_l].append(_g)
+
+            # Re-home detached items; process nearby items together so a cluster
+            # tends to land on one lorry.
+            _detached.sort(key=lambda x: (x.get("ROUTE", ""), x.get("GPS_LON") or 0))
+            for _it in _detached:
+                _w = _it["WEIGHT"]
+                _pt = _gps_of(_it)
+                _dest = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
+                _min_t = _DEST_MIN_TON.get(_dest, 0.0)
+                _strict = _strict_route_excl(_it.get("ROUTE", ""))
+                _mt = _it.get("MAX_TON")
+                _best = None
+                _best_key = None
+                for _cp, _ccap in _lorry_cap_map.items():
+                    _ccap = float(_ccap)
+                    if _cp in sess.get("unavailable", set()):
+                        continue
+                    if _ccap - _phys2.get(_cp, 0.0) < _w:
+                        continue
+                    if _ccap < _min_t:
+                        continue
+                    if _mt is not None and _ccap > _mt:
+                        continue
+                    if _cp in _strict:
+                        continue
+                    if not _chain_ok(_lpts.get(_cp, []) + [_pt]):
+                        continue
+                    # Prefer filling an occupied compatible lorry, then idle;
+                    # within that, the tightest physical fit.
+                    _occupied = 0 if _lpts.get(_cp) else 1
+                    _key = (_occupied, _ccap - _phys2.get(_cp, 0.0))
+                    if _best is None or _key < _best_key:
+                        _best, _best_key = _cp, _key
+                if _best:
+                    _it["LORRY"] = _best
+                    _phys2[_best] += _w
+                    _lpts[_best].append(_pt)
+                    _session_loads[_best] = float(_session_loads.get(_best, 0)) + _w
+                    _record_lorry_state(_best, _it.get("STATE", "").strip().upper())
+                    if _best not in _session_routes:
+                        _session_routes[_best] = _it.get("ROUTE", "")
+                    _unassigned_reasons.pop(_it["DO NUMBER"], None)
+                else:
+                    _it["LORRY"] = "NO_LORRY"
+                    _unassigned_reasons.setdefault(_it["DO NUMBER"], "GEO_TOO_FAR")
+
+            for item in items:
+                sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
         # ── (legacy for-loop removed — replaced by _assign_one above) ────────
         # The block below was the old heaviest-first loop.  Keep a dummy
