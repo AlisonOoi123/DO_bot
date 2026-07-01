@@ -87,6 +87,7 @@ HISTORY_PATH_OLD = os.path.join(_DATA_DIR, "126-A BI(ES) TRIP ROUTE CODE.xlsx") 
 #   2. Validate that two cities belong to the same state before merging.
 _CITY_TO_STATE: dict[str, str] = {}   # city.upper() → canonical state key
 _STATE_TO_CITIES: dict[str, set] = {} # canonical state key → set of city names (upper)
+_POSTCODE_TO_STATE: dict[int, str] = {}   # exact postcode (int) → canonical state key
 
 # _STATE_NAME_NORM imported from assignment_config
 
@@ -95,15 +96,16 @@ def _norm_state(st: str) -> str:
     return _STATE_NAME_NORM.get(st, st)
 
 def _load_malaysia_geo() -> None:
-    """Populate _CITY_TO_STATE and _STATE_TO_CITIES from the planning sheet."""
-    global _CITY_TO_STATE, _STATE_TO_CITIES
+    """Populate _CITY_TO_STATE, _STATE_TO_CITIES and _POSTCODE_TO_STATE from the
+    "Malaysia States & Cities" sheet (columns: STATE, CITY / TOWN, POSTCODE)."""
+    global _CITY_TO_STATE, _STATE_TO_CITIES, _POSTCODE_TO_STATE
     if not os.path.exists(PLANNING_PATH):
         return
     try:
         df = pd.read_excel(PLANNING_PATH,
                            sheet_name="Malaysia States & Cities",
-                           usecols=[0, 1], header=0)
-        df.columns = ["STATE", "CITY"]
+                           usecols=[0, 1, 2], header=0)
+        df.columns = ["STATE", "CITY", "POSTCODE"]
         df = df.dropna(subset=["STATE", "CITY"])
         for _, row in df.iterrows():
             st_raw = str(row["STATE"]).strip().upper()
@@ -112,6 +114,13 @@ def _load_malaysia_geo() -> None:
             if st and cty:
                 _CITY_TO_STATE[cty] = st
                 _STATE_TO_CITIES.setdefault(st, set()).add(cty)
+            # Exact postcode → state (from the sheet's POSTCODE column)
+            _pc_raw = row.get("POSTCODE")
+            if st and _pc_raw is not None and str(_pc_raw).strip() not in ("", "nan", "NaN"):
+                try:
+                    _POSTCODE_TO_STATE[int(float(str(_pc_raw).strip()))] = st
+                except (ValueError, TypeError):
+                    pass
     except Exception:
         pass   # sheet missing or malformed — fall back to item STATE column
 
@@ -713,11 +722,18 @@ DAILY_LOG_PATH = os.path.join(_DATA_DIR, "daily_assignments.json")
 # _POSTCODE_STATE_RANGES imported from assignment_config
 
 def _postcode_to_state(postcode) -> str:
-    """Return Malaysian state name from postcode, or '' if unknown."""
+    """Return Malaysian state name from postcode, or '' if unknown.
+    Priority: exact postcode from the "Malaysia States & Cities" sheet
+              (_POSTCODE_TO_STATE) → hardcoded POSTCODE_STATE_RANGES fallback."""
     try:
         pc = int(str(postcode).strip().split()[0])
     except (ValueError, TypeError):
         return ""
+    # 1. Exact postcode from the planning sheet (operator-maintained)
+    _st = _POSTCODE_TO_STATE.get(pc)
+    if _st:
+        return _st
+    # 2. Hardcoded range table fallback
     for lo, hi, state in _POSTCODE_STATE_RANGES:
         if lo <= pc <= hi:
             return state
