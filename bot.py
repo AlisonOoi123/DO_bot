@@ -3468,6 +3468,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         for _, r in engine.eligible_lorries.iterrows()
                         if float(r["TON"]) > _grp_cap_pre
                     }
+                # Honour the outstation minimum tonnage in the bin-pack loop too:
+                # the single-lorry path excludes ≤5T lorries for outstation, but
+                # the partial-load fallback (suggest with total_ton≈0) would
+                # otherwise let a 4.2T lorry pick up an outstation tail item.
+                _bp_dest_excl: set = set()
+                if _dest_min_t > 0:
+                    _bp_dest_excl = {
+                        str(r["LORRY"]).strip().upper()
+                        for _, r in engine.eligible_lorries.iterrows()
+                        if float(r["TON"]) < _dest_min_t
+                    }
                 for _ in range(10):
                     if remain <= 0:
                         break
@@ -3480,7 +3491,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -3551,7 +3562,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -3588,7 +3599,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl | _bp_dest_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -3841,6 +3852,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             """Return [(remaining_cap, plate)] sorted by most-remaining-cap first."""
             _it_is_urban = it_dest in _DEST_URBAN_GROUPS
             _it_strict   = _strict_route_excl(it_route)
+            _it_dest_min = _DEST_MIN_TON.get(it_dest, 0.0)
             _cands = []
             for _op in _lorry_cap_map:
                 if _op in sess.get("unavailable", set()):
@@ -3849,6 +3861,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _ol = float(_session_loads.get(_op, 0))
                 _or = _oc - _ol
                 if _op in _it_strict:
+                    continue
+                # Outstation minimum tonnage: lorries ≤5T can never serve an
+                # outstation route (LARGE_LONG / MEDIUM_LONG), even as overflow.
+                if _oc < _it_dest_min:
                     continue
                 # REMARKS size cap (FIELD 3)
                 if it_max_ton is not None and _oc > it_max_ton:
@@ -3924,6 +3940,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _g_dest  = _classify_dest_group(_g_route, _gits[0].get("STATE",""))
                 _g_urban = _g_dest in _DEST_URBAN_GROUPS
                 _g_strict= _strict_route_excl(_g_route)
+                _g_dest_min = _DEST_MIN_TON.get(_g_dest, 0.0)
 
                 # Find up to 2 eligible lorries (ignoring capacity floor, state OK)
                 _split_pool = []
@@ -3934,6 +3951,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _ol = float(_session_loads.get(_op, 0))
                     _or = _oc - _ol
                     if _op in _g_strict:
+                        continue
+                    # Outstation minimum tonnage: ≤5T lorries can't serve outstation
+                    if _oc < _g_dest_min:
                         continue
                     # Route direction guard
                     _op_rt2 = _session_routes.get(_op, "")
@@ -4088,7 +4108,18 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _it.get("MAX_TON") is None or _cap_a2 <= _it["MAX_TON"]
                     for _it in _pit[_best_pb]
                 )
-                if _swap_pa_ok and _swap_pb_ok and _outstation_dir_ok and _swap_cap_ok:
+                # Outstation minimum: after the swap B receives A's routes and A
+                # receives B's. Neither lorry may end up too small for an
+                # outstation route it would then have to run.
+                _swap_dstmin_ok = all(
+                    _cap_b2 >= _DEST_MIN_TON.get(_classify_dest_group(r), 0.0)
+                    for r in _routes_pa
+                ) and all(
+                    _cap_a2 >= _DEST_MIN_TON.get(_classify_dest_group(r), 0.0)
+                    for r in _routes_pb
+                )
+                if (_swap_pa_ok and _swap_pb_ok and _outstation_dir_ok
+                        and _swap_cap_ok and _swap_dstmin_ok):
                     for _it in _pit[_best_pa]:
                         _it["LORRY"] = _best_pb
                         sess["assigned"][_it["DO NUMBER"]] = _best_pb
@@ -4167,7 +4198,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _it.get("MAX_TON") is None or _dst_cap <= _it["MAX_TON"]
                     for _it in _pit[_best_src]
                 )
-                _merge_route_ok = _state_merge_ok and _cap_merge_ok and not any(
+                # Outstation minimum: never merge outstation items onto a ≤5T
+                # lorry that is too small to run that route.
+                _dstmin_merge_ok = all(
+                    _dst_cap >= _DEST_MIN_TON.get(_classify_dest_group(r), 0.0)
+                    for r in _src_routes
+                )
+                _merge_route_ok = _state_merge_ok and _cap_merge_ok and _dstmin_merge_ok and not any(
                     _best_dst in _strict_route_excl(r) for r in _src_routes
                 ) and not any(
                     _preferred_lorries_for_route(r)
@@ -4239,6 +4276,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         # Strict route guard: don't move item to a lorry that
                         # is not allowed to serve the item's route
                         if _route_it and _dst in _strict_route_excl(_route_it):
+                            continue
+                        # Outstation minimum: never move an outstation item onto
+                        # a ≤5T lorry too small to run that route.
+                        if _cap_dst < _DEST_MIN_TON.get(
+                                _classify_dest_group(_route_it, _it.get("STATE","")), 0.0):
                             continue
                         # Preferred lorry guard: prefer designated lorries, but
                         # don't block the move entirely — rebalance is an optimisation,
