@@ -4614,40 +4614,40 @@ def _handle_excel_upload(phone, sess, file_bytes):
         def _geo_deg(_a, _b):
             return ((_a[0] - _b[0]) ** 2 + (_a[1] - _b[1]) ** 2) ** 0.5
 
-        def _grp_compat(_ga, _gb):
-            """Two route-code groups (lists of point tuples) may share a lorry?"""
-            if not _states_compatible(_ga[0][3], _gb[0][3]):
+        def _edge_ok(_a, _b):
+            """Two stops may sit next to each other in a cluster: same state AND
+            within _GEO_GAP straight-line degrees. Distance is measured by GPS
+            only — a mislabeled stop that carries a correct city name but a
+            wrong far-away coordinate must NOT be treated as adjacent."""
+            if not _states_compatible(_a[3], _b[3]):
                 return False
-            if {_p[4] for _p in _ga} & {_p[4] for _p in _gb}:
-                return True                       # share at least one city
-            return min(_geo_deg(_a[:2], _b[:2]) for _a in _ga for _b in _gb) <= _GEO_GAP
+            return _geo_deg(_a[:2], _b[:2]) <= _GEO_GAP
 
         def _lorry_geo_ok(_pts):
-            """True if the route-code groups in _pts form one connected chain
-            under _grp_compat (same-code stops are one group, always allowed)."""
-            _groups: dict = {}
-            for _p in _pts:
-                _groups.setdefault(_p[2], []).append(_p)
-            _codes = list(_groups)
-            if len(_codes) <= 1:
+            """GPS single-linkage: all stops must form ONE connected cluster where
+            neighbouring stops are same-state and within _GEO_GAP. A route that
+            spans several nearby cities stays whole; a mislabeled far-away stop
+            (wrong GPS) is NOT connected and must move to another lorry."""
+            _n = len(_pts)
+            if _n <= 1:
                 return True
-            _adj = {_c: set() for _c in _codes}
-            for _i in range(len(_codes)):
-                for _j in range(_i + 1, len(_codes)):
-                    if _grp_compat(_groups[_codes[_i]], _groups[_codes[_j]]):
-                        _adj[_codes[_i]].add(_codes[_j])
-                        _adj[_codes[_j]].add(_codes[_i])
-            _seen = {_codes[0]}
-            _stack = [_codes[0]]
+            _adj = {_i: set() for _i in range(_n)}
+            for _i in range(_n):
+                for _j in range(_i + 1, _n):
+                    if _edge_ok(_pts[_i], _pts[_j]):
+                        _adj[_i].add(_j)
+                        _adj[_j].add(_i)
+            _seen = {0}
+            _stack = [0]
             while _stack:
-                for _n in _adj[_stack.pop()]:
-                    if _n not in _seen:
-                        _seen.add(_n)
-                        _stack.append(_n)
-            return len(_seen) == len(_codes)
+                for _nb in _adj[_stack.pop()]:
+                    if _nb not in _seen:
+                        _seen.add(_nb)
+                        _stack.append(_nb)
+            return len(_seen) == _n
 
-        # Split each lorry: keep the heaviest route-code group plus any groups
-        # that keep the whole set chain-connected; detach the incompatible ones.
+        # Split each lorry into GPS-connected clusters (single linkage under
+        # _GEO_GAP + same state); keep the heaviest cluster, detach the rest.
         _geo_by_lorry: dict[str, list] = {}
         for _it in items:
             _l = _it.get("LORRY")
@@ -4656,31 +4656,39 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         _detached: list = []
         for _l, _its in _geo_by_lorry.items():
-            if _lorry_geo_ok([_pt_of(_x) for _x in _its]):
+            _pts = [_pt_of(_x) for _x in _its]
+            if _lorry_geo_ok(_pts):
                 continue
-            _grp_items: dict = {}
-            for _it in _its:
-                _grp_items.setdefault(_rcode(_it), []).append(_it)
-            _ordered = sorted(_grp_items.items(),
-                              key=lambda kv: sum(x["WEIGHT"] for x in kv[1]),
-                              reverse=True)
-            _kept = [_ordered[0][0]]
-            _changed = True
-            while _changed:
-                _changed = False
-                for _code, _ in _ordered:
-                    if _code in _kept:
-                        continue
-                    _trial = [_pt_of(_x) for _c in (_kept + [_code])
-                              for _x in _grp_items[_c]]
-                    if _lorry_geo_ok(_trial):
-                        _kept.append(_code)
-                        _changed = True
-            for _code, _gits in _ordered:
-                if _code not in _kept:
-                    for _it in _gits:
-                        _it["LORRY"] = "NO_LORRY"
-                        _detached.append(_it)
+            # Build connected components (indices) under _edge_ok.
+            _n = len(_its)
+            _adj = {_i: set() for _i in range(_n)}
+            for _i in range(_n):
+                for _j in range(_i + 1, _n):
+                    if _edge_ok(_pts[_i], _pts[_j]):
+                        _adj[_i].add(_j)
+                        _adj[_j].add(_i)
+            _comp_of = [-1] * _n
+            _comps: list = []
+            for _s in range(_n):
+                if _comp_of[_s] != -1:
+                    continue
+                _cid = len(_comps)
+                _comps.append([])
+                _stack = [_s]
+                _comp_of[_s] = _cid
+                while _stack:
+                    _u = _stack.pop()
+                    _comps[_cid].append(_u)
+                    for _nb in _adj[_u]:
+                        if _comp_of[_nb] == -1:
+                            _comp_of[_nb] = _cid
+                            _stack.append(_nb)
+            # Keep the heaviest component; detach the rest.
+            _comps.sort(key=lambda c: sum(_its[i]["WEIGHT"] for i in c), reverse=True)
+            for _comp in _comps[1:]:
+                for _i in _comp:
+                    _its[_i]["LORRY"] = "NO_LORRY"
+                    _detached.append(_its[_i])
 
         if _detached:
             # Recompute physical loads and each lorry's current point tuples.
