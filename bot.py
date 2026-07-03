@@ -4768,6 +4768,74 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for item in items:
                 sess["assigned"][item["DO NUMBER"]] = item["LORRY"]
 
+        # ── VAN-remark consolidation (highest priority) ───────────────────────
+        # Every DO whose remark is VAN (cap ≤2T) should ride a van TOGETHER with
+        # nearby VAN DOs, even across different route codes. Pool all VAN DOs,
+        # cluster them by GPS single-linkage (same state + within 0.29°), and
+        # pack each cluster onto one ≤2T lorry — preferring a van already holding
+        # part of the cluster, else the tightest-fitting free van. This pulls a
+        # VAN DO off a 4.2T lorry onto the van with its VAN neighbours.
+        _van_its = [_it for _it in items
+                    if _it.get("MAX_TON") == 2.0 and _pt_of(_it)]
+        if _van_its:
+            _van_plates = [p for p, c in _lorry_cap_map.items() if float(c) <= 2.0]
+            if _van_plates:
+                # Physical load per lorry EXCLUDING the VAN DOs (they get re-placed).
+                _vphys: dict[str, float] = defaultdict(float)
+                _van_ids = {id(_x) for _x in _van_its}
+                for _it in items:
+                    _l = _it.get("LORRY")
+                    if _l not in _GEO_VALID and id(_it) not in _van_ids:
+                        _vphys[_l] += _it["WEIGHT"]
+                # Single-linkage clusters of the VAN DOs.
+                _vpts = [_pt_of(_x) for _x in _van_its]
+                _vn = len(_van_its)
+                _vadj = {_i: set() for _i in range(_vn)}
+                for _i in range(_vn):
+                    for _j in range(_i + 1, _vn):
+                        if _edge_ok(_vpts[_i], _vpts[_j]):
+                            _vadj[_i].add(_j)
+                            _vadj[_j].add(_i)
+                _vcomp = [-1] * _vn
+                _vcomps: list = []
+                for _s in range(_vn):
+                    if _vcomp[_s] != -1:
+                        continue
+                    _cid = len(_vcomps)
+                    _vcomps.append([])
+                    _vcomp[_s] = _cid
+                    _stk = [_s]
+                    while _stk:
+                        _u = _stk.pop()
+                        _vcomps[_cid].append(_u)
+                        for _nb in _vadj[_u]:
+                            if _vcomp[_nb] == -1:
+                                _vcomp[_nb] = _cid
+                                _stk.append(_nb)
+                for _comp in _vcomps:
+                    _citems = [_van_its[_i] for _i in _comp]
+                    _cw = sum(_x["WEIGHT"] for _x in _citems)
+                    # Prefer a van already carrying most of this cluster, then the
+                    # one with the most free room; require it to fit the whole cluster.
+                    _cur = defaultdict(float)
+                    for _x in _citems:
+                        if _x.get("LORRY") in _van_plates:
+                            _cur[_x["LORRY"]] += 1
+                    _pick = None
+                    for _v in sorted(_van_plates,
+                                     key=lambda v: (-_cur.get(v, 0),
+                                                    _vphys[v] - float(_lorry_cap_map.get(v, 0)))):
+                        if _vphys[_v] + _cw <= float(_lorry_cap_map.get(_v, 0)):
+                            _pick = _v
+                            break
+                    if _pick is None:
+                        continue   # cluster larger than any single van — leave as-is
+                    for _x in _citems:
+                        _x["LORRY"] = _pick
+                        sess["assigned"][_x["DO NUMBER"]] = _pick
+                        _unassigned_reasons.pop(_x["DO NUMBER"], None)
+                    _vphys[_pick] += _cw
+
         # ── Same-route consolidation ──────────────────────────────────────────
         # Pull scattered stops of ONE route code together so a route is not split
         # between a full lorry and a near-empty van (e.g. two KV05A drops at the
