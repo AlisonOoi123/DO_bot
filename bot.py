@@ -2104,7 +2104,22 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
-        df.columns = [c.strip().upper() for c in df.columns]
+        # Some exports (e.g. the ZSDOROUTEWRH .xls) put a title/date row above the
+        # real header, so row 0 is not the column names. Detect the header row
+        # (the one containing DO NUMBER / ROUTE) and re-read from there.
+        _cols0 = [str(c).strip().upper() for c in df.columns]
+        if not any(_k in _cols0 for _k in
+                   ("DO NUMBER", "ROUTE", "GROSS WEIGHT", "WEIGHT(T)")):
+            _raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+            _hdr = None
+            for _i in range(min(10, len(_raw))):
+                _rv = [str(x).strip().upper() for x in _raw.iloc[_i].tolist()]
+                if "DO NUMBER" in _rv or ("ROUTE" in _rv and "CUSTOMER NAME" in _rv):
+                    _hdr = _i
+                    break
+            if _hdr is not None:
+                df = pd.read_excel(io.BytesIO(file_bytes), header=_hdr)
+        df.columns = [str(c).strip().upper() for c in df.columns]
 
         # ── Detect lorry-status file (LORRY + STATUS columns) ───────────────
         # Must be checked BEFORE DO-file detection so a master-lorry upload
@@ -2264,6 +2279,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
             _remarks_raw = str(row.get("REMARKS", "")).strip()
 
+            # ── SHIP_DETAIL column (new file format) ──────────────────────────
+            # Format: "<days>, [AM|PM], MAX <N> TON".  The "MAX N TON" part is the
+            # largest lorry allowed for this DO (e.g. MAX 15 TON → any lorry ≤15T).
+            # We parse it the same way as REMARKS size phrases and take the
+            # TIGHTEST (smallest) cap of the two.  The size rules still apply on
+            # top: ≤2T = VAN, ≤5T = small lorry, and both cannot run outstation.
+            # (Day / AM-PM parts are ignored for now, per request.)
+            _ship_raw = str(row.get("SHIP_DETAIL", "")).strip()
+            _cap_remarks = _remarks_lorry_cap(_remarks_raw)
+            _cap_ship    = _remarks_lorry_cap(_ship_raw)
+            _caps_all    = [c for c in (_cap_remarks, _cap_ship) if c is not None]
+            _size_cap    = min(_caps_all) if _caps_all else None
+
             # Remarks-day filter DISABLED by request: assignment now depends only
             # on the trip day the user selected at login (today/tomorrow) plus the
             # SCHD schedule check above. Delivery-day hints in REMARKS (e.g.
@@ -2286,7 +2314,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # whose remark demands a small lorry (e.g. "small lorry" → ≤2T)
                     # must NOT keep a pre-set oversized lorry. Drop the pre-fill so
                     # it is reassigned to a compliant lorry.
-                    _cap_pf = _remarks_lorry_cap(_remarks_raw)
+                    _cap_pf = _size_cap
                     _plate_ton_pf = _prefill_cap_map.get(_plate_up)
                     if (_cap_pf is not None and _plate_ton_pf is not None
                             and _plate_ton_pf > _cap_pf):
@@ -2322,8 +2350,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "GPS_LON":       _gps_lon,
                 "LORRY":         _lorry_init,
                 "SPLIT_LORRIES": None,
-                # Max lorry tonnage required by this DO's REMARKS (None = any size).
-                "MAX_TON":       _remarks_lorry_cap(_remarks_raw),
+                # Max lorry tonnage allowed by this DO's REMARKS and/or SHIP_DETAIL
+                # ("MAX N TON") — tightest of the two (None = any size).
+                "MAX_TON":       _size_cap,
             })
 
         # Sort eligible items by DATE ascending so oldest pending DOs are
