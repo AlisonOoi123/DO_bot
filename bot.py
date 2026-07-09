@@ -2280,15 +2280,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _remarks_raw = str(row.get("REMARKS", "")).strip()
 
             # ── SHIP_DETAIL column (new file format) ──────────────────────────
-            # Format: "<days>, [AM|PM], MAX <N> TON".  The "MAX N TON" part is the
-            # largest lorry allowed for this DO (e.g. MAX 15 TON → any lorry ≤15T).
-            # We parse it the same way as REMARKS size phrases and take the
-            # TIGHTEST (smallest) cap of the two.  The size rules still apply on
-            # top: ≤2T = VAN, ≤5T = small lorry, and both cannot run outstation.
-            # (Day / AM-PM parts are ignored for now, per request.)
+            # Format: "<days>, [AM|PM], MAX <N> TON".  Per operator, ONLY
+            # "MAX 2 TON" is enforced from SHIP_DETAIL → that DO must go on a
+            # lorry under 2T (a van).  All other MAX values (5/11/15/21 TON) are
+            # NOT capped here — those DOs follow the original assignment rules.
+            # (Day / AM-PM parts are ignored, per request.)  REMARKS size phrases
+            # (VAN, LORRY KECIL, BELOW 5 TON, …) keep their original behaviour.
             _ship_raw = str(row.get("SHIP_DETAIL", "")).strip()
             _cap_remarks = _remarks_lorry_cap(_remarks_raw)
             _cap_ship    = _remarks_lorry_cap(_ship_raw)
+            if _cap_ship != 2.0:      # only MAX 2 TON from SHIP_DETAIL applies
+                _cap_ship = None
             _caps_all    = [c for c in (_cap_remarks, _cap_ship) if c is not None]
             _size_cap    = min(_caps_all) if _caps_all else None
 
