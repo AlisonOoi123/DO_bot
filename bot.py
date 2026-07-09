@@ -2121,6 +2121,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 df = pd.read_excel(io.BytesIO(file_bytes), header=_hdr)
         df.columns = [str(c).strip().upper() for c in df.columns]
 
+        # Remember the EXACT columns (and order) of the uploaded file so the
+        # export can be returned with the same layout — no added TRIP/DEST_STATE
+        # or internal WEIGHT(T), and INVOICE DATE etc. keep their position.
+        sess["_orig_cols"] = list(df.columns)
+
         # ── Detect lorry-status file (LORRY + STATUS columns) ───────────────
         # Must be checked BEFORE DO-file detection so a master-lorry upload
         # with Status column doesn't accidentally trigger DO assignment flow.
@@ -6425,10 +6430,22 @@ def _export_result_inner(sess) -> list[str]:
                 str(_trip_vals[i]) if i in _trip_vals else ""
                 for i in range(len(out_df))
             ]
-            # Only insert TRIP column if any lorry does 2 trips
-            if any(v == 2 for v in _trip_vals.values()):
+            # Only insert TRIP column if any lorry does 2 trips (and it isn't
+            # already present from a re-uploaded prior output).
+            if any(v == 2 for v in _trip_vals.values()) and "TRIP" not in out_df.columns:
                 _lic_loc = out_df.columns.get_loc("LICENSE")
                 out_df.insert(_lic_loc, "TRIP", _trip_col)
+
+    # ── Preserve the uploaded file's exact column layout ──────────────────────
+    # Return the same columns, in the same order, as the file the user uploaded.
+    # Only the assignment columns (LICENSE, etc.) are filled in — no added
+    # TRIP / DEST_STATE / WEIGHT(T), and INVOICE DATE keeps its original spot.
+    _orig_cols = sess.get("_orig_cols")
+    if _orig_cols:
+        for _c in _orig_cols:
+            if _c not in out_df.columns:
+                out_df[_c] = ""
+        out_df = out_df[[_c for _c in _orig_cols if _c in out_df.columns]]
 
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
