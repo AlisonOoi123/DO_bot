@@ -1,0 +1,193 @@
+# DO_BOT ASSIGNMENT SKILL — Strict Implementation Script
+
+**Version 2.0 · Authoritative decision procedure for the DO_BOT AI.**
+This file is the single source of truth for HOW a lorry is chosen for a DO.
+It is intentionally *preference + intelligence based, NOT hardcoded*: no rule
+says "route PH07 must use lorry X". Instead the bot decides from **owner,
+outstation status, geography (city / state / route code / longitude), gross
+weight, and the SHIP_DETAIL column**, with the goal of **fully utilising every
+lorry**.
+
+> Governance: Do not overturn any rule in this file without operator sign-off.
+> Every decision must be explainable ("no black box"). When two rules conflict,
+> the HARD CONSTRAINTS (Section A) always win.
+
+---
+
+## A. HARD CONSTRAINTS (never violated, no exceptions)
+
+These are physical / contractual limits. They are checked first and can never
+be overridden by optimisation or utilisation goals.
+
+1. **Owner isolation.** The logged-in user (ABI or VIVIAN) may only be assigned
+   lorries they own **plus SPARE** lorries. A DO whose route belongs to the
+   other user is left blank (`OTHER_USER`) — never assigned.
+2. **Outstation minimum tonnage.** A lorry ≤ 5 T (rated `TON` ≤ 5.001) can
+   **never** serve an outstation route. It may only serve urban KL / Selangor
+   routes. Outstation = any route whose destination group is LARGE_LONG or
+   MEDIUM_LONG (Pahang, Johor, NS, Perak, Terengganu, …).
+3. **VAN class.** A lorry under 2 T is the *van* class. Used for DOs that
+   explicitly require a van (see Section D).
+4. **Small-lorry class.** A lorry under 5 T is the *small lorry* class.
+5. **REMARKS / SHIP_DETAIL size cap.** A DO that specifies a maximum lorry size
+   must never ride a lorry larger than that cap (see Section D for the exact
+   phrases currently enforced).
+6. **OUT SOURCE.** A DO whose SHIP_DETAIL contains `OUT SOURCE` is handled by a
+   third-party lorry. The bot assigns **no plate** — `LICENSE` stays blank and
+   the DO is **not** counted as unassigned.
+7. **Geographic integrity.** DOs on one lorry must form ONE geographic cluster
+   (Section C). A far-away drop is never bolted onto an unrelated cluster.
+8. **File integrity.** The exported file keeps the uploaded file's EXACT columns
+   and order. Only assignment columns (LICENSE, DRIVER, assistants) are filled.
+   No columns are added, removed, or reordered.
+
+---
+
+## B. THE FIVE OPERATING PRINCIPLES (in priority order)
+
+The bot works through these in order for every upload.
+
+### Principle 1 — Who is logged in?
+Determine the user (ABI / VIVIAN). Build the eligible fleet = that user's
+lorries + SPARE. All later steps choose ONLY from this fleet. Routes owned by
+the other user are set aside (`OTHER_USER`) and never touched.
+
+### Principle 2 — Is the destination outstation?
+For each DO, classify the destination (by route-code prefix, then STATE / CITY,
+then postcode — see Section E for how STATE is resolved):
+- **Outstation** (LARGE_LONG / MEDIUM_LONG): exclude every lorry ≤ 5 T from
+  consideration. Only lorries > 5 T may be used.
+- **Urban** (KL / Selangor): any lorry size may be used, including vans and
+  small lorries.
+
+### Principle 3 — Cluster by geography, then fill by weight.
+Group DOs that share **route code + state + city** and are geographically near
+(nearest longitude / GPS). Assign these clusters together, choosing the
+**tightest-fitting** lorry that covers the cluster's total gross weight, so each
+lorry is filled as full as possible. Then keep filling underused lorries with
+the nearest compatible DOs until they reach the utilisation target. This is how
+we achieve Principle 5 (full utilisation) without hardcoding.
+
+Same route code always rides one lorry (however many cities it spans) **as long
+as the stops form one connected GPS cluster** — see Section C.
+
+### Principle 4 — Read SHIP_DETAIL for the size preference.
+SHIP_DETAIL format: `<days>, [AM|PM], MAX <N> TON` (any part optional).
+- `MAX N TON` = the largest lorry the customer can receive. Within that ceiling,
+  pick the lorry by **gross weight** (tightest fit) — don't send a 15 T lorry
+  for 200 kg just because MAX 15 TON is allowed.
+- `OUT SOURCE` = assign no plate (Hard Constraint A6).
+- Days / AM / PM are read but **not** used to filter assignment (the operator
+  chooses the trip day at login; the SCHD sheet does day filtering).
+
+> ⚠️ CURRENT CODE STATE (pending operator decision): only `MAX 2 TON` from
+> SHIP_DETAIL is enforced today (→ van). `MAX 5 / 11 / 15 / 21 TON` are NOT
+> capped — those DOs follow ordinary weight/route rules. This matches the
+> operator's most recent explicit instruction. Principle 4 above describes the
+> intended "cap ≤ N and pick by weight" behaviour. **These differ — do not
+> change without confirming which is wanted.**
+
+### Principle 5 — Fully utilise every lorry.
+The optimisation goal. After the constraint-respecting assignment, run the
+optimisation passes (Section F) to raise utilisation: consolidate scattered
+same-route stops, pull nearby DOs onto underfilled lorries, and prefer filling
+an already-used compatible lorry over opening a new one — always within the
+hard constraints.
+
+---
+
+## C. GEOGRAPHIC CLUSTERING (GPS single-linkage)
+
+A lorry's stops must form ONE connected cluster:
+- Two stops are "connected" when they are in the **same state**
+  (KL and Selangor count as one urban state) AND within
+  **`MAX_GEO_GAP_DEG` = 0.29°** straight-line distance
+  (√(Δlat² + Δlon²), ≈ 32 km).
+- All stops on a lorry must be reachable from each other through a chain of such
+  ≤ 0.29° hops. A legitimate multi-city route (e.g. Benta ↔ Lipis ↔ Kuala
+  Lipis, each hop ≤ 0.29°) stays whole; a stop with a wrong/far GPS is split off
+  and re-homed onto a lorry where it fits the chain, else left unassigned.
+- Distance is measured by **GPS only** — a stop with a correct city name but a
+  wrong coordinate is still separated.
+
+VAN priority: all VAN-remark DOs are pooled ACROSS routes, clustered by the same
+0.29° single-linkage rule, and packed onto a ≤ 2 T van together.
+
+---
+
+## D. SIZE-REQUIREMENT PHRASES (REMARKS + SHIP_DETAIL)
+
+Detection is case-insensitive, whole-word, LORI/LORRY interchangeable.
+
+| Phrase (in REMARKS or SHIP_DETAIL) | Max lorry tonnage | Notes |
+|---|---|---|
+| `VAN`, `VAN ONLY` | ≤ 2 T | van class |
+| `SMALL LORRY`, `LORRY SMALL`, `LORRY/LORI KECIL`, `LORI BESAR TAK BOLEH` | ≤ 5 T | small lorry |
+| `BELOW 5 / 10 / 14 / 20 TON` | ≤ that value | free-text tonnage |
+| `MAX 2 TON` (SHIP_DETAIL) | ≤ 2 T | **enforced today** |
+| `MAX 5 / 11 / 15 / 21 TON` (SHIP_DETAIL) | *not capped today* | see Principle 4 warning |
+| `ANY SIZE`, `BIG LORRY` | no cap | |
+| `OUT SOURCE` (SHIP_DETAIL) | — | no plate assigned |
+
+When several DOs share a lorry, the binding cap is the **smallest** cap among
+them. A DO with no size phrase imposes no cap.
+
+The phrase→cap table is loaded at runtime from the `REMARKS FIELD` sheet in
+LORRY DAILY PLANNING.xlsx when present, falling back to
+`assignment_config.py` (`REMARKS_FIELD3_TON_CAP`, `REMARKS_SIZE_ALIASES`).
+
+---
+
+## E. STATE / CITY / POSTCODE RESOLUTION
+
+Destination STATE for each DO is resolved in this order:
+1. Explicit `STATE` column.
+2. `CITY` looked up in the **Malaysia States & Cities** sheet.
+3. `POSCODE` — exact match in that sheet's POSTCODE column, then the postcode
+   range table in `assignment_config.py` (`POSTCODE_STATE_RANGES`).
+
+Operators maintain the Malaysia States & Cities sheet (STATE / CITY / POSTCODE)
+directly — the bot reads it at startup, so new towns/postcodes need no code
+change.
+
+---
+
+## F. OPTIMISATION PASSES (run in this order, all within Section A constraints)
+
+1. **Initial assignment** — cluster (Principle 3) → tightest-fit lorry.
+2. **Consolidation / force-assign** — place any still-unassigned DO on a
+   compatible lorry with room.
+3. **Overflow / split** — split a group across two lorries only when no single
+   lorry fits; never onto a size-capped or outstation-illegal lorry.
+4. **Swap / same-route merge / partial rebalance** — improve utilisation;
+   every move re-checks size cap, outstation min, state, and the 0.29° chain.
+5. **Bin-pack safety** — a lorry is only marked "used/unavailable" once it
+   actually receives items (empty bins release their lorry for later groups).
+6. **Geographic enforcement** — split any lorry that isn't one GPS cluster;
+   re-home the outliers.
+7. **VAN-priority consolidation** — pool all VAN DOs onto the van(s).
+8. **Same-route (urban) consolidation** — pull scattered same-route stops
+   together so a route isn't split between a full lorry and a near-empty van.
+
+---
+
+## G. WHAT IS **NOT** HARDCODED (removed on purpose)
+
+- No `ROUTE_PREFERRED_LORRY` (empty) — no "route X must use lorry Y".
+- No `LORRY_STRICT_ROUTE` (empty) — no lorry is bound to a route direction.
+Assignment is entirely driven by owner + outstation + geography + weight +
+SHIP_DETAIL, per the principles above.
+
+---
+
+## H. SENTINEL VALUES (rows that are intentionally NOT assigned)
+
+`OTHER_USER` (other owner's route) · `NOT_TODAY` (not on today's SCHD) ·
+`REMARKS_SKIP` (day-restricted remark) · `OUT_SOURCE` (third-party) ·
+`NO_LORRY` (genuinely could not fit any eligible lorry).
+Only `NO_LORRY` counts as a real "unassigned"; the others are expected skips and
+are exported with a blank LICENSE.
+
+---
+
+## END OF SKILL SCRIPT

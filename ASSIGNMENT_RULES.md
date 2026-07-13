@@ -184,33 +184,40 @@ For outstation routes, cross-route sharing is allowed if:
 
 ---
 
-## SECTION 9 — PREFERRED LORRY ASSIGNMENTS
+## SECTION 9 — LORRY SELECTION (PREFERENCE, NOT HARDCODE)
 
-**RULE 9.1 — Preferred Lorry Per Route**
-Each route has a preferred lorry list. The preferred lorry is tried FIRST during assignment if it is the tightest-fitting available (within 1T of best available capacity). Preferred lorries are NOT forced if a significantly better fit is available.
-
-The preferred lists are DERIVED FROM REAL MANUAL-ASSIGNMENT HISTORY (data/ZSDOROUTEWRH.xlsx):
-for each route, the lorries the owning planner (ABI or VIVIAN) used most often,
-counting only owner-owned + SPARE lorries — cross-owner borrows/swaps are ignored.
-Route codes are matched by LONGEST prefix, so specific codes (e.g. KV24A → VIVIAN)
-win over shorter ones (e.g. KV24 → ABI). When ABI is logged in only ABI+SPARE
-lorries are eligible; when VIVIAN is logged in only VIVIAN+SPARE — so both owners'
-preferences coexist in the table without conflict.
-
-Key preferred assignments:
-  - KV01A, KV02A → BQY7823, BMN3682 (north corridor)
-  - KV04A → BQY7823, BMN3682
-  - KV05A → WA6899M, BMN3682
-  - KV06A, KV07A → W3618U, W3826C (tight inner-KL, 4.2T only)
-  - KV10A → W3826C, W3618U
-  - KV11A → VKN8836, W3618U, W3826C (shophouse deliveries, small lorry only)
-  - KV18A, KV19A, KV20A → BPE9788, VJN9910, VEA2818 (SE corridor)
-  - NS routes → BQX9983, BMN3682
-  - PH routes → BPE9788, WA6899M
-  - Long-haul (PK, JH, TR, KB, KD, PN) → VJN9910, BQY7823, BQX9983, VER2872
+**RULE 9.1 — No route→lorry hardcode.**
+There is NO fixed "route X must use lorry Y" table. `ROUTE_PREFERRED_LORRY` and
+`LORRY_STRICT_ROUTE` in assignment_config.py are intentionally EMPTY. A lorry is
+chosen purely from:
+  1. **Owner** — only the logged-in user's lorries + SPARE are eligible.
+  2. **Outstation status** — lorries ≤ 5T are excluded from outstation routes.
+  3. **Size cap** — REMARKS / SHIP_DETAIL caps (Section 6, Section 6A).
+  4. **Gross weight** — the tightest-fitting eligible lorry that covers the
+     cluster's weight wins (maximise utilisation).
+  5. **Geography** — same route code + state + city + nearest longitude cluster
+     together (Section 2, and the 0.29° GPS single-linkage rule).
+The full decision procedure lives in **DO_BOT_SKILL.md** (authoritative).
 
 **RULE 9.2 — Tiny-Item Routes (Small Lorry Mandatory)**
 Routes with average DO weight ≤ 150 kg (e.g., KV11A ~46 kg/DO) MUST use small lorries or vans. Lorries ≥ 4.5T are excluded from tiny-item routes because large trucks cannot maneuver in narrow shophouse streets.
+
+---
+
+## SECTION 6A — SHIP_DETAIL COLUMN
+
+The uploaded DO file may include a `SHIP_DETAIL` column:
+`<days>, [AM|PM], MAX <N> TON`.
+
+- **`MAX N TON`** — the largest lorry the customer can receive. **Current code
+  enforces only `MAX 2 TON` (→ van, ≤2T).** `MAX 5 / 11 / 15 / 21 TON` are NOT
+  capped and follow ordinary weight/route rules. (The intended long-term rule is
+  "cap at ≤N and pick the lorry by gross weight" — pending operator sign-off; do
+  not change silently.)
+- **`OUT SOURCE`** — the DO is delivered by a third-party lorry. Assign NO plate:
+  `LICENSE` stays blank and the DO is NOT counted as unassigned (sentinel
+  `OUT_SOURCE`).
+- **days / AM / PM** — read but not used for assignment filtering.
 
 ---
 
