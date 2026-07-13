@@ -537,6 +537,43 @@ def _remarks_lorry_cap(remarks: str) -> float | None:
     return min(caps) if caps else None
 
 
+def _remarks_forbidden_plates(remarks: str, all_plates) -> set:
+    """Return eligible plates a DO's REMARKS forbid by NUMBER.
+
+    Handles "lorry 3875 tak boleh masuk" (BQU3875 forbidden), "3875 tidak boleh
+    masuk", "no 3875 cannot enter", etc.  A plate FRAGMENT is a token containing
+    a digit (so size words like BESAR / KECIL are never treated as a plate — those
+    are handled by the size-cap rules).  Any eligible lorry whose plate contains
+    the fragment is excluded for this DO.
+    """
+    if not remarks:
+        return set()
+    txt = str(remarks).upper()
+    if "TAK BOLEH" not in txt and "TIDAK BOLEH" not in txt \
+            and "TDK BOLEH" not in txt and "CANNOT" not in txt \
+            and "CAN NOT" not in txt:
+        return set()
+    _forbid_kw = r'(?:TAK|TIDAK|TDK)\s+BOLEH|CAN\s?NOT'
+    _frags = set()
+    # plate fragment (has a digit) appearing shortly BEFORE the forbid keyword,
+    # e.g. "3875 TAK BOLEH", "W3826C TIDAK BOLEH", "LORRY 3875 TAK BOLEH MASUK"
+    for _m in re.finditer(rf'([A-Z]*\d[A-Z0-9]*)\s+(?:{_forbid_kw})', txt):
+        _frags.add(_m.group(1))
+    # ...or shortly AFTER ("TAK BOLEH MASUK LORI 3875")
+    for _m in re.finditer(rf'(?:{_forbid_kw})[^0-9A-Z]*(?:MASUK\s+)?(?:LOR(?:RY|I)\s+)?([A-Z]*\d[A-Z0-9]*)', txt):
+        _frags.add(_m.group(1))
+    if not _frags:
+        return set()
+    _excl = set()
+    for _p in all_plates:
+        _pu = str(_p).strip().upper()
+        for _f in _frags:
+            if len(_f) >= 3 and _f in _pu:
+                _excl.add(_pu)
+                break
+    return _excl
+
+
 def _load_schedule(user: str) -> dict[int, set[str]]:
     """Return {weekday_int: set_of_route_prefixes} from the SCHD sheet.
     weekday_int follows Python's datetime.weekday(): Mon=0 … Sun=6.
@@ -2337,6 +2374,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     else:
                         _lorry_init = _plate_up
 
+            # REMARKS forbidding a specific plate by number ("lorry 3875 tak boleh
+            # masuk" → BQU3875 excluded for this DO). Size words ("besar") are not
+            # plates and are handled by the size-cap rules instead.
+            _forbid_plates = _remarks_forbidden_plates(_remarks_raw, _prefill_cap_map.keys())
+            # If the pre-filled plate is itself forbidden, drop the pre-fill so it
+            # gets reassigned to a lorry that IS allowed to enter.
+            if _lorry_init and _lorry_init in _forbid_plates:
+                _lorry_init = None
+
             # Parse GPS coordinates from LONGITUD column (format: "lat lon")
             _gps_lat, _gps_lon = None, None
             _loc_raw = str(row.get("LONGITUD", "")).strip()
@@ -2368,6 +2414,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # Max lorry tonnage allowed by this DO's REMARKS and/or SHIP_DETAIL
                 # ("MAX N TON") — tightest of the two (None = any size).
                 "MAX_TON":       _size_cap,
+                # Specific plates this DO forbids ("lorry 3875 tak boleh masuk").
+                "FORBID_PLATES": _forbid_plates,
             })
 
         # Sort eligible items by DATE ascending so oldest pending DOs are
@@ -3377,6 +3425,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 }
             excluded = excluded | _state_excl
 
+            # ── Forbidden-plate exclusion (REMARKS "lorry 3875 tak boleh masuk") ─
+            # Any plate a member DO forbids cannot serve this group (all members
+            # ride one lorry, so the union of forbidden plates is excluded).
+            _grp_forbid: set = set()
+            for _it in group_items:
+                _fp = _it.get("FORBID_PLATES")
+                if _fp:
+                    _grp_forbid |= _fp
+            if _grp_forbid:
+                excluded = excluded | _grp_forbid
+
             # ── Preferred lorry enforcement (runs BEFORE size exclusions) ─────
             # Preferred lorries bypass the standard size-minimum rules because
             # they are operationally designated for that corridor (e.g. BMN3682
@@ -3607,7 +3666,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -3675,7 +3734,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -3721,7 +3780,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl | _bp_dest_excl
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _grp_forbid
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -4966,6 +5025,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Rule A5 — REMARKS / SHIP_DETAIL size cap (incl. MAX 2 TON → van)
             elif _it.get("MAX_TON") is not None and _lt > _it["MAX_TON"]:
                 _reason = "SIZE_CAP_EXCEEDED"
+            # Rule — REMARKS forbids this specific plate ("3875 tak boleh masuk")
+            elif _it.get("FORBID_PLATES") and _l in _it["FORBID_PLATES"]:
+                _reason = "PLATE_FORBIDDEN"
             if _reason:
                 _audit_viol.append(f"{_it.get('DO NUMBER')}:{_l}({_lt}T):{_reason}")
                 _it["LORRY"] = "NO_LORRY"
