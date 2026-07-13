@@ -4940,6 +4940,44 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _lor_map[_src] = []
                     break
 
+        # ── RULES-COMPLIANCE GATE (ASSIGNMENT_RULES.md / DO_BOT_SKILL.md §A) ───
+        # Final deterministic audit: every assigned DO must obey the HARD rules.
+        # Any violation is corrected (the DO is unassigned → NO_LORRY) and logged,
+        # so a rule can never be silently broken in the output. No black box —
+        # each check maps 1:1 to a written rule.
+        _audit_caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
+                       for _, r in engine.eligible_lorries.iterrows()}
+        _audit_owner = set(_audit_caps)          # owner + SPARE fleet
+        _audit_viol: list[str] = []
+        for _it in items:
+            _l = _it.get("LORRY")
+            if _l not in _audit_caps:
+                continue                          # sentinels / blanks — skip
+            _lt = _audit_caps[_l]
+            _rt = _it.get("ROUTE", "")
+            _dg = _classify_dest_group(_rt, _it.get("STATE", ""))
+            _reason = None
+            # Rule A1 — owner isolation
+            if _l not in _audit_owner:
+                _reason = "OWNER_ISOLATION"
+            # Rule A2 — outstation minimum tonnage (≤5T never outstation)
+            elif _dg not in _DEST_URBAN_GROUPS and _lt < _OUTSTATION_MIN_TON:
+                _reason = "OUTSTATION_NEEDS_>5T"
+            # Rule A5 — REMARKS / SHIP_DETAIL size cap (incl. MAX 2 TON → van)
+            elif _it.get("MAX_TON") is not None and _lt > _it["MAX_TON"]:
+                _reason = "SIZE_CAP_EXCEEDED"
+            if _reason:
+                _audit_viol.append(f"{_it.get('DO NUMBER')}:{_l}({_lt}T):{_reason}")
+                _it["LORRY"] = "NO_LORRY"
+                sess["assigned"][_it["DO NUMBER"]] = "NO_LORRY"
+                _unassigned_reasons[_it["DO NUMBER"]] = _reason
+        if _audit_viol:
+            import logging as _rlog
+            _rlog.warning("[RULES-AUDIT] corrected %d violation(s): %s",
+                          len(_audit_viol), "; ".join(_audit_viol[:20]))
+        else:
+            print(f"[RULES-AUDIT] OK — all assignments comply with the hard rules.")
+
         # ── (legacy for-loop removed — replaced by _assign_one above) ────────
         # The block below was the old heaviest-first loop.  Keep a dummy
         # reference so diff is minimal.
