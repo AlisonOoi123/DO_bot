@@ -4734,10 +4734,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
             return ((_a[0] - _b[0]) ** 2 + (_a[1] - _b[1]) ** 2) ** 0.5
 
         def _edge_ok(_a, _b):
-            """Two stops may sit next to each other in a cluster: same state AND
-            within _GEO_GAP straight-line degrees. Distance is measured by GPS
-            only — a mislabeled stop that carries a correct city name but a
-            wrong far-away coordinate must NOT be treated as adjacent."""
+            """May these two stops sit on one lorry together?
+            - SAME route code → always yes (route code is atomic: one route =
+              one trip = one lorry, regardless of how far its stops are, because
+              the route code is a more reliable signal than a possibly-wrong GPS).
+            - DIFFERENT route codes → only if SAME state AND within _GEO_GAP
+              straight-line degrees (so a far/foreign drop is not bolted on)."""
+            if _a[2] == _b[2]:
+                return True
             if not _states_compatible(_a[3], _b[3]):
                 return False
             return _geo_deg(_a[:2], _b[:2]) <= _GEO_GAP
