@@ -4738,12 +4738,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             - SAME route code → always yes (route code is atomic: one route =
               one trip = one lorry, regardless of how far its stops are, because
               the route code is a more reliable signal than a possibly-wrong GPS).
-            - DIFFERENT route codes → only if SAME state AND within _GEO_GAP
-              straight-line degrees (so a far/foreign drop is not bolted on)."""
+            - DIFFERENT route codes, SAME corridor group (e.g. PH_INT =
+              PH01..PH08 Pahang interior) → yes: it is one directional
+              outstation trip covering several towns, so they combine to fill
+              the lorry. (Still requires the same state.)
+            - Otherwise different route codes → only if SAME state AND within
+              _GEO_GAP straight-line degrees (so a far/foreign drop is not
+              bolted on)."""
             if _a[2] == _b[2]:
                 return True
             if not _states_compatible(_a[3], _b[3]):
                 return False
+            if _same_corridor_group(_a[2], _b[2]):
+                return True
             return _geo_deg(_a[:2], _b[:2]) <= _GEO_GAP
 
         def _lorry_geo_ok(_pts):
