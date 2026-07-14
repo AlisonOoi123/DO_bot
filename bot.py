@@ -712,6 +712,19 @@ def _same_corridor_group(route1: str, route2: str) -> bool:
             return True
     return False
 
+def _direction_key(route: str) -> str:
+    """Coarse outstation 'direction' for a route: the corridor-group name if the
+    route belongs to one (PH_INT, KV_NORTH, NS, …), else the route code. Used to
+    reserve one lorry per distinct outstation direction so the biggest direction
+    (e.g. Pahang/Kuantan) does not consume every lorry and starve a smaller one
+    (e.g. the KV01A/KV02A northern run)."""
+    r = str(route).strip().upper()
+    for _name, _pfxs in _ROUTE_CORRIDOR_GROUPS.items():
+        if any(r.startswith(p) for p in _pfxs):
+            return _name
+    _m = re.match(r"([A-Z]+\d+[A-Z]?)", r)
+    return _m.group(1) if _m else r[:6]
+
 # _ROUTE_PREFERRED_LORRY, _TINY_ITEM_AVG_WEIGHT_T, _CROSS_BEARING_LIMIT,
 # _MAX_CITY_MERGE_KM_OUTSTATION imported from assignment_config
 
@@ -3158,6 +3171,43 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _split_groups.append(_uncapped_pool)
         sorted_groups = _split_groups
 
+        # ── Per-direction lorry reservation ───────────────────────────────────
+        # Reserve one >5T lorry for EACH distinct OUTSTATION direction that has
+        # DOs, so the biggest direction (e.g. Pahang/Kuantan) cannot grab every
+        # lorry and leave a smaller outstation run (e.g. KV01A/KV02A north) with
+        # nothing. Reservation only happens when a direction actually has DOs;
+        # urban routes need no reservation. Smallest direction reserves first
+        # (it is the most easily starved) and takes the TIGHTEST-fitting >5T lorry.
+        _reserved_lorry: dict[str, str] = {}   # plate → direction key
+        _dir_weight: dict[str, float] = defaultdict(float)
+        # Count this user's own OUTSTATION DOs — both those being assigned now and
+        # those off-schedule (NOT_TODAY) that the user may choose to assign — so a
+        # lorry is held for their direction. Other users' rows are excluded.
+        for _it in items:
+            _l = _it.get("LORRY")
+            if _l not in (None, "NOT_TODAY"):
+                continue                            # settled / other-user / skip
+            _dg = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
+            if _dg in _DEST_URBAN_GROUPS:
+                continue                            # urban → no reservation
+            _dir_weight[_direction_key(_it.get("ROUTE", ""))] += _it["WEIGHT"]
+        if len(_dir_weight) > 1:                     # only when directions compete
+            _res_excl = sess["unavailable"] | get_assigned_today()
+            _res_avail = sorted(
+                (float(r["TON"]), str(r["LORRY"]).strip().upper())
+                for _, r in engine.eligible_lorries.iterrows()
+                if float(r["TON"]) > _OUTSTATION_MIN_TON
+                and str(r["LORRY"]).strip().upper() not in _res_excl
+            )
+            for _dk in sorted(_dir_weight, key=lambda k: _dir_weight[k]):
+                _need = _dir_weight[_dk]
+                _free = [(t, p) for t, p in _res_avail if p not in _reserved_lorry]
+                if not _free:
+                    break
+                _fit = [(t, p) for t, p in _free if t * NAIK_FACTOR >= _need]
+                _pick = _fit[0] if _fit else _free[-1]   # tightest that fits, else largest
+                _reserved_lorry[_pick[1]] = _dk
+
         # Session-level capacity tracker so groups can share a lorry when combined
         # weight still fits (e.g. two 0.4T groups sharing VEA2818's 1.07T).
         # Seed session loads from pre-filled items (Case B re-upload)
@@ -3449,6 +3499,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _grp_forbid:
                 excluded = excluded | _grp_forbid
 
+            # ── Per-direction reservation exclusion ───────────────────────────
+            # A lorry reserved for another outstation direction is off-limits to
+            # this group (keeps e.g. BMN3682 free for the KV_NORTH run instead of
+            # being consumed by Pahang). A group may still use a lorry reserved
+            # for ITS OWN direction, or any unreserved lorry.
+            _reserve_excl: set = set()
+            if _reserved_lorry:
+                _grp_dir = _direction_key(route)
+                _reserve_excl = {p for p, dk in _reserved_lorry.items()
+                                 if dk != _grp_dir}
+                if _reserve_excl:
+                    excluded = excluded | _reserve_excl
+
             # ── Preferred lorry enforcement (runs BEFORE size exclusions) ─────
             # Preferred lorries bypass the standard size-minimum rules because
             # they are operationally designated for that corridor (e.g. BMN3682
@@ -3679,7 +3742,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid | _reserve_excl
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -3786,7 +3849,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid | _reserve_excl
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -3832,7 +3895,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _grp_forbid
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _grp_forbid | _reserve_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
@@ -5420,7 +5483,13 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
                 if (not _is_urban_r and float(r["TON"]) < _DEST_MIN_TON.get(_dest_grp_r, 0.0))
             }
 
-            _excl = (sess.get("unavailable", set())
+            # A lorry flagged "unavailable" but carrying nothing (0 physical
+            # load) is really idle — often one reserved for this direction — so
+            # it should be usable for these off-schedule DOs. Only keep the
+            # unavailable flag for lorries that actually carry something.
+            _unavail_loaded = {p for p in sess.get("unavailable", set())
+                               if float(_session_loads.get(p, 0)) > 0}
+            _excl = (_unavail_loaded
                      | _state_excl | _size_excl
                      | {p for p, cap in _lorry_cap_map.items()
                         if cap - float(_session_loads.get(p, 0)) < _total_w})
