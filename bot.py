@@ -2153,6 +2153,10 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
 
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
+        # Keep the raw upload so "assign off-schedule DOs" (YES) can re-run the
+        # full assignment with the schedule filter off.
+        if file_bytes and not sess.get("_ignore_schedule"):
+            sess["_upload_bytes"] = file_bytes
         df = pd.read_excel(io.BytesIO(file_bytes))
         # Some exports (e.g. the ZSDOROUTEWRH .xls) put a title/date row above the
         # real header, so row 0 is not the column names. Detect the header row
@@ -2292,8 +2296,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # ── Schedule filter ──────────────────────────────────────────────────
         # User explicitly chose "Today" or "Tomorrow" at login.
         # Routes not on the chosen day's schedule are left blank (NOT_TODAY).
+        # When the user has already said YES to "assign off-schedule DOs too",
+        # the whole assignment is re-run with the schedule filter OFF so every
+        # rule (reservation, geo, same-destination, corridor) applies uniformly
+        # to ALL routes — not just a simplified per-route pass for one route.
         _trip_day       = sess.get("trip_day", "today")
-        _sched_prefixes = _scheduled_prefixes_for_upload(sess.get("user_id", ""), trip_day=_trip_day)
+        if sess.get("_ignore_schedule"):
+            _sched_prefixes = None
+        else:
+            _sched_prefixes = _scheduled_prefixes_for_upload(sess.get("user_id", ""), trip_day=_trip_day)
 
         # Batch-parse all unique REMARKS via Claude (one API call, disk-cached).
         # Falls back silently to the keyword regex when no API key is set.
@@ -5431,6 +5442,22 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
             sess["state"] = "CONFIRMING"
             return _build_summary(sess)
 
+        # Preferred path: re-run the FULL assignment with the schedule filter
+        # OFF, so EVERY rule (per-direction reservation, geo clustering,
+        # same-destination, corridor combining, size caps, forbidden plates)
+        # applies uniformly to ALL off-schedule routes — not just a simplified
+        # single-suggest pass for one route.
+        _bytes = sess.get("_upload_bytes")
+        if _bytes:
+            sess["_ignore_schedule"] = True
+            try:
+                _msgs = _handle_excel_upload(phone, sess, _bytes)
+            finally:
+                sess["_ignore_schedule"] = False
+            return _msgs
+
+        # Fallback (no stored upload): assign off-schedule DOs with the simpler
+        # per-route pass below.
         # Clear NOT_TODAY marker so items are treated as unassigned
         for it in not_today_items:
             it["LORRY"] = None
