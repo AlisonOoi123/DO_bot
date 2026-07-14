@@ -3259,14 +3259,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # DOs get the first lorry so older orders always ship first).
                     # group_items is already date-sorted from the pre-sort above.
                     _cap1 = max(_avail_caps) if _avail_caps else 0
+                    # Split by DESTINATION cluster (same state+city+GPS stays
+                    # whole) so one physical drop is never cut across the two
+                    # halves. Clusters keep their earliest-date order.
+                    def _hs_key(_it):
+                        _la, _lo = _it.get("GPS_LAT"), _it.get("GPS_LON")
+                        return (str(_it.get("STATE", "")).strip().upper(),
+                                str(_it.get("CITY", "")).strip().upper(),
+                                round(_la, 4) if _la is not None else None,
+                                round(_lo, 4) if _lo is not None else None)
+                    _hs_clusters: dict = {}
+                    for _it in group_items:   # already sorted earliest-first
+                        _hs_clusters.setdefault(_hs_key(_it), []).append(_it)
                     half_a, half_b = [], []
                     _fill_w = 0.0
-                    for _it in group_items:   # already sorted earliest-first
-                        if _fill_w + _it["WEIGHT"] <= _cap1:
-                            half_a.append(_it)
-                            _fill_w += _it["WEIGHT"]
+                    for _cl in _hs_clusters.values():
+                        _cw = sum(x["WEIGHT"] for x in _cl)
+                        if _fill_w + _cw <= _cap1 * 1.05 or not half_a:
+                            half_a.extend(_cl)
+                            _fill_w += _cw
                         else:
-                            half_b.append(_it)
+                            half_b.extend(_cl)
                     _assign_group(half_a)
                     _assign_group(half_b)
                     # Propagate back to _all_group items that were pre-filtered NO_LORRY
@@ -3708,11 +3721,50 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     remain = round(remain - cap, 6)
 
                 if remain <= 0 and bins:
-                    # Distribute items into bins (each item → one bin, heaviest first)
+                    # Distribute items into bins. First place whole SAME-DESTINATION
+                    # clusters (same route+state+city+GPS) into one bin so a single
+                    # drop is never split across lorries unless it exceeds one lorry
+                    # (same-route clusters may use the ×NAIK overage). Then place any
+                    # remaining items individually, heaviest-first.
                     item_bin2: dict[str, str] = {}
                     max_bin_cap = max(b["remain"] + sum(
                         x["W"] for x in b["rows"]) for b in bins) if bins else 0
+
+                    def _bp_dest_key(_it):
+                        _la, _lo = _it.get("GPS_LAT"), _it.get("GPS_LON")
+                        return (str(_it.get("ROUTE", "")).strip().upper(),
+                                str(_it.get("STATE", "")).strip().upper(),
+                                str(_it.get("CITY", "")).strip().upper(),
+                                round(_la, 4) if _la is not None else None,
+                                round(_lo, 4) if _lo is not None else None)
+
+                    _bp_clusters: dict = {}
+                    for it in group_items:
+                        _bp_clusters.setdefault(_bp_dest_key(it), []).append(it)
+                    _placed_ids: set = set()
+                    # Heaviest cluster first; try to seat the whole cluster in one bin.
+                    for _cl in sorted(_bp_clusters.values(),
+                                      key=lambda c: -sum(x["WEIGHT"] for x in c)):
+                        if len(_cl) < 2:
+                            continue                 # singletons handled below
+                        _cw = sum(x["WEIGHT"] for x in _cl)
+                        _cmax = min((x["MAX_TON"] for x in _cl if x.get("MAX_TON") is not None),
+                                    default=None)
+                        for bin_ in bins:
+                            _blc = float(_lorry_cap_map.get(bin_["lorry"], 0))
+                            if _cmax is not None and _blc > _cmax:
+                                continue
+                            _bused = sum(x["W"] for x in bin_["rows"])
+                            if _bused + _cw <= _blc * NAIK_FACTOR + 0.001:
+                                for it in _cl:
+                                    bin_["rows"].append({"DO": it["DO NUMBER"], "W": it["WEIGHT"]})
+                                    bin_["remain"] -= it["WEIGHT"]
+                                    item_bin2[it["DO NUMBER"]] = bin_["lorry"]
+                                    _placed_ids.add(it["DO NUMBER"])
+                                break
                     for it in sorted(group_items, key=lambda x: x["WEIGHT"], reverse=True):
+                        if it["DO NUMBER"] in _placed_ids:
+                            continue
                         placed = False
                         for bin_ in bins:
                             # Skip bins whose lorry exceeds this item's REMARKS size cap
@@ -4949,6 +5001,69 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         sess["assigned"][_x["DO NUMBER"]] = _pick
                         _unassigned_reasons.pop(_x["DO NUMBER"], None)
                     _vphys[_pick] += _cw
+
+        # ── Same-destination consolidation (highest grouping priority) ────────
+        # DOs at the SAME physical destination — same route code + state + city +
+        # longitude/GPS — are one drop and must ride ONE lorry, never split,
+        # provided they fit (same-route load may use the ×1.05 NAIK overage).
+        # Applies to ALL routes (urban and outstation). Respects size cap,
+        # outstation minimum and forbidden plates.
+        _dd_phys: dict[str, float] = defaultdict(float)
+        _dest_groups: dict = defaultdict(lambda: defaultdict(list))  # destkey→lorry→items
+        for _it in items:
+            _l = _it.get("LORRY")
+            if _l in _GEO_VALID:
+                continue
+            _dd_phys[_l] += _it["WEIGHT"]
+            _g = _gps_of(_it)
+            _dk = (_rcode(_it),
+                   str(_it.get("STATE", "")).strip().upper(),
+                   str(_it.get("CITY", "")).strip().upper(),
+                   round(_g[0], 4) if _g else None,
+                   round(_g[1], 4) if _g else None)
+            _dest_groups[_dk][_l].append(_it)
+
+        for _dk, _lor_map in _dest_groups.items():
+            if len(_lor_map) < 2:
+                continue                          # already on one lorry
+            _all_it = [_x for _l in _lor_map for _x in _lor_map[_l]]
+            _grp_w = sum(_x["WEIGHT"] for _x in _all_it)
+            _mt = min((_x["MAX_TON"] for _x in _all_it if _x.get("MAX_TON") is not None),
+                      default=None)
+            _dmin = max(_DEST_MIN_TON.get(
+                _classify_dest_group(_x.get("ROUTE", ""), _x.get("STATE", "")), 0.0)
+                for _x in _all_it)
+            _forbid = set()
+            for _x in _all_it:
+                if _x.get("FORBID_PLATES"):
+                    _forbid |= _x["FORBID_PLATES"]
+            # target = the lorry already holding the most of this destination
+            _pick = None
+            for _tgt in sorted(_lor_map, key=lambda l: -sum(x["WEIGHT"] for x in _lor_map[l])):
+                _tcap = float(_lorry_cap_map.get(_tgt, 0))
+                _new = _dd_phys[_tgt] + _grp_w - sum(_x["WEIGHT"] for _x in _lor_map.get(_tgt, []))
+                if _new > _tcap * NAIK_FACTOR:
+                    continue                      # would overload even with naik
+                if _mt is not None and _tcap > _mt:
+                    continue
+                if _tcap < _dmin:
+                    continue
+                if _tgt in _forbid:
+                    continue
+                _pick = _tgt
+                break
+            if _pick is None:
+                continue                          # doesn't fit one lorry → keep split
+            for _src, _sitems in list(_lor_map.items()):
+                if _src == _pick:
+                    continue
+                _mw = sum(_x["WEIGHT"] for _x in _sitems)
+                for _x in _sitems:
+                    _x["LORRY"] = _pick
+                    sess["assigned"][_x["DO NUMBER"]] = _pick
+                    _unassigned_reasons.pop(_x["DO NUMBER"], None)
+                _dd_phys[_pick] += _mw
+                _dd_phys[_src] -= _mw
 
         # ── Same-route consolidation ──────────────────────────────────────────
         # Pull scattered stops of ONE route code together so a route is not split
