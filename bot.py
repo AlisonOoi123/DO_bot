@@ -5375,7 +5375,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return False
                 if _cand in _cforbid:
                     return False
-                _rstates = _session_lorry_states.get(_cand, set())
+                _rstates = {str(y.get("STATE", "")).strip().upper()
+                            for y in items if y.get("LORRY") == _cand and y.get("STATE")}
                 if (_rstates and _cstates and not any(
                         _states_compatible(_a, _b)
                         for _a in _cstates for _b in _rstates)):
@@ -5423,6 +5424,141 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _unassigned_reasons.pop(x["DO NUMBER"], None)
                     _session_loads[_tgt] = float(_session_loads.get(_tgt, 0)) + x["WEIGHT"]
             _record_lorry_state(_tgt, next(iter(_cstates), ""))
+
+        # ── OUTSTATION ROUTE CONSOLIDATION ────────────────────────────────────
+        # An outstation route (Kuantan/Pahang/…) should ride the FEWEST big
+        # lorries and obey its minimum tonnage (LARGE_LONG needs >11T). If a
+        # route is split, consolidate it onto ONE lorry that holds its whole
+        # weight and meets the min — preferring a current holder, else the
+        # tightest-fitting eligible lorry. Fixes an outstation stub stranded on
+        # a too-small lorry and frees that lorry / raises utilisation.
+        _or_phys: dict[str, float] = defaultdict(float)
+        for _it in items:
+            if _it.get("LORRY") in _lorry_cap_map:
+                _or_phys[_it["LORRY"]] += _it["WEIGHT"]
+        _out_routes: dict = {}
+        for _it in items:
+            if (_it.get("LORRY") in _lorry_cap_map
+                    and _classify_dest_group(_it.get("ROUTE", ""),
+                                             _it.get("STATE", "")) not in _DEST_URBAN_GROUPS):
+                _out_routes.setdefault(_rcode(_it), []).append(_it)
+        for _rc, _rits in _out_routes.items():
+            _lset = {x["LORRY"] for x in _rits}
+            if len(_lset) < 2:
+                continue                          # already on one lorry
+            _rw = sum(x["WEIGHT"] for x in _rits)
+            _dg = _classify_dest_group(_rits[0].get("ROUTE", ""), _rits[0].get("STATE", ""))
+            _dmin = _DEST_MIN_TON.get(_dg, _OUTSTATION_MIN_TON)
+            _rmt = min((x["MAX_TON"] for x in _rits
+                        if x.get("MAX_TON") is not None), default=None)
+            _rforbid: set = set()
+            for x in _rits:
+                if x.get("FORBID_PLATES"):
+                    _rforbid |= x["FORBID_PLATES"]
+
+            def _out_fits(_cand):
+                _cap = float(_lorry_cap_map.get(_cand, 0))
+                if _cap < _dmin:
+                    return False
+                if _rmt is not None and _cap > _rmt:
+                    return False
+                if _cand in _rforbid:
+                    return False
+                _here = sum(x["WEIGHT"] for x in _rits if x["LORRY"] == _cand)
+                if _or_phys[_cand] - _here + _rw > _cap * NAIK_FACTOR:
+                    return False
+                _other = [_pt_of(x) for x in items
+                          if x.get("LORRY") == _cand and _rcode(x) != _rc and _pt_of(x)]
+                _add = [_pt_of(x) for x in _rits if _pt_of(x)]
+                return _lorry_geo_ok(_other + _add)
+
+            _tgt = None
+            for _cand in sorted(_lset, key=lambda l: -sum(
+                    x["WEIGHT"] for x in _rits if x["LORRY"] == l)):
+                if _out_fits(_cand):
+                    _tgt = _cand
+                    break
+            if _tgt is None:
+                for _cand in sorted(_lorry_cap_map, key=lambda l: float(_lorry_cap_map[l])):
+                    if _cand in _lset:
+                        continue
+                    if _out_fits(_cand):
+                        _tgt = _cand
+                        break
+            if _tgt is not None:
+                for x in _rits:
+                    if x["LORRY"] != _tgt:
+                        _or_phys[x["LORRY"]] -= x["WEIGHT"]
+                        _or_phys[_tgt] += x["WEIGHT"]
+                        x["LORRY"] = _tgt
+                        sess["assigned"][x["DO NUMBER"]] = _tgt
+                        _unassigned_reasons.pop(x["DO NUMBER"], None)
+                        _session_loads[_tgt] = float(_session_loads.get(_tgt, 0)) + x["WEIGHT"]
+                _record_lorry_state(_tgt, next(
+                    (x.get("STATE", "").strip().upper() for x in _rits if x.get("STATE")), ""))
+                continue
+
+            # Whole route fits no single lorry (capacity, or a per-stop plate
+            # forbid on the only big lorry). Lift the WHOLE route off its current
+            # lorries and re-pack its ATOMIC components (same GPS / same route+
+            # customer stay whole) across valid big lorries (cap ≥ dmin) — each
+            # component onto the emptiest lorry it may use (not forbidden, and
+            # empty of OTHER routes so directions never mix). This can move the
+            # non-forbidding bulk onto an idle big lorry, freeing the incumbent
+            # for a plate-forbidding stop. If a component finds no valid home it
+            # is restored to its original lorry (never stranded worse than start).
+            _valid = [p for p in _lorry_cap_map
+                      if float(_lorry_cap_map[p]) >= _dmin
+                      and (_rmt is None or float(_lorry_cap_map[p]) <= _rmt)]
+            _comps_r = _atomic_components(_rits, _rcode, _gps_of,
+                                          lambda x: x.get("CODE", ""))
+            _orig = {id(x): x["LORRY"] for x in _rits}
+            # set the route aside: remove its weight from the running loads
+            for x in _rits:
+                _or_phys[x["LORRY"]] -= x["WEIGHT"]
+                x["LORRY"] = None
+            _cids_all = {id(x) for x in _rits}
+            for _comp in sorted(_comps_r, key=lambda c: -sum(x["WEIGHT"] for x in c)):
+                _cw = sum(x["WEIGHT"] for x in _comp)
+                _cfp: set = set()
+                for x in _comp:
+                    if x.get("FORBID_PLATES"):
+                        _cfp |= x["FORBID_PLATES"]
+                _best = None
+                _best_free = -1.0
+                for _cand in _valid:
+                    if _cand in _cfp:
+                        continue
+                    # only an empty lorry or one already holding THIS route (no
+                    # other route direction) — never mix outstation with urban.
+                    _cand_routes = {_rcode(y) for y in items
+                                    if y.get("LORRY") == _cand and id(y) not in _cids_all}
+                    if _cand_routes and _cand_routes != {_rc}:
+                        continue
+                    _free = float(_lorry_cap_map[_cand]) * NAIK_FACTOR - _or_phys[_cand]
+                    if _free < _cw:
+                        continue
+                    _other = [_pt_of(y) for y in items
+                              if y.get("LORRY") == _cand and id(y) not in _cids_all and _pt_of(y)]
+                    if not _lorry_geo_ok(_other + [_pt_of(x) for x in _comp if _pt_of(x)]):
+                        continue
+                    if _free > _best_free:
+                        _best_free = _free
+                        _best = _cand
+                _dest = _best
+                if _dest is None:                 # restore to original lorry
+                    for x in _comp:
+                        x["LORRY"] = _orig[id(x)]
+                        _or_phys[x["LORRY"]] += x["WEIGHT"]
+                    continue
+                for x in _comp:
+                    x["LORRY"] = _dest
+                    sess["assigned"][x["DO NUMBER"]] = _dest
+                    _unassigned_reasons.pop(x["DO NUMBER"], None)
+                    _or_phys[_dest] += x["WEIGHT"]
+                    _session_loads[_dest] = float(_session_loads.get(_dest, 0)) + x["WEIGHT"]
+                _record_lorry_state(_dest, next(
+                    (x.get("STATE", "").strip().upper() for x in _comp if x.get("STATE")), ""))
 
         # ── URBAN >11T DE-CONCENTRATION ───────────────────────────────────────
         # Urban (KL / Selangor) routes visit many closely-spaced small drops; a
@@ -5486,7 +5622,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                             continue
                         if _r in _cforbid:
                             continue
-                        _rstates = _session_lorry_states.get(_r, set())
+                        _rstates = {str(y.get("STATE", "")).strip().upper()
+                                    for y in items if y.get("LORRY") == _r and y.get("STATE")}
                         if (_rstates and _cstates and not any(
                                 _states_compatible(_a, _b)
                                 for _a in _cstates for _b in _rstates)):
@@ -5683,8 +5820,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _l not in _audit_owner:
                 _reason = "OWNER_ISOLATION"
             # Rule A2 — outstation minimum tonnage (≤5T never outstation)
-            elif _dg not in _DEST_URBAN_GROUPS and _lt < _OUTSTATION_MIN_TON:
-                _reason = "OUTSTATION_NEEDS_>5T"
+            elif _dg not in _DEST_URBAN_GROUPS and _lt < _DEST_MIN_TON.get(_dg, _OUTSTATION_MIN_TON):
+                # Far outstation (LARGE_LONG) needs >11T; nearer (MEDIUM_LONG) >5T.
+                _reason = f"OUTSTATION_NEEDS_>{_DEST_MIN_TON.get(_dg, _OUTSTATION_MIN_TON):.0f}T"
             # Rule A5 — REMARKS / SHIP_DETAIL size cap (incl. MAX 2 TON → van)
             elif _it.get("MAX_TON") is not None and _lt > _it["MAX_TON"]:
                 _reason = "SIZE_CAP_EXCEEDED"

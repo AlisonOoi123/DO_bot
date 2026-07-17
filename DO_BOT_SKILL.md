@@ -22,10 +22,19 @@ be overridden by optimisation or utilisation goals.
 1. **Owner isolation.** The logged-in user (ABI or VIVIAN) may only be assigned
    lorries they own **plus SPARE** lorries. A DO whose route belongs to the
    other user is left blank (`OTHER_USER`) — never assigned.
-2. **Outstation minimum tonnage.** A lorry ≤ 5 T (rated `TON` ≤ 5.001) can
-   **never** serve an outstation route. It may only serve urban KL / Selangor
-   routes. Outstation = any route whose destination group is LARGE_LONG or
-   MEDIUM_LONG (Pahang, Johor, NS, Perak, Terengganu, …).
+2. **Outstation minimum tonnage.** Outstation = any route whose destination
+   group is LARGE_LONG or MEDIUM_LONG. The minimum lorry size depends on which:
+   - **Far outstation (LARGE_LONG:** Kuantan, Pahang, Johor, Perak, Terengganu,
+     Kelantan, …) must use a lorry **> 11 T**.
+   - **Nearer outstation (MEDIUM_LONG:** NS/Seremban, KV01A north / Rawang-
+     Serendah direction) must use a lorry **> 5 T** (so an 8–9 T lorry such as
+     BMN3682 can still serve KV01A).
+   A lorry below the applicable minimum can never serve that outstation route.
+   Each outstation route is also consolidated onto the fewest big lorries: a
+   whole route rides ONE big lorry when it fits; if a per-stop plate forbid or
+   capacity prevents that, its atomic components are re-packed across valid big
+   lorries of the SAME direction (never mixed with urban), splitting only when
+   unavoidable.
 3. **VAN class.** A lorry under 2 T is the *van* class. Used for DOs that
    explicitly require a van (see Section D).
 4. **Small-lorry class.** A lorry under 5 T is the *small lorry* class.

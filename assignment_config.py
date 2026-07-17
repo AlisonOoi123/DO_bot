@@ -74,9 +74,14 @@ TINY_ITEM_AVG_WEIGHT_T = 0.15   # 150 kg
 # ── Destination group minimum tonnage ────────────────────────────────────────
 # Minimum lorry tonnage (TON) required per destination group.
 # 0.0 = any size allowed (urban); 5.001 = outstation (small lorries excluded).
+# Far outstation (LARGE_LONG: Kuantan / Pahang / Perak / Johor / Terengganu …)
+# must use a lorry OVER 11 T. Nearer outstation (MEDIUM_LONG: KV01A north /
+# Rawang-Serendah direction) keeps the >5 T minimum so an 8-9 T lorry (e.g.
+# BMN3682 for KV01A) can still serve it.
+LARGE_LONG_MIN_TON    = 11.001
 DEST_MIN_TON: dict[str, float] = {
-    "LARGE_LONG":  OUTSTATION_MIN_TON,   # Pahang / TR / JH / PK / …
-    "MEDIUM_LONG": OUTSTATION_MIN_TON,   # NS / Seremban / KV01A direction
+    "LARGE_LONG":  LARGE_LONG_MIN_TON,   # Pahang / TR / JH / PK / … — must be >11T
+    "MEDIUM_LONG": OUTSTATION_MIN_TON,   # NS / Seremban / KV01A direction — >5T
     "KL":          0.0,                  # Kuala Lumpur urban — any size
     "SELANGOR":    0.0,                  # Selangor urban — any size
     "KL_SELANGOR": 0.0,                  # generic urban fallback — any size
