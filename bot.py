@@ -29,6 +29,7 @@ from assignment_config import (
     CROSS_BEARING_LIMIT as _CROSS_BEARING_LIMIT,
     MAX_CITY_MERGE_KM_OUTSTATION as _MAX_CITY_MERGE_KM_OUTSTATION,
     MAX_GEO_GAP_DEG        as _MAX_GEO_GAP_DEG,
+    URBAN_MERGE_SPREAD_DEG as _URBAN_MERGE_SPREAD,
     # Destination classification
     DEST_MIN_TON         as _DEST_MIN_TON,
     DEST_LARGE_LONG_CLUSTERS  as _DEST_LARGE_LONG_CLUSTERS,
@@ -2496,6 +2497,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "FORBID_PLATES": _forbid_plates,
             })
 
+        # ── Infer missing GPS from same-city (then same-postcode) neighbours ──
+        # Some DOs arrive with a blank LONGITUD. Without coordinates a DO can't
+        # be geo-separated and may wrongly ride a far lorry (e.g. a Semenyih DO
+        # with no GPS landing on a Rawang lorry). Fill each missing coordinate
+        # from the mean GPS of other DOs in this SAME upload that share its CITY
+        # (fallback: its POSCODE) and do have GPS — data-driven, no hardcoding.
+        def _norm_key(_it, _field):
+            return str(_it.get(_field, "")).strip().upper()
+        _city_gps: dict = {}
+        _pc_gps: dict = {}
+        for _it in items:
+            if _it.get("GPS_LAT") is not None and _it.get("GPS_LON") is not None:
+                _city_gps.setdefault(_norm_key(_it, "CITY"), []).append(
+                    (_it["GPS_LAT"], _it["GPS_LON"]))
+                _pc_gps.setdefault(_norm_key(_it, "POSCODE"), []).append(
+                    (_it["GPS_LAT"], _it["GPS_LON"]))
+        for _it in items:
+            if _it.get("GPS_LAT") is None or _it.get("GPS_LON") is None:
+                _pool = (_city_gps.get(_norm_key(_it, "CITY"))
+                         or _pc_gps.get(_norm_key(_it, "POSCODE")))
+                if _pool:
+                    _it["GPS_LAT"] = sum(p[0] for p in _pool) / len(_pool)
+                    _it["GPS_LON"] = sum(p[1] for p in _pool) / len(_pool)
+                    _it["GPS_INFERRED"] = True
+
         # Sort eligible items by DATE ascending so oldest pending DOs are
         # assigned lorries first. Items already settled (NOT_TODAY/OTHER_USER/
         # pre-filled plate) sort last so they don't displace pending DOs.
@@ -4955,7 +4981,23 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if _nb not in _seen:
                         _seen.add(_nb)
                         _stack.append(_nb)
-            return len(_seen) == _n
+            if len(_seen) != _n:
+                return False
+            # ── Urban anti-chaining (consider longitude, not just adjacency) ──
+            # Single-linkage alone lets a chain of close stops bridge two far
+            # urban zones (e.g. central KL → Rawang, or Semenyih → KL). For
+            # URBAN stops of DIFFERENT route codes, also bound the overall
+            # SPREAD: no two different-route urban stops may be more than
+            # _URBAN_MERGE_SPREAD apart. Same route code stays atomic (any
+            # distance), so a legitimate multi-town route is never broken.
+            _urb = [_p for _p in _pts
+                    if _p[3] in _URBAN_COMPATIBLE_STATES and _p[0] is not None]
+            for _i in range(len(_urb)):
+                for _j in range(_i + 1, len(_urb)):
+                    if (_urb[_i][2] != _urb[_j][2]
+                            and _geo_deg(_urb[_i][:2], _urb[_j][:2]) > _URBAN_MERGE_SPREAD):
+                        return False
+            return True
 
         # Split each lorry into GPS-connected clusters (single linkage under
         # _GEO_GAP + same state); keep the heaviest cluster, detach the rest.
@@ -5000,6 +5042,43 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 for _i in _comp:
                     _its[_i]["LORRY"] = "NO_LORRY"
                     _detached.append(_its[_i])
+            # ── Urban complete-linkage refinement (anti-chaining) ─────────────
+            # A single connected component can still bridge two far urban zones
+            # through a chain of close stops (central KL → Rawang, Semenyih →
+            # KL). Within the kept component, no two DIFFERENT-route urban stops
+            # may exceed _URBAN_MERGE_SPREAD. While one does, detach the LIGHTER
+            # of the two offending route codes (route code stays atomic) and
+            # re-home it. This enforces the spread by longitude, not just by the
+            # single-linkage chain.
+            _kept = list(_comps[0])
+            while True:
+                _worst = 0.0
+                _pair = None
+                for _a in _kept:
+                    for _b in _kept:
+                        if _a < _b:
+                            _pa, _pb = _pts[_a], _pts[_b]
+                            if (_pa[2] != _pb[2]
+                                    and _pa[3] in _URBAN_COMPATIBLE_STATES
+                                    and _pb[3] in _URBAN_COMPATIBLE_STATES):
+                                _dd = _geo_deg(_pa[:2], _pb[:2])
+                                if _dd > _worst:
+                                    _worst = _dd
+                                    _pair = (_a, _b)
+                if _pair is None or _worst <= _URBAN_MERGE_SPREAD:
+                    break
+                _ra, _rb = _pts[_pair[0]][2], _pts[_pair[1]][2]
+                _wa = sum(_its[i]["WEIGHT"] for i in _kept if _pts[i][2] == _ra)
+                _wb = sum(_its[i]["WEIGHT"] for i in _kept if _pts[i][2] == _rb)
+                _drop = _ra if _wa <= _wb else _rb
+                _new_kept = []
+                for _i in _kept:
+                    if _pts[_i][2] == _drop:
+                        _its[_i]["LORRY"] = "NO_LORRY"
+                        _detached.append(_its[_i])
+                    else:
+                        _new_kept.append(_i)
+                _kept = _new_kept
 
         if _detached:
             # Recompute physical loads and each lorry's current point tuples.

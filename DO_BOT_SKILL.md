@@ -125,11 +125,19 @@ A lorry's stops must form ONE connected cluster:
   wrong coordinate is still separated.
 - **Urban anti-chaining (longitude-aware).** Single-linkage alone can let a
   string of close stops *bridge* two far urban zones (e.g. central KL → Rawang,
-  or Semenyih → KL). So for URBAN stops of **different** route codes, the
-  overall spread is also bounded: no two different-route urban stops may be more
-  than `URBAN_MERGE_SPREAD_DEG` (0.29°) apart. Same route code stays atomic (any
-  distance). Result: Rawang may share a lorry with nearby Batu Caves, but never
-  with far Kajang or central KL.
+  Kajang → Rawang, or Semenyih → KL). So for URBAN stops of **different** route
+  codes, the overall spread is also bounded: no two different-route urban stops
+  may be more than `URBAN_MERGE_SPREAD_DEG` (0.25° ≈ 28 km) apart. Same route
+  code stays atomic (any distance). This is enforced in BOTH the merge/move
+  paths (`_lorry_geo_ok`) AND the geo-enforcement split pass, which applies
+  **complete-linkage**: within a kept cluster it detaches the lighter offending
+  route code until no cross-route urban pair exceeds the cap, then re-homes it.
+  Result: Rawang may share a lorry with nearby Batu Caves, but never with far
+  Kajang, Semenyih, or central KL.
+- **Missing-GPS inference.** A DO that arrives with a blank LONGITUD is given
+  coordinates from the mean GPS of other DOs in the SAME upload sharing its CITY
+  (fallback: POSCODE). Without this a no-GPS DO can't be geo-separated and may
+  wrongly ride a far lorry (e.g. a Semenyih DO landing on a Rawang lorry).
 
 VAN priority: all VAN-remark DOs are pooled ACROSS routes, clustered by the same
 0.29° single-linkage rule, and packed onto a ≤ 2 T van together.

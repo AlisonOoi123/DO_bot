@@ -48,6 +48,13 @@ DEPOT_LON  = 101.5563
 # routes — items too far from their neighbours are moved to another lorry.
 MAX_GEO_GAP_DEG               = 0.29
 
+# Urban anti-chaining cap. Single-linkage under MAX_GEO_GAP_DEG lets a chain of
+# close stops bridge two far urban zones (e.g. central KL → Rawang, Semenyih →
+# KL). For URBAN stops of DIFFERENT route codes, the overall spread (max
+# straight-line distance between any two) may not exceed this. Same route code
+# stays atomic (any distance), so a legitimate multi-town route is never split.
+URBAN_MERGE_SPREAD_DEG        = 0.25
+
 CROSS_BEARING_LIMIT           = 90.0   # max bearing diff (°) for same-direction merge
 MAX_CITY_MERGE_KM_OUTSTATION  = 60.0   # max GPS distance (km) when merging outstation city clusters
 OUTSTATION_DIST_KM            = 50.0   # routes ≥ this distance from depot are "outstation"
