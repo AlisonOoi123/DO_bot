@@ -71,6 +71,20 @@ we achieve Principle 5 (full utilisation) without hardcoding.
 Same route code always rides one lorry (however many cities it spans) **as long
 as the stops form one connected GPS cluster** — see Section C.
 
+**Split priority (when a load must be divided across lorries), in order:**
+1. **Same longitude → same lorry.** DOs at the same GPS point are never split.
+2. **Same route + same customer (CODE, column D) → same lorry.** Never split.
+3. **Same route, different customer → prefer the same lorry** (may split only
+   when capacity forces it).
+4. **Fully utilise gross weight** — pack the fixed atomic units (1 & 2) to fill
+   each lorry as much as possible.
+
+Criteria 1 and 2 are enforced as inseparable *atomic units*: every split path
+(heavy-group half-split, urban de-concentration) moves whole units only, and a
+final **reunification pass** pulls back onto one lorry any atomic unit that an
+earlier pass left split — adding a lorry if needed rather than breaking the
+unit. A unit is only left split when no single lorry in the fleet can hold it.
+
 ### Principle 4 — Read SHIP_DETAIL for the size preference.
 SHIP_DETAIL format: `<days>, [AM|PM], MAX <N> TON` (any part optional).
 - `MAX N TON` = the largest lorry the customer can receive. Within that ceiling,

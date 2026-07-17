@@ -672,6 +672,59 @@ def _states_compatible(s1: str, s2: str) -> bool:
         return True
     return False
 
+def _atomic_components(item_list, rcode_fn, gps_fn, code_fn):
+    """Split-atomicity grouping, in operator priority order. When a load must be
+    split across lorries, two DOs must NEVER be separated if they share:
+      1. the same GPS longitude/point            → "same longitud, same lorry"
+      2. the same route code AND customer CODE    → "same route + same customer,
+                                                     same lorry"
+    (Same route but DIFFERENT customer — criterion 3 — is only a *preference*:
+    those may ride together but may be split when capacity forces it, so they
+    are NOT unioned here; callers keep same-route components together on a
+    best-effort basis. Criterion 4, full weight utilisation, is the packer's
+    job once these atomic units are fixed.)
+
+    Union-find over the two hard keys returns a list of inseparable component
+    lists; any split (heavy-group half-split, urban de-concentration) moves
+    whole components only, so criteria 1 and 2 are never broken."""
+    parent = list(range(len(item_list)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_routecode: dict = {}   # (route code, customer CODE) → same lorry
+    by_gps: dict = {}         # exact GPS point → same lorry
+    for i, it in enumerate(item_list):
+        by_routecode.setdefault((rcode_fn(it), str(code_fn(it)).strip().upper()),
+                                []).append(i)
+        g = gps_fn(it)
+        if g and g[0] is not None and g[1] is not None:
+            by_gps.setdefault((round(g[0], 4), round(g[1], 4)), []).append(i)
+    for grp in list(by_routecode.values()) + list(by_gps.values()):
+        for k in grp[1:]:
+            union(grp[0], k)
+    comps: dict = {}
+    for i, it in enumerate(item_list):
+        comps.setdefault(find(i), []).append(it)
+    return list(comps.values())
+
+
+def _route_code_of(it) -> str:
+    """Canonical route code ('KV12A', 'PH03', …) — module-level twin of the
+    nested _rcode helper, usable before that closure is defined."""
+    r = str(it.get("ROUTE", "")).strip().upper()
+    m = re.match(r"([A-Z]+\d+[A-Z]?)", r)
+    return m.group(1) if m else r[:6]
+
+
 def _classify_dest_group(route: str, state: str = "") -> str:
     """Return destination group for a route + optional explicit state.
 
@@ -3321,21 +3374,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # DOs get the first lorry so older orders always ship first).
                     # group_items is already date-sorted from the pre-sort above.
                     _cap1 = max(_avail_caps) if _avail_caps else 0
-                    # Split by DESTINATION cluster (same state+city+GPS stays
-                    # whole) so one physical drop is never cut across the two
-                    # halves. Clusters keep their earliest-date order.
-                    def _hs_key(_it):
-                        _la, _lo = _it.get("GPS_LAT"), _it.get("GPS_LON")
-                        return (str(_it.get("STATE", "")).strip().upper(),
-                                str(_it.get("CITY", "")).strip().upper(),
-                                round(_la, 4) if _la is not None else None,
-                                round(_lo, 4) if _lo is not None else None)
-                    _hs_clusters: dict = {}
-                    for _it in group_items:   # already sorted earliest-first
-                        _hs_clusters.setdefault(_hs_key(_it), []).append(_it)
+                    # Split into ATOMIC components first so a split never breaks
+                    # criterion 1 (same longitude) or 2 (same route + same
+                    # customer CODE). Components sharing a route code are kept
+                    # adjacent so same-route DOs (criterion 3) stay together when
+                    # they fit, and each half is filled by weight (criterion 4).
+                    _hs_comps = _atomic_components(
+                        group_items,
+                        _route_code_of,
+                        lambda _it: (_it.get("GPS_LAT"), _it.get("GPS_LON")),
+                        lambda _it: _it.get("CODE", ""))
+                    _hs_comps.sort(key=lambda c: (
+                        _route_code_of(c[0]),
+                        -sum(x["WEIGHT"] for x in c)))
                     half_a, half_b = [], []
                     _fill_w = 0.0
-                    for _cl in _hs_clusters.values():
+                    for _cl in _hs_comps:
                         _cw = sum(x["WEIGHT"] for x in _cl)
                         if _fill_w + _cw <= _cap1 * 1.05 or not half_a:
                             half_a.extend(_cl)
@@ -5200,6 +5254,97 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _lor_map[_src] = []
                     break
 
+        # ── ATOMIC-UNIT REUNIFICATION (criteria 1 & 2) ────────────────────────
+        # No atomic unit may stay split across lorries: (1) same GPS longitude,
+        # (2) same route + customer CODE. Any unit that ended up split (from any
+        # earlier pass, e.g. when its lorries filled up) is pulled back onto ONE
+        # lorry that can hold the whole unit — preferring a lorry already holding
+        # part of it, then the tightest-fitting other eligible lorry with room.
+        # If no single lorry can hold the whole unit (fleet genuinely full), it
+        # is left as-is rather than dropping any DO.
+        _ru_all = [_it for _it in items if _it.get("LORRY") in _lorry_cap_map]
+        _ru_phys: dict[str, float] = defaultdict(float)
+        for _it in _ru_all:
+            _ru_phys[_it["LORRY"]] += _it["WEIGHT"]
+        for _comp in _atomic_components(_ru_all, _rcode, _gps_of,
+                                        lambda x: x.get("CODE", "")):
+            _lset = {x["LORRY"] for x in _comp}
+            if len(_lset) < 2:
+                continue                          # already whole
+            _comp_ids = {id(x) for x in _comp}
+            _cw = sum(x["WEIGHT"] for x in _comp)
+            _cmt = min((x["MAX_TON"] for x in _comp
+                        if x.get("MAX_TON") is not None), default=None)
+            _dmin = max(_DEST_MIN_TON.get(
+                _classify_dest_group(x.get("ROUTE", ""), x.get("STATE", "")), 0.0)
+                for x in _comp)
+            _cforbid: set = set()
+            for x in _comp:
+                if x.get("FORBID_PLATES"):
+                    _cforbid |= x["FORBID_PLATES"]
+            _cstates = {x.get("STATE", "").strip().upper()
+                        for x in _comp if x.get("STATE")}
+
+            def _ru_fits(_cand):
+                _ccap = float(_lorry_cap_map.get(_cand, 0))
+                _here = sum(x["WEIGHT"] for x in _comp if x["LORRY"] == _cand)
+                if _ru_phys[_cand] - _here + _cw > _ccap * NAIK_FACTOR:
+                    return False
+                if _cmt is not None and _ccap > _cmt:
+                    return False
+                if _ccap < _dmin:
+                    return False
+                if _cand in _cforbid:
+                    return False
+                _rstates = _session_lorry_states.get(_cand, set())
+                if (_rstates and _cstates and not any(
+                        _states_compatible(_a, _b)
+                        for _a in _cstates for _b in _rstates)):
+                    return False
+                _other = [_pt_of(x) for x in items
+                          if x.get("LORRY") == _cand and id(x) not in _comp_ids
+                          and _pt_of(x)]
+                _add = [_pt_of(x) for x in _comp if _pt_of(x)]
+                return _lorry_geo_ok(_other + _add)
+
+            # 1st choice: a lorry already holding part (most of it first).
+            _tgt = None
+            for _cand in sorted(_lset,
+                                key=lambda l: -sum(x["WEIGHT"] for x in _comp
+                                                   if x["LORRY"] == l)):
+                if _ru_fits(_cand):
+                    _tgt = _cand
+                    break
+            # 2nd choice: any other eligible lorry, tightest fit that holds it
+            # whole (prefer ≤11T for urban units so a big lorry isn't taken).
+            if _tgt is None:
+                _urban_unit = all(
+                    _classify_dest_group(x.get("ROUTE", ""),
+                                         x.get("STATE", "")) in _DEST_URBAN_GROUPS
+                    for x in _comp)
+                for _cand in sorted(
+                        _lorry_cap_map,
+                        key=lambda l: (0 if (not _urban_unit
+                                             or float(_lorry_cap_map[l]) <= _URBAN_MAX_TON)
+                                       else 1,
+                                       float(_lorry_cap_map[l]))):
+                    if _cand in _lset:
+                        continue
+                    if _ru_fits(_cand):
+                        _tgt = _cand
+                        break
+            if _tgt is None:
+                continue                          # fleet full — leave split
+            for x in _comp:
+                if x["LORRY"] != _tgt:
+                    _ru_phys[x["LORRY"]] -= x["WEIGHT"]
+                    _ru_phys[_tgt] += x["WEIGHT"]
+                    x["LORRY"] = _tgt
+                    sess["assigned"][x["DO NUMBER"]] = _tgt
+                    _unassigned_reasons.pop(x["DO NUMBER"], None)
+                    _session_loads[_tgt] = float(_session_loads.get(_tgt, 0)) + x["WEIGHT"]
+            _record_lorry_state(_tgt, next(iter(_cstates), ""))
+
         # ── URBAN >11T DE-CONCENTRATION ───────────────────────────────────────
         # Urban (KL / Selangor) routes visit many closely-spaced small drops; a
         # lorry over _URBAN_MAX_TON (11 T) cannot physically run that many stops
@@ -5224,21 +5369,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _uc_phys[_it["LORRY"]] += _it["WEIGHT"]
             _small_plates = [p for p, c in _lorry_cap_map.items()
                              if float(c) <= _URBAN_MAX_TON]
+            # route codes each lorry currently carries (for criterion 3 —
+            # keep same-route DOs together on one lorry when possible)
+            _uc_routes: dict[str, set] = defaultdict(set)
+            for _it in items:
+                if _it.get("LORRY") in _lorry_cap_map:
+                    _uc_routes[_it["LORRY"]].add(_rcode(_it))
             for _big, _bitems in _big_urban.items():
-                # cluster the big lorry's urban items by destination (keep whole)
-                _uclusters: dict = defaultdict(list)
-                for _it in _bitems:
-                    _g = _gps_of(_it)
-                    _ck = (_rcode(_it),
-                           str(_it.get("STATE", "")).strip().upper(),
-                           str(_it.get("CITY", "")).strip().upper(),
-                           round(_g[0], 4) if _g else None,
-                           round(_g[1], 4) if _g else None)
-                    _uclusters[_ck].append(_it)
-                # heaviest cluster first so the biggest chunk leaves the big lorry
-                for _ck, _cit in sorted(_uclusters.items(),
-                                        key=lambda kv: -sum(x["WEIGHT"] for x in kv[1])):
+                # Split the big lorry's urban items into ATOMIC components — same
+                # longitude (1) OR same route+customer CODE (2) stays together and
+                # is never split. Move whole components only, heaviest first.
+                for _cit in sorted(
+                        _atomic_components(_bitems, _rcode, _gps_of,
+                                           lambda x: x.get("CODE", "")),
+                        key=lambda c: -sum(x["WEIGHT"] for x in c)):
                     _cw = sum(x["WEIGHT"] for x in _cit)
+                    _croutes = {_rcode(x) for x in _cit}
                     _cforbid: set = set()
                     for x in _cit:
                         if x.get("FORBID_PLATES"):
@@ -5247,11 +5393,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 for x in _cit if x.get("STATE")}
                     _cmt = min((x["MAX_TON"] for x in _cit
                                 if x.get("MAX_TON") is not None), default=None)
-                    # receiver = ≤11T lorry with the MOST free room (fills the
-                    # emptiest small lorry first, e.g. a near-idle 10T unit)
-                    _best = None
-                    for _r in sorted(_small_plates,
-                                     key=lambda p: -(float(_lorry_cap_map[p]) - _uc_phys[p])):
+                    # Collect every valid ≤11T receiver, then choose by priority:
+                    # (3) a lorry already carrying this route code (keep route
+                    # together), else the one with the MOST free room.
+                    _cands = []
+                    for _r in _small_plates:
                         if _r == _big:
                             continue
                         _rcap = float(_lorry_cap_map[_r])
@@ -5271,16 +5417,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _add = [_pt_of(x) for x in _cit if _pt_of(x)]
                         if not _lorry_geo_ok(_rpts + _add):
                             continue
-                        _best = _r
-                        break
-                    if _best is None:
+                        _cands.append(_r)
+                    if not _cands:
                         continue                      # no ≤11T home — keep on big lorry
+                    _best = min(
+                        _cands,
+                        key=lambda p: (0 if _uc_routes[p] & _croutes else 1,
+                                       -(float(_lorry_cap_map[p]) - _uc_phys[p])))
                     for x in _cit:
                         x["LORRY"] = _best
                         sess["assigned"][x["DO NUMBER"]] = _best
                         _unassigned_reasons.pop(x["DO NUMBER"], None)
                     _uc_phys[_best] += _cw
                     _uc_phys[_big] -= _cw
+                    _uc_routes[_best] |= _croutes
                     _session_loads[_best] = float(_session_loads.get(_best, 0)) + _cw
                     _record_lorry_state(_best, next(iter(_cstates), ""))
 
