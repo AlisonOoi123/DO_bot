@@ -16,8 +16,12 @@ MIN_UTIL_TO_ASSIGN    = 0.10   # Rule 8: don't dispatch if load < 10% capacity (
 MAX_STOPS_PER_LORRY   = 8      # Rule 6: max delivery stops per lorry per day
 MERGE_DIST_THRESHOLD  = 0.25   # Rule 7: reject merge if extra distance > 25%
 
-NAIK_FACTOR           = 1.05   # LORRY NAIK: lorries may carry up to 5% over rated tonnage
-SAME_ROUTE_NAIK       = 1.10   # Same-route loads may use up to 10% overage
+# TON already equals the "LORRY NAIK (5%)" column from LORRY DAILY PLANNING.xlsx
+# (MUATAN sheet) — i.e. the effective MAX load per lorry already includes the 5%
+# naik. So NO further overage is allowed: a lorry may never carry more than its
+# LORRY NAIK (5%) value. Both factors are 1.0 (the hard ceiling is TON itself).
+NAIK_FACTOR           = 1.0    # no overage beyond TON (= LORRY NAIK 5% column)
+SAME_ROUTE_NAIK       = 1.0    # same-route loads also capped at LORRY NAIK (5%)
 REBAL_THRESHOLD       = 0.50   # Partial-transfer rebalance: underloaded threshold
 FILL_TARGET           = CAPACITY_TARGET   # alias used in fill-to-80% pass
 MAX_DOS_PER_LORRY     = 15     # split trigger: groups with > 15 DOs are checked for weight overflow

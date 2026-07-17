@@ -840,10 +840,9 @@ class LorryEngine:
         intel   = _extract_route_intelligence(route)
         cluster = intel["cluster"]
 
-        # Allow up to 2 % over rated capacity for minor rounding/variance.
-        # A tighter tolerance prevents small lorries (e.g. WUD4927 6.77T)
-        # from absorbing a load (e.g. 7.417T) that should go to a larger lorry.
-        _SAME_ROUTE_OVERLOAD = 1.02
+        # TON already IS the "LORRY NAIK (5%)" ceiling from LORRY DAILY
+        # PLANNING.xlsx — no load may exceed it. No extra overage is allowed.
+        _SAME_ROUTE_OVERLOAD = 1.0
         eligible = self.eligible_lorries[
             (self.eligible_lorries["TON"] * _SAME_ROUTE_OVERLOAD >= total_ton) &
             (~self.eligible_lorries["LORRY"].isin(unavailable))

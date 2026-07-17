@@ -3395,7 +3395,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     float(row["TON"]) for _, row in engine.eligible_lorries.iterrows()
                     if row["LORRY"] not in _excl_check
                 )
-                if not any(c * 1.05 >= _pre_total_w for c in _avail_caps):
+                if not any(c * NAIK_FACTOR >= _pre_total_w for c in _avail_caps):
                     # Too heavy for any single lorry — split by DATE (earliest
                     # DOs get the first lorry so older orders always ship first).
                     # group_items is already date-sorted from the pre-sort above.
@@ -3417,7 +3417,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _fill_w = 0.0
                     for _cl in _hs_comps:
                         _cw = sum(x["WEIGHT"] for x in _cl)
-                        if _fill_w + _cw <= _cap1 * 1.05 or not half_a:
+                        if _fill_w + _cw <= _cap1 * NAIK_FACTOR or not half_a:
                             half_a.extend(_cl)
                             _fill_w += _cw
                         else:
@@ -4554,7 +4554,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # Same-route items may fill up to 10 % over rated capacity
                     # so they are never split across lorries unnecessarily.
                     _same_rt = bool(_route_a and _route_a in _routes_b)
-                    _eff_cap_b = _cap_b * (1.10 if _same_rt else 1.0)
+                    _eff_cap_b = _cap_b * (SAME_ROUTE_NAIK if _same_rt else 1.0)
                     if _load_a + _load_b > _eff_cap_b:
                         continue
                     # Score by utilisation GAIN on the destination lorry so that
@@ -4809,7 +4809,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # are never split.  Multi-route lorries use the hard cap exactly.
             _pl_routes = {it.get("ROUTE", "").strip().upper() for it in _pl_items
                           if it.get("ROUTE")}
-            _eff_cap = _cap * (1.10 if len(_pl_routes) == 1 else 1.0)
+            _eff_cap = _cap * (SAME_ROUTE_NAIK if len(_pl_routes) == 1 else 1.0)
             if _total <= _eff_cap:
                 continue
             # Sort by distance from depot — nearest first

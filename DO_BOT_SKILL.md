@@ -32,6 +32,11 @@ be overridden by optimisation or utilisation goals.
 5. **REMARKS / SHIP_DETAIL size cap.** A DO that specifies a maximum lorry size
    must never ride a lorry larger than that cap (see Section D for the exact
    phrases currently enforced).
+5a. **LORRY NAIK ceiling.** A lorry's max load is the `LORRY NAIK (5%)` value in
+   LORRY DAILY PLANNING.xlsx (MUATAN sheet) — the engine loads it as `TON`. A
+   lorry may NEVER carry more than its `LORRY NAIK (5%)` tonnage. No extra
+   overage is applied on top (the 5% naik is already inside that number), so
+   every naik factor in the code is 1.0.
 6. **OUT SOURCE.** A DO whose SHIP_DETAIL contains `OUT SOURCE` is handled by a
    third-party lorry. The bot assigns **no plate** — `LICENSE` stays blank and
    the DO is **not** counted as unassigned.
