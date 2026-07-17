@@ -2361,16 +2361,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _caps_all    = [c for c in (_cap_remarks, _cap_ship) if c is not None]
             _size_cap    = min(_caps_all) if _caps_all else None
 
-            # Urban (KL / Selangor) tonnage ceiling. A lorry larger than
-            # _URBAN_MAX_TON (11 T) cannot serve urban routes: those routes hit
-            # many closely-spaced stops in one trip and a large lorry cannot
-            # physically cover them all in one run. So any DO whose destination
-            # is urban is capped at 11 T. Outstation DOs are unaffected.
-            _dg_cap = _classify_dest_group(route_str, _state_from_row(row))
-            if _dg_cap in _DEST_URBAN_GROUPS:
-                _size_cap = min(_size_cap, _URBAN_MAX_TON) \
-                    if _size_cap is not None else _URBAN_MAX_TON
-
             # Remarks-day filter DISABLED by request: assignment now depends only
             # on the trip day the user selected at login (today/tomorrow) plus the
             # SCHD schedule check above. Delivery-day hints in REMARKS (e.g.
@@ -5209,6 +5199,90 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _lor_map[_tgt].extend(_src_items)
                     _lor_map[_src] = []
                     break
+
+        # ── URBAN >11T DE-CONCENTRATION ───────────────────────────────────────
+        # Urban (KL / Selangor) routes visit many closely-spaced small drops; a
+        # lorry over _URBAN_MAX_TON (11 T) cannot physically run that many stops
+        # in one trip ("only lorry under 11 TON can handle that much routes").
+        # When a >11 T lorry has accumulated urban stops, move as many as
+        # possible onto ≤11 T lorries that have room — keeping same-destination
+        # clusters whole and respecting weight, size cap, state, geo chain and
+        # forbidden plates. Whatever cannot find a ≤11 T home stays put (never
+        # left unassigned). Big lorries are thus freed for heavy / outstation
+        # work, and the many-stop urban runs land on the small lorries.
+        _big_urban: dict[str, list] = defaultdict(list)
+        for _it in items:
+            _l = _it.get("LORRY")
+            if (_l in _lorry_cap_map and float(_lorry_cap_map[_l]) > _URBAN_MAX_TON
+                    and _classify_dest_group(_it.get("ROUTE", ""),
+                                             _it.get("STATE", "")) in _DEST_URBAN_GROUPS):
+                _big_urban[_l].append(_it)
+        if _big_urban:
+            _uc_phys: dict[str, float] = defaultdict(float)
+            for _it in items:
+                if _it.get("LORRY") in _lorry_cap_map:
+                    _uc_phys[_it["LORRY"]] += _it["WEIGHT"]
+            _small_plates = [p for p, c in _lorry_cap_map.items()
+                             if float(c) <= _URBAN_MAX_TON]
+            for _big, _bitems in _big_urban.items():
+                # cluster the big lorry's urban items by destination (keep whole)
+                _uclusters: dict = defaultdict(list)
+                for _it in _bitems:
+                    _g = _gps_of(_it)
+                    _ck = (_rcode(_it),
+                           str(_it.get("STATE", "")).strip().upper(),
+                           str(_it.get("CITY", "")).strip().upper(),
+                           round(_g[0], 4) if _g else None,
+                           round(_g[1], 4) if _g else None)
+                    _uclusters[_ck].append(_it)
+                # heaviest cluster first so the biggest chunk leaves the big lorry
+                for _ck, _cit in sorted(_uclusters.items(),
+                                        key=lambda kv: -sum(x["WEIGHT"] for x in kv[1])):
+                    _cw = sum(x["WEIGHT"] for x in _cit)
+                    _cforbid: set = set()
+                    for x in _cit:
+                        if x.get("FORBID_PLATES"):
+                            _cforbid |= x["FORBID_PLATES"]
+                    _cstates = {x.get("STATE", "").strip().upper()
+                                for x in _cit if x.get("STATE")}
+                    _cmt = min((x["MAX_TON"] for x in _cit
+                                if x.get("MAX_TON") is not None), default=None)
+                    # receiver = ≤11T lorry with the MOST free room (fills the
+                    # emptiest small lorry first, e.g. a near-idle 10T unit)
+                    _best = None
+                    for _r in sorted(_small_plates,
+                                     key=lambda p: -(float(_lorry_cap_map[p]) - _uc_phys[p])):
+                        if _r == _big:
+                            continue
+                        _rcap = float(_lorry_cap_map[_r])
+                        if _uc_phys[_r] + _cw > _rcap * NAIK_FACTOR:
+                            continue
+                        if _cmt is not None and _rcap > _cmt:
+                            continue
+                        if _r in _cforbid:
+                            continue
+                        _rstates = _session_lorry_states.get(_r, set())
+                        if (_rstates and _cstates and not any(
+                                _states_compatible(_a, _b)
+                                for _a in _cstates for _b in _rstates)):
+                            continue
+                        _rpts = [_pt_of(x) for x in items
+                                 if x.get("LORRY") == _r and _pt_of(x)]
+                        _add = [_pt_of(x) for x in _cit if _pt_of(x)]
+                        if not _lorry_geo_ok(_rpts + _add):
+                            continue
+                        _best = _r
+                        break
+                    if _best is None:
+                        continue                      # no ≤11T home — keep on big lorry
+                    for x in _cit:
+                        x["LORRY"] = _best
+                        sess["assigned"][x["DO NUMBER"]] = _best
+                        _unassigned_reasons.pop(x["DO NUMBER"], None)
+                    _uc_phys[_best] += _cw
+                    _uc_phys[_big] -= _cw
+                    _session_loads[_best] = float(_session_loads.get(_best, 0)) + _cw
+                    _record_lorry_state(_best, next(iter(_cstates), ""))
 
         # ── RULES-COMPLIANCE GATE (ASSIGNMENT_RULES.md / DO_BOT_SKILL.md §A) ───
         # Final deterministic audit: every assigned DO must obey the HARD rules.

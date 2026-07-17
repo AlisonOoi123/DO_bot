@@ -168,6 +168,15 @@ change.
 7. **VAN-priority consolidation** — pool all VAN DOs onto the van(s).
 8. **Same-route (urban) consolidation** — pull scattered same-route stops
    together so a route isn't split between a full lorry and a near-empty van.
+9. **Urban >11 T de-concentration** — a lorry over `URBAN_MAX_TON` (11 T)
+   cannot physically run the many closely-spaced small drops of urban
+   (KL / Selangor) routes ("only a lorry under 11 TON can handle that many
+   routes"). This pass moves urban stops off any >11 T lorry onto ≤11 T lorries
+   that have room (same-destination clusters kept whole; weight, size cap,
+   state, geo chain and forbidden plates all respected). It is **best-effort,
+   never lossy**: a cluster with no ≤11 T home stays on the big lorry rather
+   than being left unassigned. Outstation routes are untouched — big lorries
+   are exactly what they need.
 
 ---
 
