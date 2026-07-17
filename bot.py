@@ -970,14 +970,21 @@ def remove_broken_lorry(broken: str):
 
 def clear_daily_log_for_user(engine) -> list[str]:
     """
-    Remove only the plates belonging to this user's engine (owner + SPARE)
-    from today's log. Returns the list of plates actually removed.
+    Remove only the plates the user OWNS EXCLUSIVELY (USER != SPARE) from
+    today's log, so re-uploading recomputes their own lorries. SPARE lorries
+    are shared: one committed by another user's earlier run (e.g. ABI) must
+    stay blocked when this user (e.g. VIVIAN) uploads — never freed here.
+    Returns the list of plates actually removed.
     """
-    user_lorries = set(engine.eligible_lorries["LORRY"].str.upper())
+    el = engine.eligible_lorries
+    if "USER" in el.columns:
+        own_lorries = set(el[el["USER"].astype(str).str.upper() != "SPARE"]["LORRY"].str.upper())
+    else:
+        own_lorries = set(el["LORRY"].str.upper())
     log = _load_daily_log()
     all_plates  = set(log["assigned"])
-    my_plates   = all_plates & user_lorries        # intersection = this user's plates
-    remaining   = sorted(all_plates - my_plates)   # keep other users' plates
+    my_plates   = all_plates & own_lorries         # this user's OWN (non-SPARE) plates
+    remaining   = sorted(all_plates - my_plates)   # keep other users' + all SPARE plates
     log["assigned"] = remaining
     _save_daily_log(log)
     return sorted(my_plates)
@@ -2441,13 +2448,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _lic_key = _existing_lic.lower()
                 if _lic_key and _lic_key not in {"", "nan", "none", "n/a", "-"}:
                     _plate_up = _existing_lic.upper()
-                    # Enforce the REMARKS size cap even on pre-filled rows: a DO
-                    # whose remark demands a small lorry (e.g. "small lorry" → ≤2T)
-                    # must NOT keep a pre-set oversized lorry. Drop the pre-fill so
-                    # it is reassigned to a compliant lorry.
                     _cap_pf = _size_cap
                     _plate_ton_pf = _prefill_cap_map.get(_plate_up)
-                    if (_cap_pf is not None and _plate_ton_pf is not None
+                    if _plate_up in get_assigned_today() or _plate_up in get_broken_lorries():
+                        # The pre-filled lorry was already used on an earlier run
+                        # today (e.g. a SPARE lorry taken by the ABI run before
+                        # this VIVIAN run) — it is BLOCKED. Drop the pre-fill so
+                        # this DO is reassigned to a still-available lorry.
+                        _lorry_init = None
+                    elif _plate_up not in _prefill_cap_map:
+                        # Pre-filled plate is not in THIS user's eligible fleet
+                        # (owner isolation) — drop so it is reassigned.
+                        _lorry_init = None
+                    # Enforce the REMARKS size cap even on pre-filled rows: a DO
+                    # whose remark demands a small lorry (e.g. "small lorry" → ≤2T)
+                    # must NOT keep a pre-set oversized lorry.
+                    elif (_cap_pf is not None and _plate_ton_pf is not None
                             and _plate_ton_pf > _cap_pf):
                         _lorry_init = None
                     else:
@@ -2562,7 +2578,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         sess["items"]      = items          # row-level item list
         sess["raw_df"]     = raw
-        sess["unavailable"] = set()
+        # Seed unavailable with lorries already committed TODAY (e.g. a SPARE
+        # lorry used on an earlier ABI run before this VIVIAN run) plus broken
+        # lorries, so the core assignment never reassigns a blocked lorry.
+        sess["unavailable"] = set(get_assigned_today()) | set(get_broken_lorries())
         sess["assigned"]   = {}             # kept for change/block compat (item ROW_IDX → lorry)
         sess["state"]      = "CONFIRMING"
 
@@ -5333,6 +5352,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _lor_map[_src] = []
                     break
 
+        # Lorries already assigned today (e.g. a SPARE lorry used on the ABI run
+        # before this VIVIAN run) or broken are OFF-LIMITS to every consolidation
+        # / de-concentration / repack pass below — they must never receive a DO.
+        _blocked_today = set(get_assigned_today()) | set(get_broken_lorries())
+
         # ── ATOMIC-UNIT REUNIFICATION (criteria 1 & 2) ────────────────────────
         # No atomic unit may stay split across lorries: (1) same GPS longitude,
         # (2) same route + customer CODE. Any unit that ended up split (from any
@@ -5365,6 +5389,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         for x in _comp if x.get("STATE")}
 
             def _ru_fits(_cand):
+                if _cand in _blocked_today:
+                    return False
                 _ccap = float(_lorry_cap_map.get(_cand, 0))
                 _here = sum(x["WEIGHT"] for x in _comp if x["LORRY"] == _cand)
                 if _ru_phys[_cand] - _here + _cw > _ccap * NAIK_FACTOR:
@@ -5457,6 +5483,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _rforbid |= x["FORBID_PLATES"]
 
             def _out_fits(_cand):
+                if _cand in _blocked_today:
+                    return False
                 _cap = float(_lorry_cap_map.get(_cand, 0))
                 if _cap < _dmin:
                     return False
@@ -5521,7 +5549,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _used_here: set = set()               # lorries this repack has filled
 
             def _may_take(_cand, _comp, _cw, _cfp):
-                if _cand in _cfp:
+                if _cand in _cfp or _cand in _blocked_today:
                     return False
                 # empty lorry, or one already holding ONLY this route — never
                 # mix outstation with urban / a different corridor.
@@ -5620,7 +5648,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # together), else the one with the MOST free room.
                     _cands = []
                     for _r in _small_plates:
-                        if _r == _big:
+                        if _r == _big or _r in _blocked_today:
                             continue
                         _rcap = float(_lorry_cap_map[_r])
                         if _uc_phys[_r] + _cw > _rcap * NAIK_FACTOR:
@@ -5682,6 +5710,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _rc_phys[_it["LORRY"]] += _it["WEIGHT"]
 
         def _route_fits_on(_cand, _rits, _rc, _rw, _rmt, _rforbid):
+            if _cand in _blocked_today:
+                return False
             _cap = float(_lorry_cap_map.get(_cand, 0))
             _here = sum(x["WEIGHT"] for x in _rits if x["LORRY"] == _cand)
             if _rc_phys[_cand] - _here + _rw > _cap * NAIK_FACTOR:
@@ -5755,6 +5785,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 {x["LORRY"] for _r in _urb.values() for x in _r},
                 key=lambda l: -(float(_lorry_cap_map[l]) - _rc_phys[l]))
             for _l in _urb_lorries:
+                if _l in _blocked_today:
+                    continue
                 _free = float(_lorry_cap_map[_l]) * NAIK_FACTOR - _rc_phys[_l]
                 if _free <= 0.05:
                     continue
