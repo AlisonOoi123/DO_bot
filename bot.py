@@ -23,6 +23,7 @@ from assignment_config import (
     # Lorry size
     LORRY_LARGE_MIN_TON, LORRY_SMALL_MAX_TON, LORRY_TINY_EXCL_TON,
     OUTSTATION_MIN_TON as _OUTSTATION_MIN_TON,
+    URBAN_MAX_TON as _URBAN_MAX_TON,
     # Geographic
     DEPOT_LAT, DEPOT_LON,
     CROSS_BEARING_LIMIT as _CROSS_BEARING_LIMIT,
@@ -2359,6 +2360,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _cap_ship = None
             _caps_all    = [c for c in (_cap_remarks, _cap_ship) if c is not None]
             _size_cap    = min(_caps_all) if _caps_all else None
+
+            # Urban (KL / Selangor) tonnage ceiling. A lorry larger than
+            # _URBAN_MAX_TON (11 T) cannot serve urban routes: those routes hit
+            # many closely-spaced stops in one trip and a large lorry cannot
+            # physically cover them all in one run. So any DO whose destination
+            # is urban is capped at 11 T. Outstation DOs are unaffected.
+            _dg_cap = _classify_dest_group(route_str, _state_from_row(row))
+            if _dg_cap in _DEST_URBAN_GROUPS:
+                _size_cap = min(_size_cap, _URBAN_MAX_TON) \
+                    if _size_cap is not None else _URBAN_MAX_TON
 
             # Remarks-day filter DISABLED by request: assignment now depends only
             # on the trip day the user selected at login (today/tomorrow) plus the

@@ -31,6 +31,12 @@ LORRY_TINY_EXCL_TON   = 4.5    # routes with tiny items exclude lorries ≥ this
 # Lorries with TON ≤ 5T are forbidden on any outstation (non-urban) route.
 OUTSTATION_MIN_TON    = 5.001
 
+# ── Urban maximum tonnage ─────────────────────────────────────────────────────
+# Urban (KL / Selangor) routes visit many closely-spaced stops in one trip; a
+# lorry larger than this cannot physically cover them all in one run. So any DO
+# whose destination is urban is capped at this tonnage. Outstation is unaffected.
+URBAN_MAX_TON         = 11.0
+
 # ── Geographic constants ──────────────────────────────────────────────────────
 # Depot / HQ coordinates (HICOM Shah Alam)
 DEPOT_LAT  = 3.0340
