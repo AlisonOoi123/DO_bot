@@ -5513,6 +5513,155 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _session_loads[_best] = float(_session_loads.get(_best, 0)) + _cw
                     _record_lorry_state(_best, next(iter(_cstates), ""))
 
+        # ── URBAN ROUTE-FIRST CONSOLIDATION + NEAREST-ROUTE FILL ──────────────
+        # For URBAN (KL / Selangor) routes only: a whole route code should ride
+        # ONE lorry (priority 1). Consolidate any urban route split across
+        # lorries onto a single lorry that can hold the whole route within
+        # capacity, size cap, forbidden plates and the geo spread — preferring
+        # the lorry already holding most of it. Then, for a lorry with leftover
+        # space, pull in the geographically NEAREST other urban route that still
+        # fits (priority 2). Outstation routes (Kuantan, Perak, …) are NEVER
+        # touched — they split by capacity necessity. A route stays split only
+        # when no single lorry can hold it.
+        def _urban_rc_items():
+            _m: dict = {}
+            for _it in items:
+                if (_it.get("LORRY") in _lorry_cap_map
+                        and _classify_dest_group(_it.get("ROUTE", ""),
+                                                 _it.get("STATE", "")) in _DEST_URBAN_GROUPS):
+                    _m.setdefault(_rcode(_it), []).append(_it)
+            return _m
+
+        _rc_phys: dict[str, float] = defaultdict(float)
+        for _it in items:
+            if _it.get("LORRY") in _lorry_cap_map:
+                _rc_phys[_it["LORRY"]] += _it["WEIGHT"]
+
+        def _route_fits_on(_cand, _rits, _rc, _rw, _rmt, _rforbid):
+            _cap = float(_lorry_cap_map.get(_cand, 0))
+            _here = sum(x["WEIGHT"] for x in _rits if x["LORRY"] == _cand)
+            if _rc_phys[_cand] - _here + _rw > _cap * NAIK_FACTOR:
+                return False
+            if _rmt is not None and _cap > _rmt:
+                return False
+            if _cand in _rforbid:
+                return False
+            _other = [_pt_of(x) for x in items
+                      if x.get("LORRY") == _cand and _rcode(x) != _rc and _pt_of(x)]
+            _add = [_pt_of(x) for x in _rits if _pt_of(x)]
+            return _lorry_geo_ok(_other + _add)
+
+        # Priority 1 — consolidate each split urban route onto one lorry.
+        for _rc, _rits in _urban_rc_items().items():
+            _lset = {x["LORRY"] for x in _rits}
+            if len(_lset) < 2:
+                continue
+            _rw = sum(x["WEIGHT"] for x in _rits)
+            _rmt = min((x["MAX_TON"] for x in _rits
+                        if x.get("MAX_TON") is not None), default=None)
+            _rforbid: set = set()
+            for x in _rits:
+                if x.get("FORBID_PLATES"):
+                    _rforbid |= x["FORBID_PLATES"]
+            _rstates = {x.get("STATE", "").strip().upper() for x in _rits if x.get("STATE")}
+            _tgt = None
+            for _cand in sorted(_lset, key=lambda l: -sum(
+                    x["WEIGHT"] for x in _rits if x["LORRY"] == l)):
+                if _route_fits_on(_cand, _rits, _rc, _rw, _rmt, _rforbid):
+                    _tgt = _cand
+                    break
+            if _tgt is None:
+                for _cand in sorted(_lorry_cap_map, key=lambda l: (
+                        0 if float(_lorry_cap_map[l]) <= _URBAN_MAX_TON else 1,
+                        float(_lorry_cap_map[l]))):
+                    if _cand in _lset:
+                        continue
+                    if _route_fits_on(_cand, _rits, _rc, _rw, _rmt, _rforbid):
+                        _tgt = _cand
+                        break
+            if _tgt is None:
+                continue                          # whole route fits no single lorry
+            for x in _rits:
+                if x["LORRY"] != _tgt:
+                    _rc_phys[x["LORRY"]] -= x["WEIGHT"]
+                    _rc_phys[_tgt] += x["WEIGHT"]
+                    x["LORRY"] = _tgt
+                    sess["assigned"][x["DO NUMBER"]] = _tgt
+                    _unassigned_reasons.pop(x["DO NUMBER"], None)
+                    _session_loads[_tgt] = float(_session_loads.get(_tgt, 0)) + x["WEIGHT"]
+            _record_lorry_state(_tgt, next(iter(_rstates), ""))
+
+        # Priority 2 — fill leftover space with the NEAREST other urban route.
+        # For each urban lorry with spare capacity, find the whole urban route
+        # (currently on another lorry, and itself un-split) whose centroid is
+        # closest, and move it over if it fits within capacity and geo spread.
+        def _centroid(_rits):
+            _pts = [(_x["GPS_LAT"], _x["GPS_LON"]) for _x in _rits
+                    if _x.get("GPS_LAT") is not None]
+            if not _pts:
+                return None
+            return (sum(p[0] for p in _pts) / len(_pts),
+                    sum(p[1] for p in _pts) / len(_pts))
+
+        for _pass in range(2):                    # a couple of top-up rounds
+            _urb = _urban_rc_items()
+            _moved = False
+            # lorries that currently carry an urban route, most free space first
+            _urb_lorries = sorted(
+                {x["LORRY"] for _r in _urb.values() for x in _r},
+                key=lambda l: -(float(_lorry_cap_map[l]) - _rc_phys[l]))
+            for _l in _urb_lorries:
+                _free = float(_lorry_cap_map[_l]) * NAIK_FACTOR - _rc_phys[_l]
+                if _free <= 0.05:
+                    continue
+                _lpts = [_pt_of(x) for x in items
+                         if x.get("LORRY") == _l and _pt_of(x)]
+                _lcent = _centroid([x for x in items if x.get("LORRY") == _l])
+                if _lcent is None:
+                    continue
+                # candidate whole urban routes sitting on OTHER lorries
+                _cands = []
+                for _rc, _rits in _urb.items():
+                    _lset = {x["LORRY"] for x in _rits}
+                    if _l in _lset or len(_lset) != 1:
+                        continue                  # only move a route that is whole elsewhere
+                    _rw = sum(x["WEIGHT"] for x in _rits)
+                    if _rw > _free:
+                        continue
+                    _rmt = min((x["MAX_TON"] for x in _rits
+                                if x.get("MAX_TON") is not None), default=None)
+                    if _rmt is not None and float(_lorry_cap_map[_l]) > _rmt:
+                        continue
+                    _rforbid: set = set()
+                    for x in _rits:
+                        if x.get("FORBID_PLATES"):
+                            _rforbid |= x["FORBID_PLATES"]
+                    if _l in _rforbid:
+                        continue
+                    _rcent = _centroid(_rits)
+                    if _rcent is None:
+                        continue
+                    _dist = ((_lcent[0] - _rcent[0]) ** 2 + (_lcent[1] - _rcent[1]) ** 2) ** 0.5
+                    if not _lorry_geo_ok(_lpts + [_pt_of(x) for x in _rits if _pt_of(x)]):
+                        continue
+                    _cands.append((_dist, _rc, _rits, _rw))
+                if not _cands:
+                    continue
+                _cands.sort(key=lambda c: c[0])   # nearest route first
+                _d, _rc, _rits, _rw = _cands[0]
+                for x in _rits:
+                    _rc_phys[x["LORRY"]] -= x["WEIGHT"]
+                    _rc_phys[_l] += x["WEIGHT"]
+                    x["LORRY"] = _l
+                    sess["assigned"][x["DO NUMBER"]] = _l
+                    _unassigned_reasons.pop(x["DO NUMBER"], None)
+                    _session_loads[_l] = float(_session_loads.get(_l, 0)) + x["WEIGHT"]
+                _record_lorry_state(_l, next(
+                    (x.get("STATE", "").strip().upper() for x in _rits if x.get("STATE")), ""))
+                _moved = True
+            if not _moved:
+                break
+
         # ── RULES-COMPLIANCE GATE (ASSIGNMENT_RULES.md / DO_BOT_SKILL.md §A) ───
         # Final deterministic audit: every assigned DO must obey the HARD rules.
         # Any violation is corrected (the DO is unassigned → NO_LORRY) and logged,

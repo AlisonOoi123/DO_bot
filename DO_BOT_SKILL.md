@@ -79,6 +79,16 @@ as the stops form one connected GPS cluster** — see Section C.
 4. **Fully utilise gross weight** — pack the fixed atomic units (1 & 2) to fill
    each lorry as much as possible.
 
+**Urban route-first packing (KL / Selangor only — NOT outstation).** A whole
+urban route code rides ONE lorry whenever it fits (priority 1): any urban route
+split across lorries is consolidated onto a single lorry that can hold its full
+weight within capacity, size cap, forbidden plates and the geo spread —
+preferring the lorry already holding most of it. Then a lorry with leftover
+space is topped up with the geographically **nearest** other whole urban route
+(priority 2). A route stays split only when no single lorry can hold it.
+Outstation routes (Kuantan, Perak, Pahang, …) are never consolidated this way —
+they split across large lorries out of capacity necessity.
+
 Criteria 1 and 2 are enforced as inseparable *atomic units*: every split path
 (heavy-group half-split, urban de-concentration) moves whole units only, and a
 final **reunification pass** pulls back onto one lorry any atomic unit that an
