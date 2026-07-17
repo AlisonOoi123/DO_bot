@@ -5518,39 +5518,46 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _or_phys[x["LORRY"]] -= x["WEIGHT"]
                 x["LORRY"] = None
             _cids_all = {id(x) for x in _rits}
+            _used_here: set = set()               # lorries this repack has filled
+
+            def _may_take(_cand, _comp, _cw, _cfp):
+                if _cand in _cfp:
+                    return False
+                # empty lorry, or one already holding ONLY this route — never
+                # mix outstation with urban / a different corridor.
+                _cand_routes = {_rcode(y) for y in items
+                                if y.get("LORRY") == _cand and id(y) not in _cids_all}
+                if _cand_routes and _cand_routes != {_rc}:
+                    return False
+                if float(_lorry_cap_map[_cand]) * NAIK_FACTOR - _or_phys[_cand] < _cw:
+                    return False
+                _other = [_pt_of(y) for y in items
+                          if y.get("LORRY") == _cand and id(y) not in _cids_all and _pt_of(y)]
+                return _lorry_geo_ok(_other + [_pt_of(x) for x in _comp if _pt_of(x)])
+
             for _comp in sorted(_comps_r, key=lambda c: -sum(x["WEIGHT"] for x in c)):
                 _cw = sum(x["WEIGHT"] for x in _comp)
                 _cfp: set = set()
                 for x in _comp:
                     if x.get("FORBID_PLATES"):
                         _cfp |= x["FORBID_PLATES"]
-                _best = None
-                _best_free = -1.0
-                for _cand in _valid:
-                    if _cand in _cfp:
-                        continue
-                    # only an empty lorry or one already holding THIS route (no
-                    # other route direction) — never mix outstation with urban.
-                    _cand_routes = {_rcode(y) for y in items
-                                    if y.get("LORRY") == _cand and id(y) not in _cids_all}
-                    if _cand_routes and _cand_routes != {_rc}:
-                        continue
-                    _free = float(_lorry_cap_map[_cand]) * NAIK_FACTOR - _or_phys[_cand]
-                    if _free < _cw:
-                        continue
-                    _other = [_pt_of(y) for y in items
-                              if y.get("LORRY") == _cand and id(y) not in _cids_all and _pt_of(y)]
-                    if not _lorry_geo_ok(_other + [_pt_of(x) for x in _comp if _pt_of(x)]):
-                        continue
-                    if _free > _best_free:
-                        _best_free = _free
-                        _best = _cand
-                _dest = _best
+                # First-fit-decreasing that CONSOLIDATES: fill a lorry already
+                # opened by this repack (tightest fit) before opening a new one;
+                # when opening a new lorry pick the LARGEST valid one so it can
+                # absorb the rest of the route too (fewest lorries).
+                _u = [c for c in _used_here if _may_take(c, _comp, _cw, _cfp)]
+                if _u:
+                    _dest = min(_u, key=lambda c: float(_lorry_cap_map[c]) * NAIK_FACTOR - _or_phys[c])
+                else:
+                    _fresh = [c for c in _valid
+                              if c not in _used_here and _may_take(c, _comp, _cw, _cfp)]
+                    _dest = max(_fresh, key=lambda c: float(_lorry_cap_map[c])) if _fresh else None
                 if _dest is None:                 # restore to original lorry
                     for x in _comp:
                         x["LORRY"] = _orig[id(x)]
                         _or_phys[x["LORRY"]] += x["WEIGHT"]
                     continue
+                _used_here.add(_dest)
                 for x in _comp:
                     x["LORRY"] = _dest
                     sess["assigned"][x["DO NUMBER"]] = _dest
