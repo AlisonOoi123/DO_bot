@@ -123,6 +123,13 @@ A lorry's stops must form ONE connected cluster:
   and re-homed onto a lorry where it fits the chain, else left unassigned.
 - Distance is measured by **GPS only** — a stop with a correct city name but a
   wrong coordinate is still separated.
+- **Urban anti-chaining (longitude-aware).** Single-linkage alone can let a
+  string of close stops *bridge* two far urban zones (e.g. central KL → Rawang,
+  or Semenyih → KL). So for URBAN stops of **different** route codes, the
+  overall spread is also bounded: no two different-route urban stops may be more
+  than `URBAN_MERGE_SPREAD_DEG` (0.29°) apart. Same route code stays atomic (any
+  distance). Result: Rawang may share a lorry with nearby Batu Caves, but never
+  with far Kajang or central KL.
 
 VAN priority: all VAN-remark DOs are pooled ACROSS routes, clustered by the same
 0.29° single-linkage rule, and packed onto a ≤ 2 T van together.
