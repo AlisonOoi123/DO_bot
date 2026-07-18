@@ -1126,10 +1126,38 @@ def handle_message(phone: str, text: str = None,
         own, my_spare, others_spare = categorize_clear_plates(engine, user)
         mine = sorted(own + my_spare)
         sess["_clear_others_spare"] = others_spare   # remember for the follow-up
+        # Nothing of the user's own to clear → skip the pointless "release 0"
+        # step and go straight to the shared-lorry question (if any).
+        if not mine:
+            if others_spare:
+                _shared = "\n".join(f"  • *{p}* — assigned to *{o}*"
+                                    for p, o in sorted(others_spare.items()))
+                return [{
+                    "_type": "buttons",
+                    "body": (
+                        "\U0001f536 You have no assignments of your own to clear.\n\n"
+                        "These SPARE lorry(s) are assigned to another user:\n"
+                        f"{_shared}\n\n"
+                        "Clear them so *you* can use them? This takes a shared lorry "
+                        "already assigned to someone else — make sure it won't be "
+                        "double-booked.\n\n"
+                        "• *Yes* → you may use these lorries.\n"
+                        "• *No* → you'll use only your other available lorries."
+                    ),
+                    "buttons": [
+                        {"id": "confirm clear shared", "title": "✅ Yes, clear shared"},
+                        {"id": "keep shared",          "title": "❌ No, keep them"},
+                    ],
+                }]
+            return [
+                "✅ Nothing to clear — you have no lorry assignments today.",
+                {"_type": "buttons", "body": "Type *hi* to start.",
+                 "buttons": [{"id": "hi", "title": "👋 Hi"}]},
+            ]
         _body = (
             f"⚠️ *Confirm Clear Your Log ({user})?*\n\n"
             f"This will release *{len(mine)}* of your own assignment(s) today.\n"
-            f"Plates: {', '.join(mine) if mine else 'none'}\n"
+            f"Plates: {', '.join(mine)}\n"
         )
         if others_spare:
             _shared = ", ".join(f"{p} ({o})" for p, o in sorted(others_spare.items()))
