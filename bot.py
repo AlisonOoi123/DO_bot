@@ -904,15 +904,28 @@ def get_assigned_today() -> set:
     """Return set of ALL lorry plates assigned today (never includes empty strings)."""
     return {p for p in _load_daily_log()["assigned"] if p and p.strip()}
 
-def record_assignments_today(plates: list[str]):
-    """Add newly confirmed plates to today's log."""
+def record_assignments_today(plates: list[str], user: str | None = None):
+    """Add newly confirmed plates to today's log, recording WHO assigned each
+    (so a shared SPARE lorry can be attributed to the user who took it)."""
     log = _load_daily_log()
     existing = set(log["assigned"])
+    assigned_by = dict(log.get("assigned_by", {}))
     for p in plates:
         if p and p != "SKIPPED":
-            existing.add(p)
+            pu = p.upper()
+            existing.add(pu)
+            if user:
+                assigned_by[pu] = user.upper()
     log["assigned"] = sorted(existing)
+    log["assigned_by"] = assigned_by
     _save_daily_log(log)
+
+
+def get_assigned_by() -> dict:
+    """Return { PLATE: USER } — who assigned each plate today (best-effort;
+    plates recorded before attribution existed have no entry)."""
+    return {str(k).upper(): str(v).upper()
+            for k, v in _load_daily_log().get("assigned_by", {}).items()}
 
 
 def release_specific_plates(plates: list[str]) -> bool:
@@ -986,8 +999,54 @@ def clear_daily_log_for_user(engine) -> list[str]:
     my_plates   = all_plates & own_lorries         # this user's OWN (non-SPARE) plates
     remaining   = sorted(all_plates - my_plates)   # keep other users' + all SPARE plates
     log["assigned"] = remaining
+    log["assigned_by"] = {p: u for p, u in log.get("assigned_by", {}).items()
+                          if p.upper() in set(remaining)}
     _save_daily_log(log)
     return sorted(my_plates)
+
+
+def _spare_plates(engine) -> set:
+    """Plates in this user's fleet that are SPARE (shared)."""
+    el = engine.eligible_lorries
+    if "USER" not in el.columns:
+        return set()
+    return set(el[el["USER"].astype(str).str.upper() == "SPARE"]["LORRY"].str.upper())
+
+
+def categorize_clear_plates(engine, user: str):
+    """Split today's log plates (that fall in this user's fleet) into:
+      own       — plates the user owns exclusively (clear freely)
+      my_spare  — SPARE plates THIS user assigned (clear freely)
+      others_spare — { plate: owner } SPARE plates assigned by ANOTHER user
+                     (or unknown) → clearing needs confirmation.
+    """
+    user_up = user.upper()
+    assigned = get_assigned_today()
+    by = get_assigned_by()
+    spare = _spare_plates(engine)
+    fleet = set(engine.eligible_lorries["LORRY"].str.upper())
+    own, my_spare, others_spare = [], [], {}
+    for p in sorted(assigned & fleet):
+        if p in spare:
+            owner = by.get(p)
+            if owner is None or owner == user_up:
+                my_spare.append(p)      # this user's own (or legacy/unknown-as-mine)
+            else:
+                others_spare[p] = owner
+        else:
+            own.append(p)               # owner-exclusive lorry
+    return own, my_spare, others_spare
+
+
+def clear_specific_plates_from_log(plates) -> None:
+    """Remove the given plates from today's log (assigned + assigned_by)."""
+    up = {str(p).upper() for p in plates}
+    log = _load_daily_log()
+    log["assigned"] = sorted(set(log.get("assigned", [])) - up)
+    log["assigned_by"] = {p: u for p, u in log.get("assigned_by", {}).items()
+                          if p.upper() not in up}
+    _save_daily_log(log)
+
 
 def clear_daily_log():
     """Wipe entire log (legacy/midnight reset)."""
@@ -1064,20 +1123,23 @@ def handle_message(phone: str, text: str = None,
         user   = sess.get("user_id")
         if not engine or not user:
             return ["❌ Please log in first (send *hi*) before clearing the log."]
-        # Derive this user's plates by intersecting today's log with their eligible lorries
-        user_lorries = set(engine.eligible_lorries["LORRY"].str.upper())
-        my_plates    = sorted(get_assigned_today() & user_lorries)
-        plate_count  = len(my_plates)
-        plate_list   = ", ".join(my_plates) if my_plates else "none"
+        own, my_spare, others_spare = categorize_clear_plates(engine, user)
+        mine = sorted(own + my_spare)
+        sess["_clear_others_spare"] = others_spare   # remember for the follow-up
+        _body = (
+            f"⚠️ *Confirm Clear Your Log ({user})?*\n\n"
+            f"This will release *{len(mine)}* of your own assignment(s) today.\n"
+            f"Plates: {', '.join(mine) if mine else 'none'}\n"
+        )
+        if others_spare:
+            _shared = ", ".join(f"{p} ({o})" for p, o in sorted(others_spare.items()))
+            _body += (f"\n🔶 *{len(others_spare)}* SPARE lorry(s) are assigned to "
+                      f"other user(s): {_shared}.\nI'll ask about those next.\n")
+        _body += "\nThis cannot be undone. Are you sure?"
         return [
             {
                 "_type": "buttons",
-                "body": (
-                    f"⚠️ *Confirm Clear Your Log ({user})?*\n\n"
-                    f"This will release *{plate_count}* of your lorry assignment(s) for today.\n"
-                    f"Plates: {plate_list}\n\n"
-                    "This cannot be undone. Are you sure?"
-                ),
+                "body": _body,
                 "buttons": [
                     {"id": "confirm clear daily log", "title": "✅ Yes, Clear"},
                     {"id": "cancel clear",            "title": "❌ Cancel"},
@@ -1091,17 +1153,74 @@ def handle_message(phone: str, text: str = None,
         user   = sess.get("user_id")
         if not engine or not user:
             return ["❌ Please log in first (send *hi*) before clearing the log."]
-        removed = clear_daily_log_for_user(engine)
-        sess["unavailable"] = set()
-        return [
+        # Clear the user's OWN plates + their OWN SPARE assignments right away.
+        own, my_spare, others_spare = categorize_clear_plates(engine, user)
+        clear_specific_plates_from_log(own + my_spare)
+        sess["unavailable"] = set(get_assigned_today()) | set(get_broken_lorries())
+        removed = sorted(own + my_spare)
+        _msgs = [
             f"\U0001f5d1\ufe0f *{user}*'s log cleared.\n"
             f"\U0001f4cb Plates released: {', '.join(removed) or 'none'}\n"
-            "Your lorries are now available again.",
-            {
+            "Your lorries are now available again."
+        ]
+        others_spare = sess.get("_clear_others_spare") or others_spare
+        if others_spare:
+            _shared = "\n".join(f"  • *{p}* — assigned to *{o}*"
+                                for p, o in sorted(others_spare.items()))
+            _msgs.append({
+                "_type": "buttons",
+                "body": (
+                    "\U0001f536 These SPARE lorry(s) are already assigned to another user:\n"
+                    f"{_shared}\n\n"
+                    "Clear them too so *you* can use them? This lets you take a "
+                    "shared lorry already assigned to someone else — make sure "
+                    "it won't be double-booked.\n\n"
+                    "• *Yes* → you may use these lorries.\n"
+                    "• *No* → you'll use only your other available lorries."
+                ),
+                "buttons": [
+                    {"id": "confirm clear shared", "title": "✅ Yes, clear shared"},
+                    {"id": "keep shared",          "title": "❌ No, keep them"},
+                ],
+            })
+        else:
+            _msgs.append({
                 "_type": "buttons",
                 "body": "Tap below to start a new session, or type *hi* anytime.",
                 "buttons": [{"id": "hi", "title": "👋 Hi"}],
-            }
+            })
+        return _msgs
+
+    if text.lower() == "confirm clear shared":
+        sess = get_session(phone)
+        user = sess.get("user_id") or "?"
+        others_spare = sess.get("_clear_others_spare") or {}
+        if not others_spare:
+            return ["Nothing shared to clear.",
+                    {"_type": "buttons", "body": "Type *hi* to start.",
+                     "buttons": [{"id": "hi", "title": "👋 Hi"}]}]
+        clear_specific_plates_from_log(list(others_spare))
+        sess["unavailable"] = set(get_assigned_today()) | set(get_broken_lorries())
+        sess["_clear_others_spare"] = {}
+        _plates = ", ".join(sorted(others_spare))
+        return [
+            f"✅ Shared lorry(s) released: {_plates}.\n"
+            f"*{user}* may now use them. ⚠️ Make sure they are not "
+            "double-booked with the other user's trip.",
+            {"_type": "buttons", "body": "Type *hi* to start a new session.",
+             "buttons": [{"id": "hi", "title": "👋 Hi"}]},
+        ]
+
+    if text.lower() == "keep shared":
+        sess = get_session(phone)
+        others_spare = sess.get("_clear_others_spare") or {}
+        sess["_clear_others_spare"] = {}
+        _plates = ", ".join(sorted(others_spare)) or "none"
+        return [
+            f"\U0001f44d Kept as-is. These shared lorry(s) stay with the other "
+            f"user: {_plates}.\nYou'll be assigned only your other available lorries.",
+            {"_type": "buttons", "body": "Type *hi* to start a new session.",
+             "buttons": [{"id": "hi", "title": "👋 Hi"}]},
         ]
 
     if text.lower() == "cancel clear":
@@ -1426,7 +1545,7 @@ def handle_message(phone: str, text: str = None,
         plate  = parts[2].upper()
 
         if action == "BLOCK":
-            record_assignments_today([plate])
+            record_assignments_today([plate], user=sess.get("user_id"))
             sess.setdefault("unavailable", set()).add(plate)
             in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
             follow_up = _build_summary(sess) if in_active else [{
@@ -1504,7 +1623,7 @@ def handle_message(phone: str, text: str = None,
         if plate in sess.get("unavailable", set()) or plate in get_assigned_today():
             return [f"⚠️ *{plate}* is already blocked today."]
         sess.setdefault("unavailable", set()).add(plate)
-        record_assignments_today([plate])
+        record_assignments_today([plate], user=sess.get("user_id"))
         in_active = sess.get("state") in ("CONFIRMING", "REVIEWING", "AWAIT_OTHER_USER_REPLY") and sess.get("pending_dos")
         follow_up = _build_summary(sess) if in_active else [_HI_BTN]
         return [f"🚫 *{plate}* blocked for today."] + follow_up
@@ -2110,7 +2229,7 @@ def _handle_prefilled_excel(phone, sess, raw: "pd.DataFrame", prefilled: "pd.Dat
         return None  # caller must handle None → proceed with normal auto-assign
 
     # Register in daily log
-    record_assignments_today(plates_found)
+    record_assignments_today(plates_found, user=sess.get("user_id"))
 
     unique_plates = sorted(set(plates_found))
     lines = []
@@ -2179,7 +2298,7 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
             continue
 
         if status.startswith("block"):
-            record_assignments_today([plate])
+            record_assignments_today([plate], user=sess.get("user_id"))
             sess.setdefault("unavailable", set()).add(plate)
             blocked_now.append(plate)
         elif status.startswith("avail") or status in ("ok", "free", "available"):
@@ -6499,7 +6618,7 @@ def _handle_reviewing(phone, sess, text):
         plate = text.split(" ", 1)[1].strip().upper()
         sess["unavailable"].add(plate)
         # Save to daily log so it stays blocked all day across all sessions
-        record_assignments_today([plate])
+        record_assignments_today([plate], user=sess.get("user_id"))
         return [f"🚫 {plate} blocked for the entire day (won't appear again today)."] + _suggest_current(sess)
 
     if cmd.startswith("custom "):
@@ -7129,7 +7248,7 @@ def _handle_confirming(phone, sess, text):
     if cmd.startswith("block "):
         plate = text.split(" ", 1)[1].strip().upper()
         sess["unavailable"].add(plate)
-        record_assignments_today([plate])
+        record_assignments_today([plate], user=sess.get("user_id"))
         # Re-run auto-assign for any DO currently assigned to this plate
         engine: LorryEngine = sess["engine"]
         changed = []
@@ -7444,8 +7563,8 @@ def _export_result_inner(sess) -> list[str]:
         print(f"⚠️ Trip manifest generation failed: {_tm_err}")
         sess["trip_manifest_bytes"] = None
 
-    # Persist confirmed plates to daily log
-    record_assignments_today(list(set(confirmed_plates)))
+    # Persist confirmed plates to daily log (attributed to this user)
+    record_assignments_today(list(set(confirmed_plates)), user=sess.get("user_id"))
 
     sess["state"] = "DONE"
     row_count = len(new_rows)
