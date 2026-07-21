@@ -57,7 +57,47 @@ META_PHONE_NUMBER_ID = os.environ.get("META_PHONE_NUMBER_ID", "")
 META_VERIFY_TOKEN   = os.environ.get("META_VERIFY_TOKEN", "eslorrybot2026")
 PUBLIC_BASE_URL     = os.environ.get("PUBLIC_BASE_URL", "http://localhost:5000")
 
-if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
+# ── WhatsApp provider selection (Meta Cloud API or 360dialog) ─────────────────
+# WHATSAPP_PROVIDER = "meta"  (default) → graph.facebook.com + Bearer token
+# WHATSAPP_PROVIDER = "360dialog"       → 360dialog endpoint + D360-API-KEY.
+#   D360_BASE:  production = https://waba-v2.360dialog.io  (Meta-compatible)
+#               sandbox    = https://waba-sandbox.360dialog.io/v1
+#   D360_API_KEY: the key 360dialog gives you (sandbox or production).
+# Message payloads are IDENTICAL to Meta's — only the URL + auth header change.
+WHATSAPP_PROVIDER = os.environ.get("WHATSAPP_PROVIDER", "meta").strip().lower()
+D360_API_KEY      = os.environ.get("D360_API_KEY", "").strip()
+D360_BASE         = os.environ.get("D360_BASE", "https://waba-v2.360dialog.io").strip().rstrip("/")
+
+def _wa_msg_url() -> str:
+    if WHATSAPP_PROVIDER == "360dialog":
+        return f"{D360_BASE}/messages"
+    return f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
+
+def _wa_media_upload_url() -> str:
+    if WHATSAPP_PROVIDER == "360dialog":
+        return f"{D360_BASE}/media"
+    return f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/media"
+
+def _wa_media_get_url(media_id: str) -> str:
+    if WHATSAPP_PROVIDER == "360dialog":
+        return f"{D360_BASE}/media/{media_id}"
+    return f"https://graph.facebook.com/v19.0/{media_id}"
+
+def _wa_headers(json: bool = True) -> dict:
+    if WHATSAPP_PROVIDER == "360dialog":
+        h = {"D360-API-KEY": D360_API_KEY}
+    else:
+        h = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    if json:
+        h["Content-Type"] = "application/json"
+    return h
+
+if WHATSAPP_PROVIDER == "360dialog":
+    if not D360_API_KEY:
+        print("⚠️  WARNING: WHATSAPP_PROVIDER=360dialog but D360_API_KEY not set.")
+    else:
+        print(f"📡 WhatsApp provider: 360dialog ({D360_BASE})")
+elif not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
     print("⚠️  WARNING: META_ACCESS_TOKEN or META_PHONE_NUMBER_ID not set. "
           "Set them in config.txt (dev) or as environment variables (production).")
 
@@ -200,11 +240,8 @@ def _send_text(to: str, body: str):
     else:
         chunks = [body]
 
-    url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    url = _wa_msg_url()
+    headers = _wa_headers()
     for chunk in chunks:
         payload = {
             "messaging_product": "whatsapp",
@@ -223,11 +260,8 @@ def _send_buttons(to: str, body: str, buttons: list[dict]):
     buttons: list of {"id": str, "title": str} — max 3, title max 20 chars.
     Falls back to plain text if the API call fails.
     """
-    url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    url = _wa_msg_url()
+    headers = _wa_headers()
     # Meta requires title ≤ 20 chars
     btn_list = [
         {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}}
@@ -253,21 +287,23 @@ def _send_buttons(to: str, body: str, buttons: list[dict]):
 
 def _download_media(media_id: str) -> bytes | None:
     """Download a media file from Meta servers."""
-    # Step 1: get the download URL
-    url = f"https://graph.facebook.com/v19.0/{media_id}"
-    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    # Step 1: get the download URL (Meta and 360dialog-v2 return JSON with a
+    # 'url'; some 360dialog setups return the binary directly).
+    url = _wa_media_get_url(media_id)
+    headers = _wa_headers(json=False)
     r = requests.get(url, headers=headers, timeout=10)
     if not r.ok:
         print(f"❌ Media URL fetch failed: {r.status_code}")
         return None
-    download_url = r.json().get("url")
-
-    # Step 2: download the actual file
-    r2 = requests.get(download_url, headers=headers, timeout=30)
-    if r2.ok:
-        return r2.content
-    print(f"❌ Media download failed: {r2.status_code}")
-    return None
+    if "application/json" in r.headers.get("Content-Type", ""):
+        download_url = r.json().get("url")
+        # Step 2: download the actual file
+        r2 = requests.get(download_url, headers=headers, timeout=30)
+        if r2.ok:
+            return r2.content
+        print(f"❌ Media download failed: {r2.status_code}")
+        return None
+    return r.content   # binary returned directly
 
 
 def _send_file(to: str, file_bytes: bytes, filename: str):
@@ -276,8 +312,8 @@ def _send_file(to: str, file_bytes: bytes, filename: str):
     Meta requires uploading the file first, then sending by media ID.
     """
     # Step 1: Upload media
-    upload_url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/media"
-    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    upload_url = _wa_media_upload_url()
+    headers = _wa_headers(json=False)
     files = {
         "file": (filename, file_bytes,
                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
@@ -291,7 +327,7 @@ def _send_file(to: str, file_bytes: bytes, filename: str):
     media_id = r.json().get("id")
 
     # Step 2: Send as document message
-    msg_url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
+    msg_url = _wa_msg_url()
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -320,11 +356,8 @@ def _send_do_list(to: str, header: str, body: str, button: str, items: list[dict
     Items are split into real sections of 10 — no fake "More lorries" rows.
     If the list still exceeds 100 items, the excess are sent as a plain-text fallback.
     """
-    url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
-    hdrs = {
-        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
-        "Content-Type":  "application/json",
-    }
+    url = _wa_msg_url()
+    hdrs = _wa_headers()
 
     # WhatsApp hard limits
     MAX_SECTIONS = 10
