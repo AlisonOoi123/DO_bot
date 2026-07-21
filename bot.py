@@ -5609,18 +5609,24 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for _it in items:
             if _it.get("LORRY") in _lorry_cap_map:
                 _or_phys[_it["LORRY"]] += _it["WEIGHT"]
+        # Group outstation DOs by DIRECTION (corridor), not exact route code, so
+        # all routes in one corridor (e.g. Perak PK01+PK02+PK06) consolidate onto
+        # ONE big lorry and the run is fully utilised — mirroring the manual.
         _out_routes: dict = {}
         for _it in items:
             if (_it.get("LORRY") in _lorry_cap_map
                     and _classify_dest_group(_it.get("ROUTE", ""),
                                              _it.get("STATE", "")) not in _DEST_URBAN_GROUPS):
-                _out_routes.setdefault(_rcode(_it), []).append(_it)
-        for _rc, _rits in _out_routes.items():
+                _out_routes.setdefault(_direction_key(_it.get("ROUTE", "")), []).append(_it)
+        for _dir, _rits in _out_routes.items():
             _lset = {x["LORRY"] for x in _rits}
             if len(_lset) < 2:
                 continue                          # already on one lorry
+            _rits_ids = {id(x) for x in _rits}
             _rw = sum(x["WEIGHT"] for x in _rits)
-            _dg = _classify_dest_group(_rits[0].get("ROUTE", ""), _rits[0].get("STATE", ""))
+            _dg = max((_classify_dest_group(x.get("ROUTE", ""), x.get("STATE", ""))
+                       for x in _rits),
+                      key=lambda g: _DEST_MIN_TON.get(g, 0.0))
             _dmin = _DEST_MIN_TON.get(_dg, _OUTSTATION_MIN_TON)
             _rmt = min((x["MAX_TON"] for x in _rits
                         if x.get("MAX_TON") is not None), default=None)
@@ -5642,8 +5648,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _here = sum(x["WEIGHT"] for x in _rits if x["LORRY"] == _cand)
                 if _or_phys[_cand] - _here + _rw > _cap * NAIK_FACTOR:
                     return False
-                _other = [_pt_of(x) for x in items
-                          if x.get("LORRY") == _cand and _rcode(x) != _rc and _pt_of(x)]
+                # Existing stops on _cand that are NOT part of this corridor group
+                # must be in the SAME direction and form one geo cluster with it.
+                _other_items = [y for y in items
+                                if y.get("LORRY") == _cand and id(y) not in _rits_ids]
+                if any(_direction_key(y.get("ROUTE", "")) != _dir for y in _other_items):
+                    return False
+                _other = [_pt_of(y) for y in _other_items if _pt_of(y)]
                 _add = [_pt_of(x) for x in _rits if _pt_of(x)]
                 return _lorry_geo_ok(_other + _add)
 
@@ -5698,11 +5709,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             def _may_take(_cand, _comp, _cw, _cfp):
                 if _cand in _cfp or _cand in _blocked_today:
                     return False
-                # empty lorry, or one already holding ONLY this route — never
-                # mix outstation with urban / a different corridor.
-                _cand_routes = {_rcode(y) for y in items
-                                if y.get("LORRY") == _cand and id(y) not in _cids_all}
-                if _cand_routes and _cand_routes != {_rc}:
+                # empty lorry, or one already holding ONLY this corridor — never
+                # mix a different direction (urban, or another outstation corridor).
+                _cand_dirs = {_direction_key(y.get("ROUTE", "")) for y in items
+                              if y.get("LORRY") == _cand and id(y) not in _cids_all}
+                if _cand_dirs and _cand_dirs != {_dir}:
                     return False
                 if float(_lorry_cap_map[_cand]) * NAIK_FACTOR - _or_phys[_cand] < _cw:
                     return False

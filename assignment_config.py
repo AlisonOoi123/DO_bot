@@ -243,6 +243,10 @@ ROUTE_CORRIDOR_GROUPS: dict[str, list[str]] = {
     "PH_INT":   ["PH01", "PH02", "PH03", "PH04", "PH05", "PH06", "PH07", "PH08"],
     "KV_NORTH": ["KV01A", "KV02A", "KV04A"],
     "KV_EAST":  ["KV10A", "KV11A", "KV12A"],
+    # Perak coastal/interior — one outstation direction. Sabak Bernam (PK01),
+    # Teluk Intan (PK02), Manjung (PK06) etc. combine onto one big lorry so the
+    # Perak run is fully utilised instead of split across half-empty lorries.
+    "PERAK":    ["PK01", "PK02", "PK03", "PK04", "PK05", "PK06", "PK07", "PK08", "PK09"],
 }
 
 # ── Strict lorry-route reservations ──────────────────────────────────────────

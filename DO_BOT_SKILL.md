@@ -30,11 +30,14 @@ be overridden by optimisation or utilisation goals.
      Serendah direction) must use a lorry **> 5 T** (so an 8–9 T lorry such as
      BMN3682 can still serve KV01A).
    A lorry below the applicable minimum can never serve that outstation route.
-   Each outstation route is also consolidated onto the fewest big lorries: a
-   whole route rides ONE big lorry when it fits; if a per-stop plate forbid or
-   capacity prevents that, its atomic components are re-packed across valid big
-   lorries of the SAME direction (never mixed with urban), splitting only when
-   unavoidable.
+   Outstation DOs are consolidated by DIRECTION (corridor), not just by route
+   code: all routes in one corridor combine onto ONE big lorry so the run is
+   fully utilised. Corridors: PH_INT (PH01–08 Pahang interior), PERAK (PK01–09,
+   e.g. Sabak Bernam + Teluk Intan + Manjung on one lorry), NS (NS04–08),
+   KV_NORTH (KV01A/02A/04A). A whole corridor rides one big lorry when it fits;
+   if a per-stop plate forbid or capacity prevents that, its atomic components
+   are re-packed across valid big lorries of the SAME direction (never mixed
+   with urban or another corridor), splitting only when unavoidable.
 3. **VAN class.** A lorry under 2 T is the *van* class. Used for DOs that
    explicitly require a van (see Section D).
 4. **Small-lorry class.** A lorry under 5 T is the *small lorry* class.
