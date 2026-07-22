@@ -2119,6 +2119,11 @@ def _start(phone, sess):
     }]
 
 
+# Users who share / cross-use lorries via the daily master file. Only these are
+# asked to upload it at login; others use their default owner+SPARE fleet.
+_MASTER_FILE_USERS = {"ABI", "VIVIAN"}
+
+
 def _parse_master_lorry(file_bytes):
     """Parse the daily master lorry file.
 
@@ -2258,21 +2263,27 @@ def _handle_user_id(phone, sess, text):
         return [f"❌ User not recognised. Please reply with one of: {', '.join(valid_users)}"]
 
     sess["user_id"] = user
-    # Build the engine (history/routes/GPS); the eligible fleet is set later from
-    # the daily master lorry file the user is about to upload.
+    # Build the engine (history/routes/GPS + default owner+SPARE fleet).
     _hist = _resolve_history_path()
     sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user)
     sess["_master_uploaded"] = False
-    sess["state"] = "AWAIT_MASTER_UPLOAD"
 
-    return [
-        f"✅ Logged in as *{user}*\n\n"
-        "📄 Please upload today's *master lorry file* (.xlsx).\n"
-        "I'll read which lorries are *Available* for you today (including any "
-        "cross-use lorries you've been given).\n\n"
-        "_Rule: each lorry must be *Available* for only ONE user. If the same "
-        "plate is Available for two users, I'll ask you to fix and re-upload._"
-    ]
+    # Only ABI and VIVIAN share/cross-use lorries via the daily master file, so
+    # only they are asked to upload it. Other users (SELAYANG, SPARE, BIG, …)
+    # skip straight to the trip-day question using their default fleet.
+    if user in _MASTER_FILE_USERS:
+        sess["state"] = "AWAIT_MASTER_UPLOAD"
+        return [
+            f"✅ Logged in as *{user}*\n\n"
+            "📄 Please upload today's *master lorry file* (.xlsx).\n"
+            "I'll read which lorries are *Available* for you today (including any "
+            "cross-use lorries you've been given).\n\n"
+            "_Rule: each lorry must be *Available* for only ONE user. If the same "
+            "plate is Available for two users, I'll ask you to fix and re-upload._"
+        ]
+
+    sess["state"] = "AWAIT_TRIP_DAY"
+    return _fleet_and_trip_prompt(sess, user)
 
 
 def _handle_trip_day(phone, sess, text):
