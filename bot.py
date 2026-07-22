@@ -1742,6 +1742,10 @@ def handle_message(phone: str, text: str = None,
         return _start(phone, sess)
     elif state == "AWAIT_USER_ID":
         return _handle_user_id(phone, sess, text)
+    elif state == "AWAIT_MASTER_LORRY":
+        if file_bytes:
+            return _handle_master_lorry_upload(phone, sess, file_bytes)
+        return ["📎 Please upload the master lorry file (.xlsx) to continue."]
     elif state == "AWAIT_TRIP_DAY":
         return _handle_trip_day(phone, sess, text)
     elif state == "AWAIT_EXCEL":
@@ -1831,20 +1835,121 @@ def _handle_user_id(phone, sess, text):
         return [f"❌ User not recognised. Please reply with one of: {', '.join(valid_users)}"]
 
     sess["user_id"] = user
-    # Use new-format history if it exists, else fall back to old format
+    sess["state"]   = "AWAIT_MASTER_LORRY"
+
+    return [
+        f"✅ Logged in as *{user}*\n\n"
+        "📎 Please upload today's *master lorry file* (.xlsx) to load the available fleet."
+    ]
+
+
+def _parse_master_lorry_df(df: "pd.DataFrame") -> "tuple[list, pd.DataFrame, pd.DataFrame]":
+    """Parse a master lorry DataFrame (LORRY, TON/DESCRIPTION, USER, Status columns).
+
+    Returns (conflict_plates, resolved_df, all_df):
+      conflict_plates — plate numbers that appear as Available under 2+ users.
+      resolved_df     — one row per plate that is Available (conflict-free); used as engine pool.
+      all_df          — all rows (including Blocked), for unknown-plate lookups.
+    """
+    df = df.copy()
+    df.columns = [c.strip().upper() for c in df.columns]
+
+    # Normalise column aliases
+    if "LORRY" not in df.columns:
+        for alias in ("PLATE", "LICENSE"):
+            if alias in df.columns:
+                df.rename(columns={alias: "LORRY"}, inplace=True)
+                break
+
+    # Derive TON: prefer numeric TON column; fall back to DESCRIPTION/1000
+    if "TON" in df.columns:
+        df["TON"] = pd.to_numeric(df["TON"], errors="coerce")
+    if "TON" not in df.columns or df["TON"].isna().all():
+        desc_col = next((c for c in ("DESCRIPTION", "NAIK_KG", "KG") if c in df.columns), None)
+        if desc_col:
+            df["TON"] = pd.to_numeric(df[desc_col], errors="coerce") / 1000.0
+
+    required = {"LORRY", "TON", "USER", "STATUS"}
+    missing  = required - set(df.columns)
+    if missing:
+        return ([], pd.DataFrame(columns=["LORRY","TON","USER","Status"]),
+                pd.DataFrame(columns=["LORRY","TON","USER","Status"]))
+
+    df["LORRY"]  = df["LORRY"].astype(str).str.strip().str.upper()
+    df["USER"]   = df["USER"].astype(str).str.strip().str.upper()
+    df["STATUS"] = df["STATUS"].astype(str).str.strip().str.lower()
+
+    # Drop header-like rows
+    df = df[df["LORRY"].notna() & (~df["LORRY"].isin({"LORRY", "NAN", "NONE", ""}))].copy()
+    df = df[df["TON"].notna() & (df["TON"] > 0)].copy()
+
+    # Build all_df for engine reference (needed for unknown-plate checks later)
+    all_df = df.rename(columns={"STATUS": "Status"})[["LORRY","TON","USER","Status"]].copy()
+
+    # Find conflicts: same plate Available under 2+ different users
+    avail_df   = df[df["STATUS"].str.startswith("avail")].copy()
+    plate_users = avail_df.groupby("LORRY")["USER"].apply(set)
+    conflicts   = [plate for plate, users in plate_users.items() if len(users) > 1]
+
+    # Build resolved pool: one row per plate, Available only, no conflicts
+    resolved_rows = []
+    for plate, grp in avail_df.groupby("LORRY"):
+        if plate in conflicts:
+            continue
+        row = grp.iloc[0]
+        resolved_rows.append({
+            "LORRY":  plate,
+            "TON":    float(row["TON"]),
+            "USER":   str(row["USER"]),
+            "Status": "Available",
+        })
+    resolved_df = pd.DataFrame(resolved_rows) if resolved_rows else \
+                  pd.DataFrame(columns=["LORRY","TON","USER","Status"])
+
+    return conflicts, resolved_df, all_df
+
+
+def _handle_master_lorry_upload(phone, sess, file_bytes):
+    """Process the master lorry file uploaded by the user after login."""
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    except Exception as exc:
+        return [f"❌ Could not read the file: {exc}\nPlease re-upload the master lorry file."]
+
+    conflicts, resolved_df, all_df = _parse_master_lorry_df(df)
+
+    if conflicts:
+        conflict_list = "\n".join(f"  • {p}" for p in sorted(conflicts))
+        return [
+            f"⚠️ *Duplicate Available detected!*\n\n"
+            f"The following lorry plate(s) are marked *Available* under more than one user.\n"
+            f"Please update the file so each plate is Available under only one user, "
+            f"then re-upload:\n\n"
+            f"{conflict_list}"
+        ]
+
+    if resolved_df.empty:
+        return [
+            "⚠️ No available lorries found in the uploaded file.\n"
+            "Please check the Status column and re-upload."
+        ]
+
+    # Build engine from MASTER_PATH (for history/route data), then inject the resolved pool
+    user  = sess["user_id"]
     _hist = _resolve_history_path()
-    sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user)
-    sess["state"] = "AWAIT_TRIP_DAY"
+    engine = LorryEngine(MASTER_PATH, _hist, owner_user=user)
+    engine.set_lorry_pool(resolved_df, all_df)
+    sess["engine"] = engine
+    sess["state"]  = "AWAIT_TRIP_DAY"
 
-    lorries = sess["engine"].get_eligible_lorry_list()
-
+    # Show the resolved available lorries
     taken_today  = get_assigned_today()
-    broken_today = get_broken_lorries()   # {plate: replacement}
+    broken_today = get_broken_lorries()
     lines = []
-    for _, r in lorries.iterrows():
-        plate    = r["LORRY"]
-        ton      = r["TON"]
-        lorry_user = r["USER"]
+    for _, r in resolved_df.iterrows():
+        plate = r["LORRY"]
+        ton   = r["TON"]
+        owner = r["USER"]
         if plate in broken_today:
             rep = broken_today[plate]
             tag = f" 🔴 Broken→{rep}" if rep != "NONE" else " 🔴 Broken"
@@ -1852,7 +1957,7 @@ def _handle_user_id(phone, sess, text):
             tag = " ⛔ Assigned today"
         else:
             tag = " ✅ Available"
-        lines.append(f"  • {plate} — {ton}T ({lorry_user}){tag}")
+        lines.append(f"  • {plate} — {ton:.4g}T ({owner}){tag}")
 
     from datetime import timedelta as _td
     _today_name    = datetime.now().strftime("%A")
@@ -1862,8 +1967,8 @@ def _handle_user_id(phone, sess, text):
     _tomorrow_name = _tomorrow_date.strftime("%A")
 
     lorry_text = (
-        f"✅ Logged in as *{user}*\n\n"
-        f"Your lorries:\n" + "\n".join(lines)
+        f"✅ *Fleet loaded — {len(resolved_df)} lorry(ies) available today*\n\n"
+        + "\n".join(lines)
     )
     trip_day_msg = {
         "_type": "buttons",
@@ -1920,9 +2025,7 @@ def _handle_trip_day(phone, sess, text):
 
     return [
         f"✅ Planning for *{_day_label}*.\n\n"
-        "📎 Please upload your DO Excel file (.xlsx) now.\n\n"
-        "_Tip: you can also upload the master lorry file (with a_ *Status* _column) "
-        "to block/release lorries in bulk._",
+        "📎 Please upload your DO Excel file (.xlsx) now.",
     ]
 
 

@@ -555,6 +555,16 @@ class LorryEngine:
         self._build_route_frequency()
         self._build_daily_stop_counts()
 
+    def set_lorry_pool(self, resolved_df: "pd.DataFrame", all_df: "pd.DataFrame | None" = None):
+        """Replace the lorry pool with a pre-resolved DataFrame.
+
+        resolved_df — only Available lorries (conflict-checked by caller).
+        all_df      — full file rows including blocked ones (used for unknown-plate checks).
+        Both must have columns: LORRY, TON, USER, Status.
+        """
+        self.eligible_lorries = resolved_df.reset_index(drop=True)
+        self.all_lorries = (all_df if all_df is not None else resolved_df).reset_index(drop=True)
+
     def _load_master(self, path):
         """Load lorry capacities from LORRY DAILY PLANNING.xlsx MUATAN sheet.
 
