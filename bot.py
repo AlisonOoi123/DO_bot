@@ -3,7 +3,11 @@ WhatsApp Bot State Machine (Twilio or Meta Cloud API compatible)
 Handles the full conversation flow for lorry assignment.
 
 State flow:
-  IDLE -> AWAIT_USER_ID -> AWAIT_TRIP_DAY -> AWAIT_EXCEL -> CONFIRMING -> DONE
+  IDLE -> AWAIT_USER_ID -> AWAIT_MASTER_UPLOAD -> AWAIT_TRIP_DAY -> AWAIT_EXCEL
+       -> CONFIRMING -> DONE
+  After login the user uploads the daily master lorry file; the bot reads which
+  lorries are Available for that user (cross-use supported), rejecting the file
+  if any plate is Available under two users. Then Today/Tomorrow, then the DOs.
   (Auto-assigns best lorry for all DOs silently, shows summary for confirmation)
 """
 
@@ -2029,6 +2033,10 @@ def handle_message(phone: str, text: str = None,
         return _start(phone, sess)
     elif state == "AWAIT_USER_ID":
         return _handle_user_id(phone, sess, text)
+    elif state == "AWAIT_MASTER_UPLOAD":
+        if file_bytes:
+            return _handle_master_upload(phone, sess, file_bytes)
+        return ["📄 Please upload today's *master lorry file* (.xlsx) to continue."]
     elif state == "AWAIT_TRIP_DAY":
         return _handle_trip_day(phone, sess, text)
     elif state == "AWAIT_EXCEL":
@@ -2111,27 +2119,68 @@ def _start(phone, sess):
     }]
 
 
-def _handle_user_id(phone, sess, text):
-    valid_users = _get_valid_users()
-    user = text.upper().strip()
-    if user not in valid_users:
-        return [f"❌ User not recognised. Please reply with one of: {', '.join(valid_users)}"]
+def _parse_master_lorry(file_bytes):
+    """Parse the daily master lorry file.
 
-    sess["user_id"] = user
-    # Use new-format history if it exists, else fall back to old format
-    _hist = _resolve_history_path()
-    sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user)
-    sess["state"] = "AWAIT_TRIP_DAY"
+    Layout: columns LORRY, TON, DESCRIPTION (naik value in kg), USER, Status.
+    The same plate appears once per user, carrying that user's Status for the
+    day. A user's fleet = the plates marked 'Available' for them — so cross-use
+    works: a lorry Available for ABI but Block for VIVIAN is ABI's to use.
+    TON is computed from DESCRIPTION / 1000 (the TON column is a spreadsheet
+    formula, so we read the kg value in DESCRIPTION).
 
+    Returns (per_user, conflicts, err):
+      per_user  = {USER: [(plate, ton), ...]}  Available plates per user
+      conflicts = [(plate, [users]), ...]      plates Available under >1 user
+      err       = str | None                   parse/format error
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    except Exception as e:
+        return {}, [], f"could not read the file ({e})"
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    for _need in ("LORRY", "USER", "STATUS"):
+        if _need not in df.columns:
+            return {}, [], "missing required columns (need LORRY, USER, Status)"
+    plate_users: dict = {}   # plate -> {user: (ton, status)}
+    for _, r in df.iterrows():
+        plate = str(r.get("LORRY", "")).strip().upper()
+        if not plate or plate in ("NAN", "NONE", ""):
+            continue
+        user   = str(r.get("USER", "")).strip().upper()
+        status = str(r.get("STATUS", "")).strip().upper()
+        ton = None
+        try:
+            ton = round(float(r.get("DESCRIPTION")) / 1000.0, 4)
+        except Exception:
+            try:
+                ton = float(r.get("TON"))
+            except Exception:
+                ton = None
+        if not user or ton is None:
+            continue
+        plate_users.setdefault(plate, {})[user] = (ton, status)
+    per_user: dict = {}
+    conflicts: list = []
+    for plate, um in plate_users.items():
+        avail = [u for u, (t, s) in um.items() if s.startswith("AVAIL")]
+        if len(avail) > 1:
+            conflicts.append((plate, sorted(avail)))
+        for u, (t, s) in um.items():
+            if s.startswith("AVAIL"):
+                per_user.setdefault(u, []).append((plate, t))
+    return per_user, conflicts, None
+
+
+def _fleet_and_trip_prompt(sess, user):
+    """Build the 'your lorries' list + the Today/Tomorrow trip-day buttons from
+    the engine's current eligible fleet (already set from the master file)."""
     lorries = sess["engine"].get_eligible_lorry_list()
-
     taken_today  = get_assigned_today()
-    broken_today = get_broken_lorries()   # {plate: replacement}
+    broken_today = get_broken_lorries()
     lines = []
     for _, r in lorries.iterrows():
-        plate    = r["LORRY"]
-        ton      = r["TON"]
-        lorry_user = r["USER"]
+        plate, ton, lorry_user = r["LORRY"], r["TON"], r["USER"]
         if plate in broken_today:
             rep = broken_today[plate]
             tag = f" 🔴 Broken→{rep}" if rep != "NONE" else " 🔴 Broken"
@@ -2148,10 +2197,8 @@ def _handle_user_id(phone, sess, text):
         _tomorrow_date += _td(days=1)
     _tomorrow_name = _tomorrow_date.strftime("%A")
 
-    lorry_text = (
-        f"✅ Logged in as *{user}*\n\n"
-        f"Your lorries:\n" + "\n".join(lines)
-    )
+    lorry_text = (f"✅ *{user}*'s available lorries today ({len(lines)}):\n"
+                  + "\n".join(lines))
     trip_day_msg = {
         "_type": "buttons",
         "body": (
@@ -2165,8 +2212,67 @@ def _handle_user_id(phone, sess, text):
             {"id": "clear daily log",   "title": "🗑️ Clear Today Log"},
         ],
     }
-
     return [lorry_text, trip_day_msg]
+
+
+def _handle_master_upload(phone, sess, file_bytes):
+    """Step 2 of the flow: the logged-in user uploads the daily master lorry
+    file. Validate it (no plate Available under two users) and build this
+    user's available fleet from it, then move on to the trip-day question."""
+    per_user, conflicts, err = _parse_master_lorry(file_bytes)
+    if err:
+        return [f"❌ Master lorry file: {err}.\nPlease upload the correct master "
+                "lorry file (columns: LORRY, TON, DESCRIPTION, USER, Status)."]
+    if conflicts:
+        _lines = "\n".join(f"  • *{p}* — Available for {', '.join(us)}"
+                           for p, us in conflicts[:25])
+        return [
+            "❌ *Duplicate Available lorries.*\n"
+            "These plate(s) are marked *Available* for more than one user, so I "
+            "can't tell who should use them — that would double-book a lorry:\n"
+            f"{_lines}\n\n"
+            "Please *Block* the duplicates so each lorry is Available for only "
+            "ONE user, then upload the master lorry file again.\n"
+            "_(Duplicate *Block* is fine — that just means the lorry is off today.)_"
+        ]
+    user = sess.get("user_id")
+    my_fleet = per_user.get(user, [])
+    if not my_fleet:
+        return [f"⚠️ No *Available* lorries found for *{user}* in the master file.\n"
+                "Check the Status column (should say 'Available' on your rows) and "
+                "upload the master lorry file again."]
+    # Replace the engine's eligible fleet with TODAY's availability for this user.
+    sess["engine"].eligible_lorries = pd.DataFrame(
+        [{"LORRY": p, "TON": t, "USER": user, "Status": "Available"}
+         for p, t in sorted(my_fleet)]
+    )
+    sess["_master_uploaded"] = True
+    sess["state"] = "AWAIT_TRIP_DAY"
+    return _fleet_and_trip_prompt(sess, user)
+
+
+def _handle_user_id(phone, sess, text):
+    valid_users = _get_valid_users()
+    user = text.upper().strip()
+    if user not in valid_users:
+        return [f"❌ User not recognised. Please reply with one of: {', '.join(valid_users)}"]
+
+    sess["user_id"] = user
+    # Build the engine (history/routes/GPS); the eligible fleet is set later from
+    # the daily master lorry file the user is about to upload.
+    _hist = _resolve_history_path()
+    sess["engine"] = LorryEngine(MASTER_PATH, _hist, owner_user=user)
+    sess["_master_uploaded"] = False
+    sess["state"] = "AWAIT_MASTER_UPLOAD"
+
+    return [
+        f"✅ Logged in as *{user}*\n\n"
+        "📄 Please upload today's *master lorry file* (.xlsx).\n"
+        "I'll read which lorries are *Available* for you today (including any "
+        "cross-use lorries you've been given).\n\n"
+        "_Rule: each lorry must be *Available* for only ONE user. If the same "
+        "plate is Available for two users, I'll ask you to fix and re-upload._"
+    ]
 
 
 def _handle_trip_day(phone, sess, text):
