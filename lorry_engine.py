@@ -840,8 +840,8 @@ class LorryEngine:
         intel   = _extract_route_intelligence(route)
         cluster = intel["cluster"]
 
-        # TON already IS the "LORRY NAIK (5%)" ceiling from LORRY DAILY
-        # PLANNING.xlsx — no load may exceed it. No extra overage is allowed.
+        # TON already IS the LORRY NAIK ceiling from the master file (naik now
+        # 10%, baked into the value) — no load may exceed it. No extra overage.
         _SAME_ROUTE_OVERLOAD = 1.0
         eligible = self.eligible_lorries[
             (self.eligible_lorries["TON"] * _SAME_ROUTE_OVERLOAD >= total_ton) &

@@ -20,8 +20,9 @@ MERGE_DIST_THRESHOLD  = 0.25   # Rule 7: reject merge if extra distance > 25%
 # (MUATAN sheet) — i.e. the effective MAX load per lorry already includes the 5%
 # naik. So NO further overage is allowed: a lorry may never carry more than its
 # LORRY NAIK (5%) value. Both factors are 1.0 (the hard ceiling is TON itself).
-NAIK_FACTOR           = 1.0    # no overage beyond TON (= LORRY NAIK 5% column)
-SAME_ROUTE_NAIK       = 1.0    # same-route loads also capped at LORRY NAIK (5%)
+NAIK_FACTOR           = 1.0    # no overage beyond TON (TON IS the LORRY NAIK max
+                               # from the master file — 10% naik is baked into it)
+SAME_ROUTE_NAIK       = 1.0    # same-route loads also capped at the file's TON max
 REBAL_THRESHOLD       = 0.50   # Partial-transfer rebalance: underloaded threshold
 FILL_TARGET           = CAPACITY_TARGET   # alias used in fill-to-80% pass
 MAX_DOS_PER_LORRY     = 15     # split trigger: groups with > 15 DOs are checked for weight overflow
