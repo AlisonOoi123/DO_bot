@@ -27,6 +27,8 @@ from assignment_config import (
     # Lorry size
     LORRY_LARGE_MIN_TON, LORRY_SMALL_MAX_TON, LORRY_TINY_EXCL_TON,
     OUTSTATION_MIN_TON as _OUTSTATION_MIN_TON,
+    TINY_OUTSTATION_PREFIXES as _TINY_OUTSTATION_PREFIXES,
+    TINY_OUTSTATION_MAX_TON as _TINY_OUTSTATION_MAX_TON,
     URBAN_MAX_TON as _URBAN_MAX_TON,
     # Geographic
     DEPOT_LAT, DEPOT_LON,
@@ -728,6 +730,22 @@ def _route_code_of(it) -> str:
     r = str(it.get("ROUTE", "")).strip().upper()
     m = re.match(r"([A-Z]+\d+[A-Z]?)", r)
     return m.group(1) if m else r[:6]
+
+
+def _eff_dest_min_ton(route: str, dest_grp: str, total_weight: float) -> float:
+    """Minimum lorry tonnage for an outstation group, with the tiny-NS
+    relaxation. A very small load (≤ TINY_OUTSTATION_MAX_TON) on a Negeri
+    Sembilan / Seremban route (prefix in TINY_OUTSTATION_PREFIXES) waives the
+    outstation minimum so it can ride a small lorry. Far outstation (Kuantan,
+    Pahang, Johor, Perak, Terengganu) is never relaxed."""
+    base = _DEST_MIN_TON.get(dest_grp, 0.0)
+    if base <= 0:
+        return 0.0
+    prefix = _route_code_of({"ROUTE": route})[:2]
+    if (prefix in _TINY_OUTSTATION_PREFIXES
+            and total_weight <= _TINY_OUTSTATION_MAX_TON):
+        return 0.0
+    return base
 
 
 def _classify_dest_group(route: str, state: str = "") -> str:
@@ -3574,6 +3592,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 and str(r["LORRY"]).strip().upper() not in _res_excl
             )
             for _dk in sorted(_dir_weight, key=lambda k: _dir_weight[k]):
+                # A tiny NS/Seremban direction may ride a small lorry, so don't
+                # reserve a big lorry for it (that would waste the big lorry).
+                if (_dk[:2] in _TINY_OUTSTATION_PREFIXES
+                        and _dir_weight[_dk] <= _TINY_OUTSTATION_MAX_TON):
+                    continue
                 _need = _dir_weight[_dk]
                 _free = [(t, p) for t, p in _res_avail if p not in _reserved_lorry]
                 if not _free:
@@ -3941,7 +3964,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # All preferred lorries full / unavailable → open weight-based assignment
 
             # ── Destination-based lorry size enforcement ───────────────────────
-            _dest_min_t = _DEST_MIN_TON.get(_dest_grp, 0.0)
+            # Tiny-NS relaxation: a very small Seremban/NS load may use a small
+            # lorry (far outstation stays strict).
+            _dest_min_t = _eff_dest_min_ton(route, _dest_grp, total_w)
             # Exclude undersized lorries for long-distance destinations
             if _dest_min_t > 0:
                 excluded = excluded | {
@@ -4006,6 +4031,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 top_n=1,
                 customer_name=customer,
                 today_date_str=_today(),
+                # Tiny NS/Seremban load whose outstation min was waived → let the
+                # engine consider small lorries too (don't waste a big one).
+                allow_small=(_dest_min_t == 0),
             )
 
             if suggestions:
@@ -5744,7 +5772,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _dg = max((_classify_dest_group(x.get("ROUTE", ""), x.get("STATE", ""))
                        for x in _rits),
                       key=lambda g: _DEST_MIN_TON.get(g, 0.0))
-            _dmin = _DEST_MIN_TON.get(_dg, _OUTSTATION_MIN_TON)
+            _dmin = _eff_dest_min_ton(_rits[0].get("ROUTE", ""), _dg, _rw)
             _rmt = min((x["MAX_TON"] for x in _rits
                         if x.get("MAX_TON") is not None), default=None)
             _rforbid: set = set()
@@ -6121,6 +6149,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _audit_caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
                        for _, r in engine.eligible_lorries.iterrows()}
         _audit_owner = set(_audit_caps)          # owner + SPARE fleet
+        # Per-lorry total load — used to apply the tiny-NS relaxation in the audit
+        # (a small Seremban load on a small lorry is allowed only when the whole
+        # load on that lorry is tiny).
+        _audit_load: dict = defaultdict(float)
+        for _it in items:
+            if _it.get("LORRY") in _audit_caps:
+                _audit_load[_it["LORRY"]] += _it["WEIGHT"]
         _audit_viol: list[str] = []
         for _it in items:
             _l = _it.get("LORRY")
@@ -6133,10 +6168,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Rule A1 — owner isolation
             if _l not in _audit_owner:
                 _reason = "OWNER_ISOLATION"
-            # Rule A2 — outstation minimum tonnage (≤5T never outstation)
-            elif _dg not in _DEST_URBAN_GROUPS and _lt < _DEST_MIN_TON.get(_dg, _OUTSTATION_MIN_TON):
-                # Far outstation (LARGE_LONG) needs >11T; nearer (MEDIUM_LONG) >5T.
-                _reason = f"OUTSTATION_NEEDS_>{_DEST_MIN_TON.get(_dg, _OUTSTATION_MIN_TON):.0f}T"
+            # Rule A2 — outstation minimum tonnage. Far outstation (LARGE_LONG)
+            # needs >11T; nearer (MEDIUM_LONG) >5T — waived for a tiny NS load.
+            elif _dg not in _DEST_URBAN_GROUPS and _lt < _eff_dest_min_ton(_rt, _dg, _audit_load[_l]):
+                _reason = f"OUTSTATION_NEEDS_>{_eff_dest_min_ton(_rt, _dg, _audit_load[_l]):.0f}T"
             # Rule A5 — REMARKS / SHIP_DETAIL size cap (incl. MAX 2 TON → van)
             elif _it.get("MAX_TON") is not None and _lt > _it["MAX_TON"]:
                 _reason = "SIZE_CAP_EXCEEDED"

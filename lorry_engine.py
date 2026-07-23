@@ -821,7 +821,8 @@ class LorryEngine:
     # ── Core suggest ──────────────────────────────────────────────────────────
 
     def suggest(self, route, total_ton, unavailable=None, top_n=3,
-                customer_name="", today_stop_counts=None, today_date_str=""):
+                customer_name="", today_stop_counts=None, today_date_str="",
+                allow_small=False):
         """
         Scoring (all PDF rules):
         1. Eligibility + Rule 6 (stop limit)
@@ -912,8 +913,10 @@ class LorryEngine:
         # Outstation routes (>50 km): exclude small lorries (≤5T) and vans.
         # Small lorries (≤5T) can ONLY serve KL/Selangor urban routes.
         # Urban routes (<50 km): no size cap — weight-based sort picks smallest fit.
+        # allow_small=True bypasses this (used for a tiny NS/Seremban load that
+        # the caller has decided may ride a small lorry).
         _OUTSTATION_MIN_TON = 5.001
-        if _route_dist_km >= 50.0:
+        if _route_dist_km >= 50.0 and not allow_small:
             _no_small = merged[merged["TON"] >= _OUTSTATION_MIN_TON]
             if not _no_small.empty:
                 merged = _no_small

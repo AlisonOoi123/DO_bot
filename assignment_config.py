@@ -36,6 +36,14 @@ LORRY_TINY_EXCL_TON   = 4.5    # routes with tiny items exclude lorries ≥ this
 # Lorries with TON ≤ 5T are forbidden on any outstation (non-urban) route.
 OUTSTATION_MIN_TON    = 5.001
 
+# Tiny-outstation relaxation. A VERY small outstation load on a Negeri Sembilan
+# (Seremban) route may ride a small lorry instead of tying up a big one — the
+# operator allows this ONLY for NS/Seremban, NEVER for far outstation (Kuantan,
+# Pahang, Johor, Perak, Terengganu). If the route prefix is in the set below AND
+# the group's total load is ≤ the cap, the outstation minimum tonnage is waived.
+TINY_OUTSTATION_PREFIXES = {"NS"}
+TINY_OUTSTATION_MAX_TON  = 2.0
+
 # ── Urban maximum tonnage ─────────────────────────────────────────────────────
 # Urban (KL / Selangor) routes visit many closely-spaced stops in one trip; a
 # lorry larger than this cannot physically cover them all in one run. So any DO
