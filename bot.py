@@ -2264,6 +2264,15 @@ def _handle_master_upload(phone, sess, file_bytes):
         return [f"⚠️ No *Available* lorries found for *{user}* in the master file.\n"
                 "Check the Status column (should say 'Available' on your rows) and "
                 "upload the master lorry file again."]
+    # Fresh start: uploading the master file clears THIS user's previous
+    # assignments from today's log, so a re-run isn't blocked by their own
+    # earlier lorries. Other users' log entries are left intact.
+    _by = get_assigned_by()
+    _mine_in_log = [p for p, u in _by.items() if u == user]
+    if _mine_in_log:
+        clear_specific_plates_from_log(_mine_in_log)
+    sess["unavailable"] = set(get_assigned_today()) | set(get_broken_lorries())
+
     # Replace the engine's eligible fleet with TODAY's availability for this user.
     sess["engine"].eligible_lorries = pd.DataFrame(
         [{"LORRY": p, "TON": t, "USER": user, "Status": "Available"}
@@ -2271,7 +2280,12 @@ def _handle_master_upload(phone, sess, file_bytes):
     )
     sess["_master_uploaded"] = True
     sess["state"] = "AWAIT_TRIP_DAY"
-    return _fleet_and_trip_prompt(sess, user)
+    _cleared_note = (f"\n🗑️ Cleared *{user}*'s previous log ({len(_mine_in_log)} "
+                     f"lorry) for a fresh run." if _mine_in_log else "")
+    _msgs = _fleet_and_trip_prompt(sess, user)
+    if _cleared_note:
+        _msgs[0] = _msgs[0] + _cleared_note
+    return _msgs
 
 
 def _handle_user_id(phone, sess, text):
