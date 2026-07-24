@@ -6186,8 +6186,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _l_dirs = {_urban_corridor_of(x) for x in _l_items} - {None}
             if not _l_dirs:
                 continue                              # lorry isn't on an urban corridor
+            # Candidates = same-corridor DOs on OTHER lorries OR still unassigned
+            # (NO_LORRY) — so a corridor lorry with room also RESCUES stranded
+            # same-corridor drops, not just rebalances.
             _cands = [x for x in items
-                      if x.get("LORRY") in _lorry_cap_map and x.get("LORRY") != _l
+                      if (x.get("LORRY") in _lorry_cap_map or x.get("LORRY") == "NO_LORRY")
+                      and x.get("LORRY") != _l
                       and _urban_corridor_of(x) in _l_dirs]
             for _unit in sorted(_atomic_components(_cands, _rcode, _gps_of,
                                                    lambda x: x.get("CODE", "")),
