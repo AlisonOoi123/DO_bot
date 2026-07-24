@@ -121,12 +121,15 @@ SHIP_DETAIL format: `<days>, [AM|PM], MAX <N> TON` (any part optional).
 - Days / AM / PM are read but **not** used to filter assignment (the operator
   chooses the trip day at login; the SCHD sheet does day filtering).
 
-> ⚠️ CURRENT CODE STATE (pending operator decision): only `MAX 2 TON` from
-> SHIP_DETAIL is enforced today (→ van). `MAX 5 / 11 / 15 / 21 TON` are NOT
-> capped — those DOs follow ordinary weight/route rules. This matches the
-> operator's most recent explicit instruction. Principle 4 above describes the
-> intended "cap ≤ N and pick by weight" behaviour. **These differ — do not
-> change without confirming which is wanted.**
+> SHIP_DETAIL size rules (current):
+> - `MAX 2 TON` → always enforced (van), regardless of REMARKS.
+> - A REMARKS size cap (e.g. `SMALL LORRY` ≤5T) that also has `MAX N TON` in
+>   SHIP_DETAIL is **overridden/lifted to N** — e.g. `SMALL LORRY` + `MAX 15
+>   TON` may ride up to a 15T lorry (so it can merge with other 15T-capable
+>   DOs). The SHIP_DETAIL value is authoritative over the REMARKS phrase.
+> - A plain `MAX N TON` (N>2) with **no** REMARKS restriction is ignored — it
+>   does not newly cap an otherwise-free DO (so e.g. Kuantan can still use a
+>   21T lorry even if its SHIP_DETAIL says MAX 15 TON).
 
 ### Principle 5 — Fully utilise every lorry.
 The optimisation goal. After the constraint-respecting assignment, run the

@@ -2704,19 +2704,29 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _remarks_raw = str(row.get("REMARKS", "")).strip()
 
             # ── SHIP_DETAIL column (new file format) ──────────────────────────
-            # Format: "<days>, [AM|PM], MAX <N> TON".  Per operator, ONLY
-            # "MAX 2 TON" is enforced from SHIP_DETAIL → that DO must go on a
-            # lorry under 2T (a van).  All other MAX values (5/11/15/21 TON) are
-            # NOT capped here — those DOs follow the original assignment rules.
-            # (Day / AM-PM parts are ignored, per request.)  REMARKS size phrases
-            # (VAN, LORRY KECIL, BELOW 5 TON, …) keep their original behaviour.
+            # Format: "<days>, [AM|PM], MAX <N> TON".  The SHIP_DETAIL "MAX N TON"
+            # is AUTHORITATIVE and OVERRIDES the REMARKS size phrase: e.g. a DO
+            # whose REMARKS say "SMALL LORRY" (≤5T) but whose SHIP_DETAIL says
+            # "MAX 15 TON" may ride up to a 15T lorry (so it can merge with other
+            # 15T-capable DOs). If SHIP_DETAIL has no MAX, the REMARKS cap applies.
+            # (Day / AM-PM parts are ignored, per request.)
+            # Rules:
+            #  • SHIP_DETAIL "MAX 2 TON" is always enforced (van), regardless.
+            #  • If REMARKS impose a size cap (e.g. SMALL LORRY ≤5T) AND
+            #    SHIP_DETAIL says "MAX N TON", the SHIP value OVERRIDES/LIFTS the
+            #    REMARKS cap (SMALL LORRY + MAX 15 TON → may ride up to 15T).
+            #  • A SHIP_DETAIL MAX with NO REMARKS restriction is ignored (a
+            #    plain "MAX 15 TON" does not newly cap an otherwise-free DO — so
+            #    Kuantan can still use a 21T lorry).
             _ship_raw = str(row.get("SHIP_DETAIL", "")).strip()
             _cap_remarks = _remarks_lorry_cap(_remarks_raw)
-            _cap_ship    = _remarks_lorry_cap(_ship_raw)
-            if _cap_ship != 2.0:      # only MAX 2 TON from SHIP_DETAIL applies
-                _cap_ship = None
-            _caps_all    = [c for c in (_cap_remarks, _cap_ship) if c is not None]
-            _size_cap    = min(_caps_all) if _caps_all else None
+            _cap_ship    = _remarks_lorry_cap(_ship_raw)   # MAX N TON from SHIP_DETAIL
+            if _cap_ship == 2.0:
+                _size_cap = 2.0                          # MAX 2 TON → van (always)
+            elif _cap_remarks is not None and _cap_ship is not None:
+                _size_cap = _cap_ship                    # SHIP MAX lifts REMARKS cap
+            else:
+                _size_cap = _cap_remarks                 # REMARKS cap, or no cap
 
             # Remarks-day filter DISABLED by request: assignment now depends only
             # on the trip day the user selected at login (today/tomorrow) plus the
