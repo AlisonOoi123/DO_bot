@@ -6155,6 +6155,73 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if not _moved:
                 break
 
+        # ── Priority 3 — partial CORRIDOR top-up (fill spare space) ───────────
+        # A lorry carrying a corridor route (e.g. KV20A) that still has spare
+        # space is topped up with individual same-CORRIDOR drops (e.g. KV19A
+        # stops from another lorry) so the two south routes ride together and
+        # the lorry is fully used. Only defined corridors (KV_SOUTH, KV_EAST,
+        # KV_NORTH …) merge this way; whole GPS/customer units stay together and
+        # the geo spread + size cap + forbidden plates are respected.
+        _corridor_names = set(_ROUTE_CORRIDOR_GROUPS)
+
+        def _urban_corridor_of(_it):
+            if _classify_dest_group(_it.get("ROUTE", ""),
+                                    _it.get("STATE", "")) not in _DEST_URBAN_GROUPS:
+                return None
+            _dk = _direction_key(_it.get("ROUTE", ""))
+            return _dk if _dk in _corridor_names else None
+
+        _tc_phys: dict[str, float] = defaultdict(float)
+        for _it in items:
+            if _it.get("LORRY") in _lorry_cap_map:
+                _tc_phys[_it["LORRY"]] += _it["WEIGHT"]
+        for _l in sorted(_lorry_cap_map,
+                         key=lambda l: -(float(_lorry_cap_map[l]) - _tc_phys[l])):
+            if _l in _blocked_today:
+                continue
+            _free = float(_lorry_cap_map[_l]) * NAIK_FACTOR - _tc_phys[_l]
+            if _free <= 0.05:
+                continue
+            _l_items = [x for x in items if x.get("LORRY") == _l]
+            _l_dirs = {_urban_corridor_of(x) for x in _l_items} - {None}
+            if not _l_dirs:
+                continue                              # lorry isn't on an urban corridor
+            _cands = [x for x in items
+                      if x.get("LORRY") in _lorry_cap_map and x.get("LORRY") != _l
+                      and _urban_corridor_of(x) in _l_dirs]
+            for _unit in sorted(_atomic_components(_cands, _rcode, _gps_of,
+                                                   lambda x: x.get("CODE", "")),
+                                key=lambda u: sum(x["WEIGHT"] for x in u)):
+                _uw = sum(x["WEIGHT"] for x in _unit)
+                if _uw > _free:
+                    continue
+                _umt = min((x["MAX_TON"] for x in _unit
+                            if x.get("MAX_TON") is not None), default=None)
+                if _umt is not None and float(_lorry_cap_map[_l]) > _umt:
+                    continue
+                _ufp: set = set()
+                for x in _unit:
+                    if x.get("FORBID_PLATES"):
+                        _ufp |= x["FORBID_PLATES"]
+                if _l in _ufp:
+                    continue
+                _lpts = [_pt_of(x) for x in items if x.get("LORRY") == _l and _pt_of(x)]
+                _add = [_pt_of(x) for x in _unit if _pt_of(x)]
+                if not _lorry_geo_ok(_lpts + _add):
+                    continue
+                for x in _unit:
+                    _tc_phys[x["LORRY"]] -= x["WEIGHT"]
+                    _tc_phys[_l] += x["WEIGHT"]
+                    x["LORRY"] = _l
+                    sess["assigned"][x["DO NUMBER"]] = _l
+                    _unassigned_reasons.pop(x["DO NUMBER"], None)
+                    _session_loads[_l] = float(_session_loads.get(_l, 0)) + x["WEIGHT"]
+                _record_lorry_state(_l, next(
+                    (x.get("STATE", "").strip().upper() for x in _unit if x.get("STATE")), ""))
+                _free -= _uw
+                if _free <= 0.05:
+                    break
+
         # ── RULES-COMPLIANCE GATE (ASSIGNMENT_RULES.md / DO_BOT_SKILL.md §A) ───
         # Final deterministic audit: every assigned DO must obey the HARD rules.
         # Any violation is corrected (the DO is unassigned → NO_LORRY) and logged,
