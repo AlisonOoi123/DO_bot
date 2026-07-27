@@ -1,0 +1,493 @@
+"""
+Web front-end for the DO lorry-assignment engine.
+
+This is a thin, responsive web UI over the SAME assignment engine that powers
+the WhatsApp bot (bot.py). It reuses the exact same handlers and rules —
+nothing about the assignment logic changes; only the interface does.
+
+Flow (mirrors the WhatsApp flow):
+    1. Login (pick your name — ABI / VIVIAN / …)
+    2. (ABI / VIVIAN only) upload today's master lorry file
+    3. Choose Today / Tomorrow
+    4. Upload the DO Excel file
+    5. See the assignment result on screen and download the filled Excel
+
+Run locally (e.g. on your office PC), then open it from any phone or PC on the
+same network:
+
+    pip install flask
+    python web_app.py
+    → open http://<this-pc-ip>:8000  (e.g. http://10.0.0.229:8000)
+
+The page is responsive: it fits a desktop portal and a phone screen.
+"""
+from __future__ import annotations
+
+import secrets
+import io
+
+from flask import (
+    Flask, request, jsonify, send_file, make_response, Response,
+)
+
+import bot   # the existing engine — reused as-is
+
+app = Flask(__name__)
+
+# Each browser gets a random session token stored in a cookie. We map that token
+# to a bot session (bot.get_session(token)) so the engine's per-user state
+# machine works exactly as it does for a WhatsApp phone number.
+_COOKIE = "do_sid"
+
+
+def _sid() -> str:
+    """Return the caller's session id, creating one if absent."""
+    sid = request.cookies.get(_COOKIE)
+    if not sid:
+        sid = "web_" + secrets.token_hex(8)
+    return sid
+
+
+def _with_cookie(payload, sid, status=200):
+    resp = make_response(jsonify(payload), status)
+    resp.set_cookie(_COOKIE, sid, samesite="Lax", max_age=60 * 60 * 8)
+    return resp
+
+
+def _file_bytes():
+    """Read the uploaded file from the request (field name 'file')."""
+    f = request.files.get("file")
+    if not f:
+        return None
+    return f.read()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result rendering — turn the engine's session state into structured JSON so the
+# browser can draw a clean table instead of parsing chat text.
+# ─────────────────────────────────────────────────────────────────────────────
+_SENTINELS = {"NO_LORRY", "NO_ELIGIBLE_LORRY", "SPLIT", "SKIPPED",
+              "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE",
+              "", None}
+
+
+def _result_json(sess) -> dict:
+    """Group the assigned items by lorry and list what couldn't be assigned."""
+    items = sess.get("items", []) or []
+    engine = sess.get("engine")
+    caps = {}
+    if engine is not None and getattr(engine, "eligible_lorries", None) is not None:
+        try:
+            for _, r in engine.eligible_lorries.iterrows():
+                caps[str(r["LORRY"]).strip().upper()] = float(r["TON"])
+        except Exception:
+            caps = {}
+
+    lorries: dict[str, dict] = {}
+    unassigned: list[dict] = []
+    skipped_other = 0
+
+    for it in items:
+        lorry = it.get("LORRY")
+        do = {
+            "do": str(it.get("DO NUMBER", "")),
+            "route": str(it.get("ROUTE", "")),
+            "customer": str(it.get("CUSTOMER NAME", "")),
+            "weight": round(float(it.get("WEIGHT", 0) or 0), 3),
+            "state": str(it.get("STATE", "")),
+        }
+        if lorry in ("OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP"):
+            skipped_other += 1
+            continue
+        if lorry in _SENTINELS:
+            do["reason"] = sess.get("_unassigned_reasons", {}).get(
+                do["do"], "NO_LORRY") if isinstance(
+                sess.get("_unassigned_reasons"), dict) else "NO_LORRY"
+            unassigned.append(do)
+            continue
+        grp = lorries.setdefault(lorry, {
+            "lorry": lorry,
+            "capacity": caps.get(str(lorry).strip().upper()),
+            "load": 0.0,
+            "dos": [],
+        })
+        grp["load"] = round(grp["load"] + do["weight"], 3)
+        grp["dos"].append(do)
+
+    lorry_list = sorted(lorries.values(), key=lambda g: g["lorry"])
+    for g in lorry_list:
+        cap = g["capacity"]
+        g["util"] = round(100.0 * g["load"] / cap, 1) if cap else None
+
+    total_dos = sum(len(g["dos"]) for g in lorry_list)
+    return {
+        "lorries": lorry_list,
+        "unassigned": unassigned,
+        "summary": {
+            "lorries_used": len(lorry_list),
+            "dos_assigned": total_dos,
+            "dos_unassigned": len(unassigned),
+            "dos_other": skipped_other,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API endpoints — each drives the existing engine handler for the current step.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/state")
+def api_state():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    return _with_cookie({
+        "state": sess.get("state", "IDLE"),
+        "user": sess.get("user_id"),
+    }, sid)
+
+
+@app.route("/api/users")
+def api_users():
+    sid = _sid()
+    try:
+        users = bot._get_valid_users()
+    except Exception:
+        users = ["ABI", "VIVIAN"]
+    return _with_cookie({"users": list(users)}, sid)
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    user = (request.json or {}).get("user", "")
+    msgs = bot._handle_user_id(sid, sess, str(user))
+    return _with_cookie({
+        "messages": msgs,
+        "state": sess.get("state"),
+        "user": sess.get("user_id"),
+        # AWAIT_MASTER_UPLOAD → needs master file; AWAIT_TRIP_DAY → skip to day
+        "needs_master": sess.get("state") == "AWAIT_MASTER_UPLOAD",
+    }, sid)
+
+
+@app.route("/api/master", methods=["POST"])
+def api_master():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    fb = _file_bytes()
+    if fb is None:
+        return _with_cookie({"error": "No file uploaded."}, sid, 400)
+    msgs = bot._handle_master_upload(sid, sess, fb)
+    return _with_cookie({
+        "messages": msgs,
+        "state": sess.get("state"),
+        # advanced to AWAIT_TRIP_DAY on success; stayed put on validation error
+        "ok": sess.get("state") == "AWAIT_TRIP_DAY",
+    }, sid)
+
+
+@app.route("/api/day", methods=["POST"])
+def api_day():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    day = (request.json or {}).get("day", "today")
+    # Web users pick the day explicitly; honour it regardless of SCHD hints.
+    sess["_ignore_schedule"] = True
+    msgs = bot._handle_trip_day(sid, sess, str(day))
+    return _with_cookie({
+        "messages": msgs,
+        "state": sess.get("state"),
+        "ok": sess.get("state") in ("AWAIT_EXCEL", "AWAIT_TRIP_DAY"),
+    }, sid)
+
+
+@app.route("/api/dos", methods=["POST"])
+def api_dos():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    fb = _file_bytes()
+    if fb is None:
+        return _with_cookie({"error": "No file uploaded."}, sid, 400)
+    msgs = bot._handle_excel_upload(sid, sess, fb)
+    result = _result_json(sess) if sess.get("items") else None
+    return _with_cookie({
+        "messages": msgs,
+        "state": sess.get("state"),
+        "result": result,
+    }, sid)
+
+
+@app.route("/api/download")
+def api_download():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    # Ensure the export bytes exist (build them if the user goes straight to
+    # download after seeing the result).
+    data = sess.get("export_bytes")
+    if not data:
+        try:
+            bot._export_result(sess)
+            data = sess.get("export_bytes")
+        except Exception:
+            data = None
+    if not data:
+        return _with_cookie({"error": "Nothing to download yet."}, sid, 400)
+    return send_file(
+        io.BytesIO(data),
+        as_attachment=True,
+        download_name="DO_Assigned.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/api/reset", methods=["POST"])
+def api_reset():
+    sid = _sid()
+    bot.reset_session(sid)
+    return _with_cookie({"ok": True}, sid)
+
+
+@app.route("/")
+def index():
+    return Response(_PAGE, mimetype="text/html")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The single-page responsive UI (inline so this stays one self-contained file).
+# ─────────────────────────────────────────────────────────────────────────────
+_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lorry Assignment</title>
+<style>
+  :root{
+    --bg:#0f172a; --card:#1e293b; --card2:#273449; --line:#334155;
+    --ink:#e2e8f0; --muted:#94a3b8; --brand:#38bdf8; --brand2:#0ea5e9;
+    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --radius:14px;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f1f5f9; --card:#ffffff; --card2:#f8fafc; --line:#e2e8f0;
+      --ink:#0f172a; --muted:#64748b; --brand:#0284c7; --brand2:#0369a1; }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.45;-webkit-text-size-adjust:100%}
+  .wrap{max-width:960px;margin:0 auto;padding:16px}
+  header{display:flex;align-items:center;gap:10px;padding:8px 0 16px}
+  header .logo{font-size:26px}
+  header h1{font-size:19px;margin:0;font-weight:700}
+  header .who{margin-left:auto;font-size:13px;color:var(--muted)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+    padding:18px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+  .step-title{font-size:13px;text-transform:uppercase;letter-spacing:.05em;
+    color:var(--muted);margin:0 0 12px;font-weight:700}
+  .hidden{display:none!important}
+  .btn{appearance:none;border:0;border-radius:10px;padding:12px 16px;font-size:15px;
+    font-weight:600;cursor:pointer;background:var(--brand);color:#04222f;width:100%}
+  .btn:active{transform:translateY(1px)}
+  .btn.secondary{background:var(--card2);color:var(--ink);border:1px solid var(--line)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row>*{flex:1 1 140px}
+  .grid-users{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
+  .userbtn{background:var(--card2);border:1px solid var(--line);border-radius:12px;
+    padding:16px;font-size:16px;font-weight:700;cursor:pointer;color:var(--ink);text-align:center}
+  .userbtn:active{border-color:var(--brand)}
+  .drop{border:2px dashed var(--line);border-radius:12px;padding:26px 16px;text-align:center;
+    color:var(--muted);cursor:pointer;background:var(--card2)}
+  .drop.hot{border-color:var(--brand);color:var(--ink)}
+  .drop input{display:none}
+  .msg{font-size:14px;white-space:pre-wrap;background:var(--card2);border:1px solid var(--line);
+    border-radius:10px;padding:12px;margin-top:12px;color:var(--muted)}
+  .msg.err{color:var(--bad);border-color:var(--bad)}
+  .stat{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .pill{background:var(--card2);border:1px solid var(--line);border-radius:999px;
+    padding:6px 12px;font-size:13px;font-weight:600}
+  .pill b{color:var(--brand)}
+  .pill.bad b{color:var(--bad)}
+  .lorry{border:1px solid var(--line);border-radius:12px;margin-bottom:12px;overflow:hidden}
+  .lorry h3{margin:0;padding:12px 14px;background:var(--card2);font-size:15px;
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .lorry h3 .cap{margin-left:auto;font-size:13px;color:var(--muted);font-weight:600}
+  .bar{height:6px;background:var(--line);border-radius:6px;overflow:hidden;margin:0 14px 10px}
+  .bar>i{display:block;height:100%;background:var(--ok)}
+  .bar>i.hi{background:var(--warn)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 14px;border-top:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  td.w{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .scroll{overflow-x:auto}
+  .unassigned h3{color:var(--bad)}
+  .foot{color:var(--muted);font-size:12px;text-align:center;padding:8px 0 24px}
+  .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--line);
+    border-top-color:var(--brand);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  a.dl{display:inline-block;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="logo">🚚</span>
+    <h1>Lorry Assignment</h1>
+    <span class="who" id="who"></span>
+  </header>
+
+  <!-- Step 1: login -->
+  <div class="card" id="card-login">
+    <p class="step-title">Step 1 · Who are you?</p>
+    <div class="grid-users" id="users"><span class="spin"></span></div>
+    <div class="msg hidden" id="login-msg"></div>
+  </div>
+
+  <!-- Step 2: master lorry file -->
+  <div class="card hidden" id="card-master">
+    <p class="step-title">Step 2 · Upload master lorry file</p>
+    <label class="drop" id="drop-master">
+      <div>📄 Tap to choose the <b>master lorry</b> .xlsx<br><small>or drag &amp; drop</small></div>
+      <input type="file" id="file-master" accept=".xlsx">
+    </label>
+    <div class="msg hidden" id="master-msg"></div>
+  </div>
+
+  <!-- Step 3: day -->
+  <div class="card hidden" id="card-day">
+    <p class="step-title">Step 3 · Which day?</p>
+    <div class="row">
+      <button class="btn" data-day="today">Today</button>
+      <button class="btn secondary" data-day="tomorrow">Tomorrow</button>
+    </div>
+    <div class="msg hidden" id="day-msg"></div>
+  </div>
+
+  <!-- Step 4: DO file -->
+  <div class="card hidden" id="card-dos">
+    <p class="step-title">Step 4 · Upload DO file</p>
+    <label class="drop" id="drop-dos">
+      <div>📎 Tap to choose the <b>DO</b> .xlsx<br><small>or drag &amp; drop</small></div>
+      <input type="file" id="file-dos" accept=".xlsx">
+    </label>
+    <div class="msg hidden" id="dos-msg"></div>
+  </div>
+
+  <!-- Step 5: result -->
+  <div class="card hidden" id="card-result">
+    <p class="step-title">Result</p>
+    <div class="stat" id="result-stat"></div>
+    <div style="margin-bottom:14px">
+      <a class="dl" href="/api/download"><button class="btn">⬇️ Download filled Excel</button></a>
+    </div>
+    <div id="result-body"></div>
+    <button class="btn secondary" id="btn-restart" style="margin-top:8px">Start over</button>
+  </div>
+
+  <div class="foot">Same assignment engine as the WhatsApp bot · works on phone &amp; desktop</div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const show = (id,on=true)=>{ $(id).classList.toggle('hidden',!on); };
+const setMsg = (id,txt,err=false)=>{ const e=$(id); if(!txt){e.classList.add('hidden');return;}
+  e.textContent=Array.isArray(txt)?txt.join('\n'):txt; e.classList.toggle('err',err); e.classList.remove('hidden'); };
+
+async function jpost(url,body){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); return r.json(); }
+async function fpost(url,file){ const fd=new FormData(); fd.append('file',file); const r=await fetch(url,{method:'POST',body:fd}); return r.json(); }
+
+// ---- Step 1: users ----
+async function loadUsers(){
+  const d = await (await fetch('/api/users')).json();
+  const box=$('#users'); box.innerHTML='';
+  (d.users||[]).forEach(u=>{
+    const b=document.createElement('button'); b.className='userbtn'; b.textContent=u;
+    b.onclick=()=>login(u); box.appendChild(b);
+  });
+}
+async function login(user){
+  setMsg('#login-msg','Logging in… ',false);
+  const d = await jpost('/api/login',{user});
+  if(d.user){ $('#who').textContent='Logged in as '+d.user; setMsg('#login-msg',null); show('#card-login',false);
+    if(d.needs_master){ show('#card-master',true); } else { show('#card-day',true); } }
+  else { setMsg('#login-msg',d.messages||'Login failed',true); }
+}
+
+// ---- file drop helper ----
+function wireDrop(dropId,inputId,onFile){
+  const drop=$(dropId), input=$(inputId);
+  input.addEventListener('change',()=>{ if(input.files[0]) onFile(input.files[0]); });
+  ['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('hot');}));
+  ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('hot');}));
+  drop.addEventListener('drop',e=>{ const f=e.dataTransfer.files[0]; if(f) onFile(f); });
+}
+
+// ---- Step 2: master ----
+wireDrop('#drop-master','#file-master',async(f)=>{
+  setMsg('#master-msg','Reading master file… ',false);
+  const d=await fpost('/api/master',f);
+  setMsg('#master-msg',d.messages||d.error,!d.ok);
+  if(d.ok){ show('#card-master',false); show('#card-day',true); }
+});
+
+// ---- Step 3: day ----
+document.querySelectorAll('[data-day]').forEach(b=>b.onclick=async()=>{
+  setMsg('#day-msg','Setting day… ',false);
+  const d=await jpost('/api/day',{day:b.dataset.day});
+  setMsg('#day-msg',d.messages,false);
+  show('#card-day',false); show('#card-dos',true);
+});
+
+// ---- Step 4: DOs ----
+wireDrop('#drop-dos','#file-dos',async(f)=>{
+  setMsg('#dos-msg','Assigning lorries… this can take a moment ',false);
+  const d=await fpost('/api/dos',f);
+  if(d.result){ renderResult(d.result); show('#card-dos',false); show('#card-result',true); setMsg('#dos-msg',null); }
+  else { setMsg('#dos-msg',d.messages||d.error||'Could not process file',true); }
+});
+
+// ---- Step 5: render ----
+function esc(s){ return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function renderResult(r){
+  const s=r.summary;
+  $('#result-stat').innerHTML =
+    `<span class="pill">Lorries used <b>${s.lorries_used}</b></span>`+
+    `<span class="pill">DOs assigned <b>${s.dos_assigned}</b></span>`+
+    (s.dos_unassigned?`<span class="pill bad">Unassigned <b>${s.dos_unassigned}</b></span>`:'')+
+    (s.dos_other?`<span class="pill">Other user / skipped <b>${s.dos_other}</b></span>`:'');
+  let html='';
+  r.lorries.forEach(g=>{
+    const cap=g.capacity!=null?g.capacity.toFixed(2)+'T':'—';
+    const util=g.util!=null?g.util:0;
+    html+=`<div class="lorry"><h3>🚚 ${esc(g.lorry)} <span class="cap">${g.load.toFixed(2)}T / ${cap}${g.util!=null?' · '+g.util+'%':''}</span></h3>`;
+    html+=`<div class="bar"><i class="${util>100?'hi':''}" style="width:${Math.min(util,100)}%"></i></div>`;
+    html+=`<div class="scroll"><table><thead><tr><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th></tr></thead><tbody>`;
+    g.dos.forEach(d=>{ html+=`<tr><td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td></tr>`; });
+    html+=`</tbody></table></div></div>`;
+  });
+  if(r.unassigned.length){
+    html+=`<div class="lorry unassigned"><h3>⚠️ Unassigned (${r.unassigned.length})</h3>`;
+    html+=`<div class="scroll"><table><thead><tr><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th><th>Reason</th></tr></thead><tbody>`;
+    r.unassigned.forEach(d=>{ html+=`<tr><td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td><td>${esc(d.reason||'')}</td></tr>`; });
+    html+=`</tbody></table></div></div>`;
+  }
+  $('#result-body').innerHTML=html;
+}
+
+$('#btn-restart').onclick=async()=>{ await jpost('/api/reset',{}); location.reload(); };
+
+loadUsers();
+</script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", "8000"))
+    print(f"\n  DO Lorry-Assignment web app running.")
+    print(f"  Open on this PC:      http://127.0.0.1:{port}")
+    print(f"  Open from a phone:    http://<this-pc-ip>:{port}  "
+          f"(e.g. http://10.0.0.229:{port})\n")
+    app.run(host="0.0.0.0", port=port, debug=False)
