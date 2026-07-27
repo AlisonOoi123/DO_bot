@@ -2516,18 +2516,34 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
 SLIGHT_OVERLOAD = 1.20
 
 
-def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
-    """Final safety net: place DOs that the main assignment left NO_LORRY by
-    (1) fitting within capacity, (2) allowing a slight overload, or (3) for a
-    large DO, reserving a big-enough lorry — evicting its small compatible DOs
-    to other lorries — exactly as a human planner does. Only ever REDUCES the
-    unassigned count; never strands a DO that was already placed unless it is
-    immediately re-placed elsewhere.
+def _is_urban_do(it) -> bool:
+    """True if a DO is an urban delivery (Kuala Lumpur / Selangor).
 
-    Compatibility is conservative: a leftover is only added to a lorry that is
-    empty, already carries the same route prefix, or already serves the same
-    destination state — so it never mixes unrelated directions. Per-DO size
-    caps (MAX_TON) and forbidden plates are always respected.
+    Uses the engine's own destination classifier so it matches the rest of the
+    assignment logic: KV Klang-Valley routes count as urban (KL/SELANGOR),
+    while semi-outstation KV codes (e.g. KV01A Tanjung Malim → MEDIUM_LONG) and
+    all PH/NS/JH/PK routes count as outstation — regardless of a border row's
+    raw STATE value.
+    """
+    try:
+        grp = _classify_dest_group(str(it.get("ROUTE", "")),
+                                   str(it.get("STATE", "")))
+        return grp in _DEST_URBAN_GROUPS
+    except Exception:
+        st = str(it.get("STATE", "")).strip().upper()
+        return ("KUALA LUMPUR" in st) or ("SELANGOR" in st)
+
+
+def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
+    """Final safety net for URBAN DOs only.
+
+    Slight overload is allowed strictly for Kuala Lumpur / Selangor routes, and
+    only onto lorries that carry urban DOs (or are empty) — an urban DO is
+    NEVER added to a lorry that already carries an outstation route, so urban
+    and outstation are never mixed. Outstation DOs are left exactly as the main
+    assignment placed them (no overload, no reshuffling). Per-DO size caps
+    (MAX_TON) and forbidden plates are always respected. Only ever REDUCES the
+    unassigned count.
     """
     import re as _re
     eng = sess.get("engine")
@@ -2546,17 +2562,14 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
         m = _re.match(r'\s*([A-Z]{1,3}\d+[A-Z]?)', str(it.get("ROUTE", "")))
         return m.group(1) if m else ""
 
-    load  = {l: 0.0 for l in caps}
-    pfxs  = {l: set() for l in caps}
-    states = {l: set() for l in caps}
+    load = {l: 0.0 for l in caps}
+    has_outstation = {l: False for l in caps}   # lorry carries a non-urban DO
     for it in items:
         l = it.get("LORRY")
         if l in caps:
             load[l] += it.get("WEIGHT", 0.0) or 0.0
-            pfxs[l].add(_pfx(it))
-            st = str(it.get("STATE", "")).strip().upper()
-            if st:
-                states[l].add(st)
+            if not _is_urban_do(it):
+                has_outstation[l] = True
 
     def _allowed(it, l):
         mt = it.get("MAX_TON")
@@ -2567,111 +2580,40 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
             return False
         return True
 
-    def _compatible(it, l):
-        if load[l] <= 1e-9 and not pfxs[l]:
-            return True                      # empty lorry — any direction ok
-        p = _pfx(it)
-        st = str(it.get("STATE", "")).strip().upper()
-        return (p and p in pfxs[l]) or (st and st in states[l])
-
     def _place(it, l):
         it["LORRY"] = l
         sess["assigned"][it["DO NUMBER"]] = l
         load[l] += it.get("WEIGHT", 0.0) or 0.0
-        pfxs[l].add(_pfx(it))
-        st = str(it.get("STATE", "")).strip().upper()
-        if st:
-            states[l].add(st)
 
+    # Only urban DOs are eligible for the slight-overload rescue.
     unplaced = [it for it in items
-                if it.get("LORRY") in ("NO_LORRY", "NO_ELIGIBLE_LORRY")]
+                if it.get("LORRY") in ("NO_LORRY", "NO_ELIGIBLE_LORRY")
+                and _is_urban_do(it)]
     unplaced.sort(key=lambda i: -(i.get("WEIGHT", 0.0) or 0.0))
 
     rescued = 0
     for it in unplaced:
         w = it.get("WEIGHT", 0.0) or 0.0
-        cands = [l for l in caps if _allowed(it, l) and _compatible(it, l)]
+        # Target only lorries that carry NO outstation route (urban-only or empty).
+        cands = [l for l in caps if _allowed(it, l) and not has_outstation[l]]
         # Tier 1 — fits within capacity (tightest fit first).
         fit = [l for l in cands if load[l] + w <= caps[l] + 1e-9]
         if fit:
             _place(it, max(fit, key=lambda l: (load[l] + w) / caps[l]))
             rescued += 1
             continue
-        # Tier 2 — slight overload (smallest resulting ratio).
+        # Tier 2 — slight overload of an urban lorry (smallest resulting ratio).
         ov = [l for l in cands if load[l] + w <= caps[l] * max_over + 1e-9]
         if ov:
             _place(it, min(ov, key=lambda l: (load[l] + w) / caps[l]))
             rescued += 1
             continue
-        # Tier 3 — reservation (what the human planner does for a big DO): take
-        # a lorry big enough to hold it within capacity, evict the DOs on it
-        # that go a DIFFERENT direction, redistribute them to other same-
-        # direction lorries, and dedicate the freed lorry to this DO. Fully
-        # atomic — commit only if EVERY evicted DO can be re-placed, so an
-        # already-assigned DO is never left stranded.
-        big_pfx = _pfx(it)
-        big_st  = str(it.get("STATE", "")).strip().upper()
-
-        def _same_dir(x):
-            return (_pfx(x) == big_pfx) or (big_st and
-                    str(x.get("STATE", "")).strip().upper() == big_st)
-
-        placed = False
-        # Prefer the lorry that fits the DO within capacity AND is cheapest to
-        # clear (least incompatible load to move).
-        res_cands = [l for l in caps if _allowed(it, l) and caps[l] + 1e-9 >= w]
-        def _evict_cost(l):
-            return sum((x.get("WEIGHT", 0.0) or 0.0) for x in items
-                       if x.get("LORRY") == l and not _same_dir(x))
-        for l in sorted(res_cands, key=_evict_cost):
-            evict = [x for x in items if x.get("LORRY") == l and not _same_dir(x)]
-            kept_load = load[l] - sum((x.get("WEIGHT", 0.0) or 0.0) for x in evict)
-            if kept_load + w > caps[l] * max_over + 1e-9:
-                continue                      # can't fit even after clearing
-            # Plan re-placement of every evicted DO on a copy of the state.
-            t_load = dict(load); t_pfx = {k: set(v) for k, v in pfxs.items()}
-            t_st = {k: set(v) for k, v in states.items()}
-            t_load[l] = kept_load
-            plan, ok = [], True
-            for x in sorted(evict, key=lambda z: -(z.get("WEIGHT", 0.0) or 0.0)):
-                xw = x.get("WEIGHT", 0.0) or 0.0
-                xp = _pfx(x); xs = str(x.get("STATE", "")).strip().upper()
-                best, bestr = None, 9.0
-                for m in caps:
-                    if m == l or not _allowed(x, m):
-                        continue
-                    comp = ((t_load[m] <= 1e-9 and not t_pfx[m]) or
-                            (xp and xp in t_pfx[m]) or (xs and xs in t_st[m]))
-                    if not comp:
-                        continue
-                    r = (t_load[m] + xw) / caps[m]
-                    if r <= max_over + 1e-9 and r < bestr:
-                        bestr, best = r, m
-                if best is None:
-                    ok = False
-                    break
-                t_load[best] += xw; t_pfx[best].add(xp)
-                if xs:
-                    t_st[best].add(xs)
-                plan.append((x, best))
-            if not ok:
-                continue                      # try next lorry; nothing committed
-            # Commit: move evicted DOs, then dedicate the lorry to the big DO.
-            for x in evict:
-                load[l] -= x.get("WEIGHT", 0.0) or 0.0
-                x["LORRY"] = "NO_LORRY"
-            for x, m in plan:
-                _place(x, m)
-            _place(it, l)
-            placed = True
-            rescued += 1
-            break
-        if placed:
-            continue
+        # No urban lorry can take it (even slightly overloaded). Leave it
+        # unassigned rather than mix it onto an outstation lorry.
 
     if rescued:
         import logging as _rlog
-        _rlog.info("[OVERLOAD-RESCUE] placed %d DO(s) via slight overload / reservation.", rescued)
+        _rlog.info("[OVERLOAD-RESCUE] placed %d urban DO(s) via slight overload.", rescued)
 
 
 def _handle_excel_upload(phone, sess, file_bytes):
