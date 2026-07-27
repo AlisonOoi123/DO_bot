@@ -513,9 +513,10 @@ _PAGE = r"""<!doctype html>
   .btn:disabled{opacity:.5;cursor:not-allowed}
   .row{display:flex;gap:10px;flex-wrap:wrap}
   .row>*{flex:1 1 140px}
-  .grid-users{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
+  .grid-users{display:flex;flex-wrap:wrap;justify-content:center;gap:10px}
   .userbtn{background:var(--card2);border:1px solid var(--line);border-radius:12px;
-    padding:16px;font-size:16px;font-weight:700;cursor:pointer;color:var(--ink);text-align:center}
+    padding:16px 28px;min-width:120px;font-size:16px;font-weight:700;cursor:pointer;
+    color:var(--ink);text-align:center;flex:0 0 auto}
   .userbtn:active{border-color:var(--brand)}
   .drop{border:2px dashed var(--line);border-radius:12px;padding:26px 16px;text-align:center;
     color:var(--muted);cursor:pointer;background:var(--card2)}
