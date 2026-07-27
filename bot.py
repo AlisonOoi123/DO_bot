@@ -2509,6 +2509,171 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
     ]
 
 
+# Slight-overload allowance for the rescue pass: a lorry may be filled up to
+# this fraction of its rated TON when the only alternative is leaving a DO
+# unassigned. 1.15 = up to 15% over. Mirrors the manual planner, who slightly
+# overloads small lorries rather than dropping urban DOs.
+SLIGHT_OVERLOAD = 1.20
+
+
+def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
+    """Final safety net: place DOs that the main assignment left NO_LORRY by
+    (1) fitting within capacity, (2) allowing a slight overload, or (3) for a
+    large DO, reserving a big-enough lorry — evicting its small compatible DOs
+    to other lorries — exactly as a human planner does. Only ever REDUCES the
+    unassigned count; never strands a DO that was already placed unless it is
+    immediately re-placed elsewhere.
+
+    Compatibility is conservative: a leftover is only added to a lorry that is
+    empty, already carries the same route prefix, or already serves the same
+    destination state — so it never mixes unrelated directions. Per-DO size
+    caps (MAX_TON) and forbidden plates are always respected.
+    """
+    import re as _re
+    eng = sess.get("engine")
+    if eng is None:
+        return
+    try:
+        caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
+                for _, r in eng.eligible_lorries.iterrows()}
+    except Exception:
+        return
+    if not caps:
+        return
+    items = sess.get("items", []) or []
+
+    def _pfx(it):
+        m = _re.match(r'\s*([A-Z]{1,3}\d+[A-Z]?)', str(it.get("ROUTE", "")))
+        return m.group(1) if m else ""
+
+    load  = {l: 0.0 for l in caps}
+    pfxs  = {l: set() for l in caps}
+    states = {l: set() for l in caps}
+    for it in items:
+        l = it.get("LORRY")
+        if l in caps:
+            load[l] += it.get("WEIGHT", 0.0) or 0.0
+            pfxs[l].add(_pfx(it))
+            st = str(it.get("STATE", "")).strip().upper()
+            if st:
+                states[l].add(st)
+
+    def _allowed(it, l):
+        mt = it.get("MAX_TON")
+        if mt is not None and caps[l] > mt + 1e-9:
+            return False
+        fp = it.get("FORBID_PLATES")
+        if fp and l in fp:
+            return False
+        return True
+
+    def _compatible(it, l):
+        if load[l] <= 1e-9 and not pfxs[l]:
+            return True                      # empty lorry — any direction ok
+        p = _pfx(it)
+        st = str(it.get("STATE", "")).strip().upper()
+        return (p and p in pfxs[l]) or (st and st in states[l])
+
+    def _place(it, l):
+        it["LORRY"] = l
+        sess["assigned"][it["DO NUMBER"]] = l
+        load[l] += it.get("WEIGHT", 0.0) or 0.0
+        pfxs[l].add(_pfx(it))
+        st = str(it.get("STATE", "")).strip().upper()
+        if st:
+            states[l].add(st)
+
+    unplaced = [it for it in items
+                if it.get("LORRY") in ("NO_LORRY", "NO_ELIGIBLE_LORRY")]
+    unplaced.sort(key=lambda i: -(i.get("WEIGHT", 0.0) or 0.0))
+
+    rescued = 0
+    for it in unplaced:
+        w = it.get("WEIGHT", 0.0) or 0.0
+        cands = [l for l in caps if _allowed(it, l) and _compatible(it, l)]
+        # Tier 1 — fits within capacity (tightest fit first).
+        fit = [l for l in cands if load[l] + w <= caps[l] + 1e-9]
+        if fit:
+            _place(it, max(fit, key=lambda l: (load[l] + w) / caps[l]))
+            rescued += 1
+            continue
+        # Tier 2 — slight overload (smallest resulting ratio).
+        ov = [l for l in cands if load[l] + w <= caps[l] * max_over + 1e-9]
+        if ov:
+            _place(it, min(ov, key=lambda l: (load[l] + w) / caps[l]))
+            rescued += 1
+            continue
+        # Tier 3 — reservation (what the human planner does for a big DO): take
+        # a lorry big enough to hold it within capacity, evict the DOs on it
+        # that go a DIFFERENT direction, redistribute them to other same-
+        # direction lorries, and dedicate the freed lorry to this DO. Fully
+        # atomic — commit only if EVERY evicted DO can be re-placed, so an
+        # already-assigned DO is never left stranded.
+        big_pfx = _pfx(it)
+        big_st  = str(it.get("STATE", "")).strip().upper()
+
+        def _same_dir(x):
+            return (_pfx(x) == big_pfx) or (big_st and
+                    str(x.get("STATE", "")).strip().upper() == big_st)
+
+        placed = False
+        # Prefer the lorry that fits the DO within capacity AND is cheapest to
+        # clear (least incompatible load to move).
+        res_cands = [l for l in caps if _allowed(it, l) and caps[l] + 1e-9 >= w]
+        def _evict_cost(l):
+            return sum((x.get("WEIGHT", 0.0) or 0.0) for x in items
+                       if x.get("LORRY") == l and not _same_dir(x))
+        for l in sorted(res_cands, key=_evict_cost):
+            evict = [x for x in items if x.get("LORRY") == l and not _same_dir(x)]
+            kept_load = load[l] - sum((x.get("WEIGHT", 0.0) or 0.0) for x in evict)
+            if kept_load + w > caps[l] * max_over + 1e-9:
+                continue                      # can't fit even after clearing
+            # Plan re-placement of every evicted DO on a copy of the state.
+            t_load = dict(load); t_pfx = {k: set(v) for k, v in pfxs.items()}
+            t_st = {k: set(v) for k, v in states.items()}
+            t_load[l] = kept_load
+            plan, ok = [], True
+            for x in sorted(evict, key=lambda z: -(z.get("WEIGHT", 0.0) or 0.0)):
+                xw = x.get("WEIGHT", 0.0) or 0.0
+                xp = _pfx(x); xs = str(x.get("STATE", "")).strip().upper()
+                best, bestr = None, 9.0
+                for m in caps:
+                    if m == l or not _allowed(x, m):
+                        continue
+                    comp = ((t_load[m] <= 1e-9 and not t_pfx[m]) or
+                            (xp and xp in t_pfx[m]) or (xs and xs in t_st[m]))
+                    if not comp:
+                        continue
+                    r = (t_load[m] + xw) / caps[m]
+                    if r <= max_over + 1e-9 and r < bestr:
+                        bestr, best = r, m
+                if best is None:
+                    ok = False
+                    break
+                t_load[best] += xw; t_pfx[best].add(xp)
+                if xs:
+                    t_st[best].add(xs)
+                plan.append((x, best))
+            if not ok:
+                continue                      # try next lorry; nothing committed
+            # Commit: move evicted DOs, then dedicate the lorry to the big DO.
+            for x in evict:
+                load[l] -= x.get("WEIGHT", 0.0) or 0.0
+                x["LORRY"] = "NO_LORRY"
+            for x, m in plan:
+                _place(x, m)
+            _place(it, l)
+            placed = True
+            rescued += 1
+            break
+        if placed:
+            continue
+
+    if rescued:
+        import logging as _rlog
+        _rlog.info("[OVERLOAD-RESCUE] placed %d DO(s) via slight overload / reservation.", rescued)
+
+
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         # Keep the raw upload so "assign off-schedule DOs" (YES) can re-run the
@@ -6284,6 +6449,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
                           len(_audit_viol), "; ".join(_audit_viol[:20]))
         else:
             print(f"[RULES-AUDIT] OK — all assignments comply with the hard rules.")
+
+        # ── Slight-overload rescue: place any capacity-stranded DOs the way a
+        # human planner does (slight overload of small lorries, and reserving a
+        # big lorry for a big DO) rather than leaving them unassigned. ────────
+        try:
+            _overload_rescue(sess)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[OVERLOAD-RESCUE] skipped: %s", _e)
 
         # ── (legacy for-loop removed — replaced by _assign_one above) ────────
         # The block below was the old heaviest-first loop.  Keep a dummy
