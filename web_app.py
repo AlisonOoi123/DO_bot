@@ -368,6 +368,19 @@ def api_reset():
     return _with_cookie({"ok": True}, sid)
 
 
+@app.route("/api/reset-engine", methods=["POST"])
+def api_reset_engine():
+    """Clear the assignment state machine (for the Back button / start-over)
+    WITHOUT logging the user out."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    auth = {k: sess.get(k) for k in ("_authed", "_email", "_device")}
+    bot.reset_session(sid)
+    sess = bot.get_session(sid)
+    sess.update(auth)
+    return _with_cookie({"ok": True}, sid)
+
+
 @app.route("/")
 def index():
     sess = bot.get_session(_sid())
@@ -510,6 +523,9 @@ _PAGE = r"""<!doctype html>
     font-weight:600;cursor:pointer;background:var(--brand);color:#04222f;width:100%}
   .btn:active{transform:translateY(1px)}
   .btn.secondary{background:var(--card2);color:var(--ink);border:1px solid var(--line)}
+  .btn.back{background:transparent;color:var(--muted);border:1px solid var(--line);
+    width:auto;margin-top:14px;padding:9px 16px;font-size:14px}
+  .btn.back:hover{color:var(--ink);border-color:var(--brand)}
   .btn:disabled{opacity:.5;cursor:not-allowed}
   .row{display:flex;gap:10px;flex-wrap:wrap}
   .row>*{flex:1 1 140px}
@@ -574,6 +590,7 @@ _PAGE = r"""<!doctype html>
       <input type="file" id="file-master" accept=".xlsx">
     </label>
     <div class="msg hidden" id="master-msg"></div>
+    <button class="btn back" data-back="login">← Back</button>
   </div>
 
   <!-- Step 3: day -->
@@ -584,6 +601,7 @@ _PAGE = r"""<!doctype html>
       <button class="btn secondary" data-day="tomorrow">Tomorrow</button>
     </div>
     <div class="msg hidden" id="day-msg"></div>
+    <button class="btn back" data-back="afterlogin">← Back</button>
   </div>
 
   <!-- Step 4: DO file -->
@@ -594,6 +612,7 @@ _PAGE = r"""<!doctype html>
       <input type="file" id="file-dos" accept=".xlsx">
     </label>
     <div class="msg hidden" id="dos-msg"></div>
+    <button class="btn back" data-back="day">← Back</button>
   </div>
 
   <!-- Step 4b: off-schedule question -->
@@ -604,6 +623,7 @@ _PAGE = r"""<!doctype html>
       <button class="btn" id="offsched-yes">Yes, assign them too</button>
       <button class="btn secondary" id="offsched-no">No, leave them blank</button>
     </div>
+    <button class="btn back" data-back="dos">← Back (re-upload DO file)</button>
   </div>
 
   <!-- Step 5: result -->
@@ -629,6 +649,37 @@ const setMsg = (id,txt,err=false)=>{ const e=$(id); if(!txt){e.classList.add('hi
 async function jpost(url,body){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); return r.json(); }
 async function fpost(url,file){ const fd=new FormData(); fd.append('file',file); const r=await fetch(url,{method:'POST',body:fd}); return r.json(); }
 
+// ---- Wizard state (so Back can rewind the engine and replay prior steps) ----
+let selUser=null, masterFile=null, selDay=null, needsMaster=false;
+const ALL_CARDS=['#card-login','#card-master','#card-day','#card-dos','#card-offsched','#card-result'];
+function hideAll(){ ALL_CARDS.forEach(id=>show(id,false)); }
+function clearMsgs(){ ['#login-msg','#master-msg','#day-msg','#dos-msg','#offsched-msg'].forEach(id=>setMsg(id,null)); }
+
+// Rewind to an earlier step: reset the engine, then replay the steps already
+// chosen up to (but not including) the target, and show the target card.
+async function goTo(step){
+  clearMsgs();
+  await jpost('/api/reset-engine',{});
+  hideAll();
+  if(step==='login'){ selUser=null; masterFile=null; selDay=null; show('#card-login',true); return; }
+  await jpost('/api/login',{user:selUser});            // re-enter engine as this user
+  if(step==='master'){ masterFile=null; if(document.getElementById('file-master'))document.getElementById('file-master').value=''; show('#card-master',true); return; }
+  if(needsMaster){
+    if(!masterFile){ show('#card-master',true); return; }   // no stored file → force re-upload
+    await fpost('/api/master',masterFile);
+  }
+  if(step==='day'){ selDay=null; show('#card-day',true); return; }
+  await jpost('/api/day',{day:selDay});
+  if(step==='dos'){ if(document.getElementById('file-dos'))document.getElementById('file-dos').value=''; show('#card-dos',true); return; }
+}
+function wireBackButtons(){
+  document.querySelectorAll('[data-back]').forEach(b=>b.onclick=()=>{
+    let t=b.dataset.back;
+    if(t==='afterlogin') t = needsMaster ? 'master' : 'login';
+    goTo(t);
+  });
+}
+
 // ---- Step 1: users ----
 async function loadUsers(){
   const d = await (await fetch('/api/users')).json();
@@ -641,7 +692,8 @@ async function loadUsers(){
 async function login(user){
   setMsg('#login-msg','Logging in… ',false);
   const d = await jpost('/api/login',{user});
-  if(d.user){ $('#who').textContent='Logged in as '+d.user; setMsg('#login-msg',null); show('#card-login',false);
+  if(d.user){ selUser=d.user; needsMaster=!!d.needs_master;
+    $('#who').textContent='Logged in as '+d.user; setMsg('#login-msg',null); show('#card-login',false);
     if(d.needs_master){ show('#card-master',true); } else { show('#card-day',true); } }
   else { setMsg('#login-msg',d.messages||'Login failed',true); }
 }
@@ -660,12 +712,13 @@ wireDrop('#drop-master','#file-master',async(f)=>{
   setMsg('#master-msg','Reading master file… ',false);
   const d=await fpost('/api/master',f);
   setMsg('#master-msg',d.messages||d.error,!d.ok);
-  if(d.ok){ show('#card-master',false); show('#card-day',true); }
+  if(d.ok){ masterFile=f; show('#card-master',false); show('#card-day',true); }
 });
 
 // ---- Step 3: day ----
 document.querySelectorAll('[data-day]').forEach(b=>b.onclick=async()=>{
   setMsg('#day-msg','Setting day… ',false);
+  selDay=b.dataset.day;
   const d=await jpost('/api/day',{day:b.dataset.day});
   setMsg('#day-msg',d.messages,false);
   show('#card-day',false); show('#card-dos',true);
@@ -731,6 +784,7 @@ fetch('/api/state').then(r=>r.json()).then(d=>{
   if(d && d.email){ document.getElementById('who').textContent = d.email; }
 }).catch(()=>{});
 
+wireBackButtons();
 loadUsers();
 </script>
 </body>
