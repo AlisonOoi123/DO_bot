@@ -24,6 +24,7 @@ The page is responsive: it fits a desktop portal and a phone screen.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import io
 
@@ -82,8 +83,13 @@ def _check_credentials(email: str, password: str, device_name: str = ""):
     rec = creds.get((email or "").strip().lower())
     if not rec or (password or "").strip() != rec["password"]:
         return False, "Invalid email or password."
-    dev = (device_name or "").strip()
-    if dev and rec["device_name"] and dev.upper() != rec["device_name"].upper():
+    # Device name is optional. Only enforce it when BOTH the account has one and
+    # the user typed one. Compare loosely: ignore case and all whitespace
+    # (incl. stray spaces Excel sometimes leaves in a cell).
+    def _norm(v):
+        return re.sub(r"\s+", "", str(v or "")).upper()
+    dev, want = _norm(device_name), _norm(rec["device_name"])
+    if dev and want and dev != want:
         return False, "Device name does not match this account."
     return True, None
 
@@ -486,19 +492,31 @@ _LOGIN_PAGE = r"""<!DOCTYPE html>
 </div>
 <script>
     (function () {
-        var EMAIL_KEY = 'esreports_email', DEVICE_KEY = 'esreports_device_name';
+        var EMAIL_KEY = 'esreports_email';
         var emailInput = document.getElementById('companyEmail');
         var deviceInput = document.getElementById('deviceName');
         var form = deviceInput.closest('form');
+        // Remember the email per-browser, and the device name PER EMAIL, so a
+        // previous user's device name never carries over and blocks a new user.
+        function devKey(email) { return 'esreports_device::' + (email || '').trim().toLowerCase(); }
+        function loadDevice() {
+            try {
+                var d = localStorage.getItem(devKey(emailInput.value));
+                deviceInput.value = d || '';
+            } catch (e) {}
+        }
         try {
-            var e = localStorage.getItem(EMAIL_KEY), d = localStorage.getItem(DEVICE_KEY);
+            var e = localStorage.getItem(EMAIL_KEY);
             if (e) emailInput.value = e;
-            if (d) deviceInput.value = d;
         } catch (e) {}
+        loadDevice();
+        emailInput.addEventListener('input', loadDevice);   // switch device when email changes
         form.addEventListener('submit', function () {
             try {
-                if (emailInput.value.trim()) localStorage.setItem(EMAIL_KEY, emailInput.value.trim());
-                if (deviceInput.value.trim()) localStorage.setItem(DEVICE_KEY, deviceInput.value.trim());
+                var em = emailInput.value.trim();
+                if (em) localStorage.setItem(EMAIL_KEY, em);
+                if (deviceInput.value.trim()) localStorage.setItem(devKey(em), deviceInput.value.trim());
+                else localStorage.removeItem(devKey(em));
             } catch (e) {}
         });
     })();
