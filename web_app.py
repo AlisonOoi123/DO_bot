@@ -23,11 +23,13 @@ The page is responsive: it fits a desktop portal and a phone screen.
 """
 from __future__ import annotations
 
+import os
 import secrets
 import io
 
+import pandas as pd
 from flask import (
-    Flask, request, jsonify, send_file, make_response, Response,
+    Flask, request, jsonify, send_file, make_response, Response, redirect,
 )
 
 import bot   # the existing engine — reused as-is
@@ -38,6 +40,56 @@ app = Flask(__name__)
 # to a bot session (bot.get_session(token)) so the engine's per-user state
 # machine works exactly as it does for a WhatsApp phone number.
 _COOKIE = "do_sid"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Credential-based login — validate against data/credentials.xlsx
+# (columns: email, password, ip, device_name). Keep this file OUT of git; it
+# holds plaintext staff passwords (see .gitignore).
+# ─────────────────────────────────────────────────────────────────────────────
+_CRED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "data", "credentials.xlsx")
+
+
+def _load_credentials() -> dict:
+    """Return {email_lower: {'password':..,'ip':..,'device_name':..}}.
+
+    Read fresh each login so edits to the file take effect without a restart.
+    """
+    try:
+        df = pd.read_excel(_CRED_PATH)
+    except Exception:
+        return {}
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    out = {}
+    for _, r in df.iterrows():
+        email = str(r.get("email", "")).strip().lower()
+        if not email or email in ("nan", "none"):
+            continue
+        out[email] = {
+            "password":    str(r.get("password", "")).strip(),
+            "ip":          str(r.get("ip", "")).strip(),
+            "device_name": str(r.get("device_name", "")).strip(),
+        }
+    return out
+
+
+def _check_credentials(email: str, password: str, device_name: str = ""):
+    """Return (ok, error_message). Password must match; device name, if the
+    user typed one, must match the record too."""
+    creds = _load_credentials()
+    if not creds:
+        return False, "No credentials configured. Add data/credentials.xlsx."
+    rec = creds.get((email or "").strip().lower())
+    if not rec or (password or "").strip() != rec["password"]:
+        return False, "Invalid email or password."
+    dev = (device_name or "").strip()
+    if dev and rec["device_name"] and dev.upper() != rec["device_name"].upper():
+        return False, "Device name does not match this account."
+    return True, None
+
+
+def _is_authed(sess) -> bool:
+    return bool(sess.get("_authed"))
 
 
 def _sid() -> str:
@@ -135,6 +187,42 @@ def _result_json(sess) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # API endpoints — each drives the existing engine handler for the current step.
 # ─────────────────────────────────────────────────────────────────────────────
+@app.before_request
+def _guard():
+    """All /api/* endpoints require a logged-in session."""
+    if request.path.startswith("/api/"):
+        sess = bot.get_session(_sid())
+        if not _is_authed(sess):
+            return _with_cookie({"error": "auth_required"}, _sid(), 401)
+
+
+@app.route("/auth", methods=["POST"])
+def auth():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    email = request.form.get("email", "")
+    password = request.form.get("password", "")
+    device = request.form.get("device_name", "")
+    ok, err = _check_credentials(email, password, device)
+    if not ok:
+        return Response(_login_page(err), mimetype="text/html", status=401)
+    sess["_authed"] = True
+    sess["_email"] = email.strip()
+    sess["_device"] = device.strip()
+    resp = make_response(redirect("/"))
+    resp.set_cookie(_COOKIE, sid, samesite="Lax", max_age=60 * 60 * 8)
+    return resp
+
+
+@app.route("/logout", methods=["POST", "GET"])
+def logout():
+    sid = _sid()
+    bot.reset_session(sid)          # clears auth + any in-progress assignment
+    resp = make_response(redirect("/"))
+    resp.set_cookie(_COOKIE, sid, samesite="Lax", max_age=60 * 60 * 8)
+    return resp
+
+
 @app.route("/api/state")
 def api_state():
     sid = _sid()
@@ -142,6 +230,7 @@ def api_state():
     return _with_cookie({
         "state": sess.get("state", "IDLE"),
         "user": sess.get("user_id"),
+        "email": sess.get("_email"),
     }, sid)
 
 
@@ -249,7 +338,91 @@ def api_reset():
 
 @app.route("/")
 def index():
-    return Response(_PAGE, mimetype="text/html")
+    sess = bot.get_session(_sid())
+    if not _is_authed(sess):
+        return _login_response()
+    return _with_cookie_html(_PAGE)
+
+
+def _login_response():
+    resp = make_response(Response(_login_page(), mimetype="text/html"))
+    resp.set_cookie(_COOKIE, _sid(), samesite="Lax", max_age=60 * 60 * 8)
+    return resp
+
+
+def _with_cookie_html(html):
+    resp = make_response(Response(html, mimetype="text/html"))
+    resp.set_cookie(_COOKIE, _sid(), samesite="Lax", max_age=60 * 60 * 8)
+    return resp
+
+
+def _login_page(error: str = "") -> str:
+    err_html = (f'<div class="alert alert-danger">{error}</div>'
+                if error else "")
+    return _LOGIN_PAGE.replace("<!--ERROR-->", err_html)
+
+
+# Login page — styled to match the sample "Aging Reports Portal" login.
+_LOGIN_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <title>Login - Lorry Assignment Portal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f5f7fa; }
+        .login-card { max-width: 400px; margin: 80px auto; border-radius: 12px; }
+        .device-hint { font-size: 12px; color: #6c757d; }
+        @media (max-width: 480px) { .login-card { margin: 32px auto; } }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="card shadow-sm p-4 login-card">
+        <h3 class="mb-3 text-center">🚚 Lorry Assignment Portal</h3>
+        <!--ERROR-->
+        <form method="post" action="/auth">
+            <div class="mb-3">
+                <label class="form-label">Company Email</label>
+                <input type="email" id="companyEmail" name="email" class="form-control" required placeholder="you@engsheng.com">
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Password</label>
+                <input type="password" name="password" class="form-control" required>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Device Name <small class="text-muted">(optional)</small></label>
+                <input type="text" id="deviceName" name="device_name" class="form-control" placeholder="e.g. HQ-INV-XXXX">
+                <div class="device-hint mt-1">
+                    💡 If set on your account, it must match to log in.
+                </div>
+            </div>
+            <button class="btn btn-primary w-100">Login</button>
+        </form>
+    </div>
+</div>
+<script>
+    (function () {
+        var EMAIL_KEY = 'esreports_email', DEVICE_KEY = 'esreports_device_name';
+        var emailInput = document.getElementById('companyEmail');
+        var deviceInput = document.getElementById('deviceName');
+        var form = deviceInput.closest('form');
+        try {
+            var e = localStorage.getItem(EMAIL_KEY), d = localStorage.getItem(DEVICE_KEY);
+            if (e) emailInput.value = e;
+            if (d) deviceInput.value = d;
+        } catch (e) {}
+        form.addEventListener('submit', function () {
+            try {
+                if (emailInput.value.trim()) localStorage.setItem(EMAIL_KEY, emailInput.value.trim());
+                if (deviceInput.value.trim()) localStorage.setItem(DEVICE_KEY, deviceInput.value.trim());
+            } catch (e) {}
+        });
+    })();
+</script>
+</body>
+</html>"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +508,7 @@ _PAGE = r"""<!doctype html>
     <span class="logo">🚚</span>
     <h1>Lorry Assignment</h1>
     <span class="who" id="who"></span>
+    <a href="/logout" class="who" style="text-decoration:none;margin-left:12px">Logout</a>
   </header>
 
   <!-- Step 1: login -->
@@ -476,6 +650,11 @@ function renderResult(r){
 }
 
 $('#btn-restart').onclick=async()=>{ await jpost('/api/reset',{}); location.reload(); };
+
+// Show who is logged in (from the auth session).
+fetch('/api/state').then(r=>r.json()).then(d=>{
+  if(d && d.email){ document.getElementById('who').textContent = d.email; }
+}).catch(()=>{});
 
 loadUsers();
 </script>
