@@ -4351,121 +4351,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _session_routes[_pl] = route
                     _record_lorry_state(_pl, _it.get("STATE", ""))
 
-        # ── HEAVY OUTSTATION PRE-PACK ─────────────────────────────────────────
-        # A heavy far-outstation corridor (Kuantan/Pahang/Perak/Johor) should
-        # claim the FEWEST, LARGEST lorries FIRST — the way the manual assigns —
-        # so the biggest lorry (e.g. 21T BQU3875) does the long haul and the mid
-        # lorries stay free for the many urban routes. We pack each such corridor
-        # onto the largest eligible lorries (first-fit-decreasing, heaviest
-        # atomic unit first) BEFORE urban competes for lorries. Same-corridor
-        # outstation DOs may share one lorry regardless of intra-city GPS spread
-        # (they all travel the same long way out) — the urban geo-spread rule
-        # does NOT apply here, mirroring the manual. Tiny outstation loads (e.g. a
-        # small Seremban run) are SKIPPED so they keep the flexibility to ride a
-        # mid/small lorry through normal assignment.
-        def _pp_rcode(_it):
-            _r = str(_it.get("ROUTE", "")).strip().upper()
-            _m = re.match(r"([A-Z]+\d+[A-Z]?)", _r)
-            return _m.group(1) if _m else _r[:6]
-
-        def _pp_gps(_it):
-            _la, _lo = _it.get("GPS_LAT"), _it.get("GPS_LON")
-            return (_la, _lo) if (_la is not None and _lo is not None) else None
-
-        _pp_dir_items: dict[str, list] = defaultdict(list)
-        for _it in items:
-            if _it.get("LORRY") is not None:
-                continue                              # already settled / other-user
-            _dg = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
-            if _dg in _DEST_URBAN_GROUPS:
-                continue
-            _pp_dir_items[_direction_key(_it.get("ROUTE", ""))].append(_it)
-
-        _pp_phys: dict[str, float] = defaultdict(float)
-        for _it in items:
-            if _it.get("LORRY") in _lorry_cap_map:
-                _pp_phys[_it["LORRY"]] += _it["WEIGHT"]
-        _pp_blocked = (set(get_assigned_today()) | set(get_broken_lorries())
-                       | set(sess.get("unavailable", set())))
-
-        for _dk, _dits in _pp_dir_items.items():
-            _dw = sum(x["WEIGHT"] for x in _dits)
-            # Tiny outstation (e.g. a very small NS/Seremban run) → keep
-            # flexibility, let normal assignment place it on a mid/small lorry.
-            if (_dk[:2] in _TINY_OUTSTATION_PREFIXES
-                    and _dw <= _TINY_OUTSTATION_MAX_TON):
-                continue
-            _dg = max((_classify_dest_group(x.get("ROUTE", ""), x.get("STATE", ""))
-                       for x in _dits),
-                      key=lambda g: _DEST_MIN_TON.get(g, 0.0))
-            _dmin = _eff_dest_min_ton(_dits[0].get("ROUTE", ""), _dg, _dw)
-            _dstates = {x.get("STATE", "").strip().upper()
-                        for x in _dits if x.get("STATE")}
-            _used_pp: set = set()                     # lorries opened for this corridor
-
-            def _pp_may_take(_cand, _cw, _cmt, _cfp):
-                if _cand in _pp_blocked:
-                    return False
-                _cap = float(_lorry_cap_map.get(_cand, 0))
-                if _cap < _dmin:
-                    return False
-                if _cmt is not None and _cap > _cmt:
-                    return False
-                if _cand in _cfp:
-                    return False
-                # A lorry reserved for a DIFFERENT direction is off-limits.
-                _res = _reserved_lorry.get(_cand)
-                if _res is not None and _res != _dk:
-                    return False
-                # Never mix with an incompatible direction already on the lorry.
-                _cand_items = [y for y in items if y.get("LORRY") == _cand]
-                for _y in _cand_items:
-                    if _direction_key(_y.get("ROUTE", "")) != _dk:
-                        return False
-                if _pp_phys[_cand] + _cw > _cap * NAIK_FACTOR:
-                    return False
-                # State compatibility (corridor may span compatible states).
-                _cst = {str(_y.get("STATE", "")).strip().upper()
-                        for _y in _cand_items if _y.get("STATE")}
-                if (_cst and _dstates and not any(
-                        _states_compatible(_a, _b)
-                        for _a in _dstates for _b in _cst)):
-                    return False
-                return True
-
-            _comps = _atomic_components(_dits, _pp_rcode, _pp_gps,
-                                        lambda x: x.get("CODE", ""))
-            for _comp in sorted(_comps, key=lambda c: -sum(x["WEIGHT"] for x in c)):
-                _cw = sum(x["WEIGHT"] for x in _comp)
-                _cmt = min((x["MAX_TON"] for x in _comp
-                            if x.get("MAX_TON") is not None), default=None)
-                _cfp: set = set()
-                for x in _comp:
-                    if x.get("FORBID_PLATES"):
-                        _cfp |= x["FORBID_PLATES"]
-                # Fill an already-opened lorry (tightest remaining) before opening
-                # a new one; when opening new, take the LARGEST eligible lorry so
-                # it absorbs as much of the corridor as possible (fewest lorries).
-                _u = [c for c in _used_pp if _pp_may_take(c, _cw, _cmt, _cfp)]
-                if _u:
-                    _dest = min(_u, key=lambda c: float(_lorry_cap_map[c]) * NAIK_FACTOR - _pp_phys[c])
-                else:
-                    _fresh = [c for c in _lorry_cap_map
-                              if c not in _used_pp and _pp_may_take(c, _cw, _cmt, _cfp)]
-                    _dest = max(_fresh, key=lambda c: float(_lorry_cap_map[c])) if _fresh else None
-                if _dest is None:
-                    continue                          # no big lorry now — normal passes handle it
-                _used_pp.add(_dest)
-                for x in _comp:
-                    x["LORRY"] = _dest
-                    sess["assigned"][x["DO NUMBER"]] = _dest
-                    _pp_phys[_dest] += x["WEIGHT"]
-                    _session_loads[_dest] = float(_session_loads.get(_dest, 0)) + x["WEIGHT"]
-                    if _dest not in _session_routes:
-                        _session_routes[_dest] = x.get("ROUTE", "")
-                _record_lorry_state(_dest, next(
-                    (x.get("STATE", "").strip().upper() for x in _comp if x.get("STATE")), ""))
-
         for group in sorted_groups:
             _assign_group(group)
 
@@ -4504,23 +4389,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _it_pref = _preferred_lorries_for_route(it.get("ROUTE", ""))
             _it_strict_excl = _strict_route_excl(it.get("ROUTE", ""))
 
-            _it_dir = _direction_key(it.get("ROUTE", ""))
-
             def _consol_eligible(p: str) -> bool:
                 """Core eligibility check for consolidation candidates."""
                 if float(_lorry_cap_map.get(p, 0)) - float(_session_loads.get(p, 0)) < w:
                     return False
                 if p in _excl_consol or p in _it_strict_excl:
-                    return False
-                # Reservation guard — a lorry held for a heavy outstation corridor
-                # (e.g. the 21T BQU3875 reserved for Kuantan/PH09) must not be
-                # back-filled here with a DO from a different direction. This keeps
-                # the big lorry free so the outstation-consolidation pass can load
-                # its corridor onto it (largest lorry claims the heavy run), the
-                # way the manual assigns. A DO of the SAME direction may still use
-                # its own reserved lorry.
-                _pres = _reserved_lorry.get(p)
-                if _pres is not None and _pres != _it_dir:
                     return False
                 if float(_lorry_cap_map.get(p, 0)) < _it_dest_min_t:
                     return False
@@ -4653,12 +4526,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     continue
                 if _fp in _it_strict:
                     continue
-                # Reservation guard — keep a lorry reserved for a heavy outstation
-                # corridor (e.g. 21T BQU3875 for Kuantan) free of other directions
-                # so the outstation-consolidation pass can load its corridor onto it.
-                _fp_res = _reserved_lorry.get(_fp)
-                if _fp_res is not None and _fp_res != _direction_key(it_route):
-                    continue
                 # Urban↔outstation guard
                 if (not _it_is_urban
                         and _session_routes.get(_fp, "")
@@ -4717,10 +4584,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _ol = float(_session_loads.get(_op, 0))
                 _or = _oc - _ol
                 if _op in _it_strict:
-                    continue
-                # Reservation guard — see force-assign pass above.
-                _op_res = _reserved_lorry.get(_op)
-                if _op_res is not None and _op_res != _direction_key(it_route):
                     continue
                 # Outstation minimum tonnage: lorries ≤5T can never serve an
                 # outstation route (LARGE_LONG / MEDIUM_LONG), even as overflow.
@@ -4811,10 +4674,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _ol = float(_session_loads.get(_op, 0))
                     _or = _oc - _ol
                     if _op in _g_strict:
-                        continue
-                    # Reservation guard — see force-assign pass above.
-                    _op_res2 = _reserved_lorry.get(_op)
-                    if _op_res2 is not None and _op_res2 != _direction_key(_g_route):
                         continue
                     # Outstation minimum tonnage: ≤5T lorries can't serve outstation
                     if _oc < _g_dest_min:
@@ -4911,14 +4770,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _cap_a = _lorry_cap_map.get(_pa, 0)
                 if _cap_a < _LARGE_T:
                     continue  # A must be a large lorry
-                if _pa in _reserved_lorry:
-                    continue  # reserved for an outstation corridor — leave it
                 _load_a = _ploads[_pa]
                 for _pb, _pb_its in list(_pit.items()):
                     if _pb == _pa:
                         continue
-                    if _pb in _reserved_lorry:
-                        continue  # reserved — never swap urban load onto it
                     _cap_b = _lorry_cap_map.get(_pb, 0)
                     if _cap_b >= _LARGE_T:
                         continue  # B must be smaller than A
@@ -5852,12 +5707,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
             def _ru_fits(_cand):
                 if _cand in _blocked_today:
                     return False
-                # A lorry reserved for an outstation corridor may only take DOs of
-                # that same direction (keeps e.g. BMN3682 free for its NS run).
-                _rres = _reserved_lorry.get(_cand)
-                if _rres is not None and any(
-                        _direction_key(x.get("ROUTE", "")) != _rres for x in _comp):
-                    return False
                 _ccap = float(_lorry_cap_map.get(_cand, 0))
                 _here = sum(x["WEIGHT"] for x in _comp if x["LORRY"] == _cand)
                 if _ru_phys[_cand] - _here + _cw > _ccap * NAIK_FACTOR:
@@ -6095,11 +5944,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for _it in items:
                 if _it.get("LORRY") in _lorry_cap_map:
                     _uc_phys[_it["LORRY"]] += _it["WEIGHT"]
-            # Reserved lorries are held for an outstation corridor (only
-            # outstation directions ever reserve) — never let urban de-concentration
-            # move onto them, or a tiny outstation run loses its lorry.
             _small_plates = [p for p, c in _lorry_cap_map.items()
-                             if float(c) <= _URBAN_MAX_TON and p not in _reserved_lorry]
+                             if float(c) <= _URBAN_MAX_TON]
             # route codes each lorry currently carries (for criterion 3 —
             # keep same-route DOs together on one lorry when possible)
             _uc_routes: dict[str, set] = defaultdict(set)
@@ -6193,8 +6039,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
         def _route_fits_on(_cand, _rits, _rc, _rw, _rmt, _rforbid):
             if _cand in _blocked_today:
                 return False
-            if _cand in _reserved_lorry:      # held for an outstation corridor
-                return False
             _cap = float(_lorry_cap_map.get(_cand, 0))
             _here = sum(x["WEIGHT"] for x in _rits if x["LORRY"] == _cand)
             if _rc_phys[_cand] - _here + _rw > _cap * NAIK_FACTOR:
@@ -6268,7 +6112,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 {x["LORRY"] for _r in _urb.values() for x in _r},
                 key=lambda l: -(float(_lorry_cap_map[l]) - _rc_phys[l]))
             for _l in _urb_lorries:
-                if _l in _blocked_today or _l in _reserved_lorry:
+                if _l in _blocked_today:
                     continue
                 _free = float(_lorry_cap_map[_l]) * NAIK_FACTOR - _rc_phys[_l]
                 if _free <= 0.05:
@@ -6343,7 +6187,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _tc_phys[_it["LORRY"]] += _it["WEIGHT"]
         for _l in sorted(_lorry_cap_map,
                          key=lambda l: -(float(_lorry_cap_map[l]) - _tc_phys[l])):
-            if _l in _blocked_today or _l in _reserved_lorry:
+            if _l in _blocked_today:
                 continue
             _free = float(_lorry_cap_map[_l]) * NAIK_FACTOR - _tc_phys[_l]
             if _free <= 0.05:
