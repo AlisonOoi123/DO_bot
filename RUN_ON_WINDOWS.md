@@ -29,6 +29,17 @@ its full path.
 
 ---
 
+## Quick way — one script
+
+In an **Administrator** PowerShell, from the project folder:
+
+```powershell
+.\install_service.ps1
+```
+
+It auto-detects the real Python (skipping the WindowsApps stub), installs the
+service, opens the firewall, and starts it. The manual steps below do the same thing.
+
 ## 2. Create the service
 
 Find your Python path first:
