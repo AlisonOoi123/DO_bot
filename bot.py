@@ -2853,7 +2853,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 return "9999-99-99"
             raw_d = str(it.get("DATE", "")).strip()
             try:
-                _ts = pd.to_datetime(raw_d, dayfirst=True, errors="coerce")
+                _ts = pd.to_datetime(raw_d, dayfirst=True, errors="coerce", format="mixed")
                 if pd.notna(_ts):
                     return _ts.strftime("%Y-%m-%d")
             except Exception:

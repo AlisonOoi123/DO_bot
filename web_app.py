@@ -280,8 +280,9 @@ def api_day():
     sid = _sid()
     sess = bot.get_session(sid)
     day = (request.json or {}).get("day", "today")
-    # Web users pick the day explicitly; honour it regardless of SCHD hints.
-    sess["_ignore_schedule"] = True
+    # Keep the SCHD schedule filter ON so off-schedule DOs are surfaced and the
+    # user is asked whether to assign them anyway (see /api/dos + /api/offschedule).
+    sess.pop("_ignore_schedule", None)
     msgs = bot._handle_trip_day(sid, sess, str(day))
     return _with_cookie({
         "messages": msgs,
@@ -298,6 +299,34 @@ def api_dos():
     if fb is None:
         return _with_cookie({"error": "No file uploaded."}, sid, 400)
     msgs = bot._handle_excel_upload(sid, sess, fb)
+    # If some DOs aren't on the chosen day's route schedule, the engine parks in
+    # AWAIT_OTHER_USER_REPLY and expects a YES/NO. Surface that as a question
+    # instead of the final result.
+    if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
+        return _with_cookie({
+            "messages": msgs,
+            "state": sess.get("state"),
+            "offschedule": {
+                "count": sess.get("not_today_pending_count", 0),
+                "day": sess.get("trip_day", "today"),
+            },
+        }, sid)
+    result = _result_json(sess) if sess.get("items") else None
+    return _with_cookie({
+        "messages": msgs,
+        "state": sess.get("state"),
+        "result": result,
+    }, sid)
+
+
+@app.route("/api/offschedule", methods=["POST"])
+def api_offschedule():
+    """User's answer to 'assign the off-schedule DOs too?' — YES re-runs the
+    assignment with the schedule filter off; NO leaves them unassigned."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    assign = bool((request.json or {}).get("assign"))
+    msgs = bot._handle_other_user_reply(sid, sess, "YES" if assign else "NO")
     result = _result_json(sess) if sess.get("items") else None
     return _with_cookie({
         "messages": msgs,
@@ -558,6 +587,16 @@ _PAGE = r"""<!doctype html>
     <div class="msg hidden" id="dos-msg"></div>
   </div>
 
+  <!-- Step 4b: off-schedule question -->
+  <div class="card hidden" id="card-offsched">
+    <p class="step-title">One moment · Off-schedule DOs</p>
+    <div class="msg" id="offsched-msg"></div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn" id="offsched-yes">Yes, assign them too</button>
+      <button class="btn secondary" id="offsched-no">No, leave them blank</button>
+    </div>
+  </div>
+
   <!-- Step 5: result -->
   <div class="card hidden" id="card-result">
     <p class="step-title">Result</p>
@@ -627,9 +666,26 @@ document.querySelectorAll('[data-day]').forEach(b=>b.onclick=async()=>{
 wireDrop('#drop-dos','#file-dos',async(f)=>{
   setMsg('#dos-msg','Assigning lorries… this can take a moment ',false);
   const d=await fpost('/api/dos',f);
-  if(d.result){ renderResult(d.result); show('#card-dos',false); show('#card-result',true); setMsg('#dos-msg',null); }
+  if(d.offschedule){
+    const os=d.offschedule;
+    const dayTxt = os.day==='tomorrow' ? 'tomorrow' : 'today';
+    setMsg('#offsched-msg',
+      `⏭ ${os.count} DO(s) are NOT on ${dayTxt}'s route schedule.\n\n`+
+      `Do you still want to assign lorries to them?`);
+    show('#card-dos',false); show('#card-offsched',true); setMsg('#dos-msg',null);
+  }
+  else if(d.result){ renderResult(d.result); show('#card-dos',false); show('#card-result',true); setMsg('#dos-msg',null); }
   else { setMsg('#dos-msg',d.messages||d.error||'Could not process file',true); }
 });
+
+async function answerOffsched(assign){
+  setMsg('#offsched-msg', assign?'Assigning off-schedule DOs… ':'Finalising… ');
+  const d=await jpost('/api/offschedule',{assign});
+  if(d.result){ renderResult(d.result); show('#card-offsched',false); show('#card-result',true); }
+  else { setMsg('#offsched-msg', d.messages||d.error||'Something went wrong',true); }
+}
+document.getElementById('offsched-yes').onclick=()=>answerOffsched(true);
+document.getElementById('offsched-no').onclick=()=>answerOffsched(false);
 
 // ---- Step 5: render ----
 function esc(s){ return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
