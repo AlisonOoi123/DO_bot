@@ -370,8 +370,8 @@ def api_reset():
 
 @app.route("/api/reset-engine", methods=["POST"])
 def api_reset_engine():
-    """Clear the assignment state machine (for the Back button / start-over)
-    WITHOUT logging the user out."""
+    """Clear the assignment state machine (for start-over) WITHOUT logging the
+    user out."""
     sid = _sid()
     sess = bot.get_session(sid)
     auth = {k: sess.get(k) for k in ("_authed", "_email", "_device")}
@@ -379,6 +379,33 @@ def api_reset_engine():
     sess = bot.get_session(sid)
     sess.update(auth)
     return _with_cookie({"ok": True}, sid)
+
+
+# Which engine state each wizard step corresponds to (for the Back button).
+_STEP_STATE = {
+    "master": "AWAIT_MASTER_UPLOAD",
+    "day":    "AWAIT_TRIP_DAY",
+    "dos":    "AWAIT_EXCEL",
+}
+
+
+@app.route("/api/back", methods=["POST"])
+def api_back():
+    """Step the wizard backward. Rewinding to an earlier step just moves the
+    engine's state pointer back — the loaded master/engine is kept, so there's
+    no slow Excel re-parse. Going all the way back to the user picker clears
+    the engine (but keeps the login)."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    target = (request.json or {}).get("target")
+    if target == "login":
+        auth = {k: sess.get(k) for k in ("_authed", "_email", "_device")}
+        bot.reset_session(sid)
+        sess = bot.get_session(sid)
+        sess.update(auth)
+    elif target in _STEP_STATE and sess.get("user_id"):
+        sess["state"] = _STEP_STATE[target]
+    return _with_cookie({"ok": True, "state": sess.get("state")}, sid)
 
 
 @app.route("/")
@@ -534,9 +561,12 @@ _PAGE = r"""<!doctype html>
     padding:16px 28px;min-width:120px;font-size:16px;font-weight:700;cursor:pointer;
     color:var(--ink);text-align:center;flex:0 0 auto}
   .userbtn:active{border-color:var(--brand)}
-  .drop{border:2px dashed var(--line);border-radius:12px;padding:26px 16px;text-align:center;
-    color:var(--muted);cursor:pointer;background:var(--card2)}
-  .drop.hot{border-color:var(--brand);color:var(--ink)}
+  .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;
+    box-sizing:border-box;width:100%;min-height:150px;gap:6px;
+    border:2px dashed var(--line);border-radius:14px;padding:28px 16px;text-align:center;
+    color:var(--muted);cursor:pointer;background:var(--card2);transition:border-color .15s,background .15s}
+  .drop:hover{border-color:var(--brand)}
+  .drop.hot{border-color:var(--brand);color:var(--ink);background:transparent}
   .drop input{display:none}
   .msg{font-size:14px;white-space:pre-wrap;background:var(--card2);border:1px solid var(--line);
     border-radius:10px;padding:12px;margin-top:12px;color:var(--muted)}
@@ -655,22 +685,19 @@ const ALL_CARDS=['#card-login','#card-master','#card-day','#card-dos','#card-off
 function hideAll(){ ALL_CARDS.forEach(id=>show(id,false)); }
 function clearMsgs(){ ['#login-msg','#master-msg','#day-msg','#dos-msg','#offsched-msg'].forEach(id=>setMsg(id,null)); }
 
-// Rewind to an earlier step: reset the engine, then replay the steps already
-// chosen up to (but not including) the target, and show the target card.
+// Rewind to an earlier step. This only moves the engine's state pointer back
+// (server keeps the loaded master), so it's instant — no re-upload, no blank
+// screen. We switch the visible card only after the quick request returns.
 async function goTo(step){
   clearMsgs();
-  await jpost('/api/reset-engine',{});
+  await jpost('/api/back',{target:step});
+  const inpM=document.getElementById('file-master'), inpD=document.getElementById('file-dos');
+  if(step==='login'){ selUser=null; masterFile=null; selDay=null; if(inpM)inpM.value=''; if(inpD)inpD.value=''; }
+  if(step==='master'){ masterFile=null; if(inpM)inpM.value=''; }
+  if(step==='day'){ selDay=null; }
+  if(step==='dos'){ if(inpD)inpD.value=''; }
   hideAll();
-  if(step==='login'){ selUser=null; masterFile=null; selDay=null; show('#card-login',true); return; }
-  await jpost('/api/login',{user:selUser});            // re-enter engine as this user
-  if(step==='master'){ masterFile=null; if(document.getElementById('file-master'))document.getElementById('file-master').value=''; show('#card-master',true); return; }
-  if(needsMaster){
-    if(!masterFile){ show('#card-master',true); return; }   // no stored file → force re-upload
-    await fpost('/api/master',masterFile);
-  }
-  if(step==='day'){ selDay=null; show('#card-day',true); return; }
-  await jpost('/api/day',{day:selDay});
-  if(step==='dos'){ if(document.getElementById('file-dos'))document.getElementById('file-dos').value=''; show('#card-dos',true); return; }
+  show('#card-'+(step==='login'?'login':step), true);
 }
 function wireBackButtons(){
   document.querySelectorAll('[data-back]').forEach(b=>b.onclick=()=>{
@@ -777,7 +804,7 @@ function renderResult(r){
   $('#result-body').innerHTML=html;
 }
 
-$('#btn-restart').onclick=async()=>{ await jpost('/api/reset',{}); location.reload(); };
+$('#btn-restart').onclick=()=>goTo('login');
 
 // Show who is logged in (from the auth session).
 fetch('/api/state').then(r=>r.json()).then(d=>{
