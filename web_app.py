@@ -432,16 +432,24 @@ def login_page():
     return _login_response()
 
 
+def _no_cache(resp):
+    # Never let the browser cache the app HTML/JS, so a git pull + restart is
+    # picked up on the next load without needing a hard refresh.
+    resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
 def _login_response():
     resp = make_response(Response(_login_page(), mimetype="text/html"))
     resp.set_cookie(_COOKIE, _sid(), samesite="Lax", max_age=60 * 60 * 8)
-    return resp
+    return _no_cache(resp)
 
 
 def _with_cookie_html(html):
     resp = make_response(Response(html, mimetype="text/html"))
     resp.set_cookie(_COOKIE, _sid(), samesite="Lax", max_age=60 * 60 * 8)
-    return resp
+    return _no_cache(resp)
 
 
 def _login_page(error: str = "") -> str:
@@ -694,8 +702,11 @@ const show = (id,on=true)=>{ $(id).classList.toggle('hidden',!on); };
 const setMsg = (id,txt,err=false)=>{ const e=$(id); if(!txt){e.classList.add('hidden');return;}
   e.textContent=Array.isArray(txt)?txt.join('\n'):txt; e.classList.toggle('err',err); e.classList.remove('hidden'); };
 
-async function jpost(url,body){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); return r.json(); }
-async function fpost(url,file){ const fd=new FormData(); fd.append('file',file); const r=await fetch(url,{method:'POST',body:fd}); return r.json(); }
+// If the session was lost (server returns 401), send the user back to the
+// login page to re-authenticate rather than showing a confusing error.
+function _checkAuth(r){ if(r.status===401){ window.location.href='/login'; throw new Error('auth'); } return r; }
+async function jpost(url,body){ const r=_checkAuth(await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})); return r.json(); }
+async function fpost(url,file){ const fd=new FormData(); fd.append('file',file); const r=_checkAuth(await fetch(url,{method:'POST',body:fd})); return r.json(); }
 
 // ---- Wizard state (so Back can rewind the engine and replay prior steps) ----
 let selUser=null, masterFile=null, selDay=null, needsMaster=false;
