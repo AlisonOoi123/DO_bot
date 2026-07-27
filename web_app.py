@@ -241,6 +241,9 @@ def api_users():
         users = bot._get_valid_users()
     except Exception:
         users = ["ABI", "VIVIAN"]
+    # Hide non-selectable placeholder users from the web picker.
+    _hidden = {"NAME", "SPARE"}
+    users = [u for u in users if str(u).strip().upper() not in _hidden]
     return _with_cookie({"users": list(users)}, sid)
 
 
