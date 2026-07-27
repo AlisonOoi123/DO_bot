@@ -493,6 +493,11 @@ _PAGE = r"""<!doctype html>
   header .logo{font-size:26px}
   header h1{font-size:19px;margin:0;font-weight:700}
   header .who{margin-left:auto;font-size:13px;color:var(--muted)}
+  .logout-btn{display:inline-flex;align-items:center;gap:6px;margin-left:14px;
+    text-decoration:none;font-size:14px;font-weight:600;color:#fff;background:var(--bad);
+    padding:8px 16px;border-radius:10px;white-space:nowrap;box-shadow:0 1px 2px rgba(0,0,0,.15)}
+  .logout-btn:hover{filter:brightness(1.08)}
+  .logout-btn:active{transform:translateY(1px)}
   .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
     padding:18px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.08)}
   .step-title{font-size:13px;text-transform:uppercase;letter-spacing:.05em;
@@ -547,7 +552,7 @@ _PAGE = r"""<!doctype html>
     <span class="logo">🚚</span>
     <h1>Lorry Assignment</h1>
     <span class="who" id="who"></span>
-    <a href="/logout" class="who" style="text-decoration:none;margin-left:12px">Logout</a>
+    <a href="/logout" class="logout-btn">⎋ Logout</a>
   </header>
 
   <!-- Step 1: login -->
