@@ -344,6 +344,16 @@ def index():
     return _with_cookie_html(_PAGE)
 
 
+@app.route("/login")
+def login_page():
+    """Explicit login URL (http://<host>:8000/login). If already logged in,
+    go straight to the app."""
+    sess = bot.get_session(_sid())
+    if _is_authed(sess):
+        return make_response(redirect("/"))
+    return _login_response()
+
+
 def _login_response():
     resp = make_response(Response(_login_page(), mimetype="text/html"))
     resp.set_cookie(_COOKIE, _sid(), samesite="Lax", max_age=60 * 60 * 8)
@@ -663,10 +673,19 @@ loadUsers();
 
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", "8000"))
+    host = os.environ.get("HOST", "0.0.0.0")
     print(f"\n  DO Lorry-Assignment web app running.")
-    print(f"  Open on this PC:      http://127.0.0.1:{port}")
-    print(f"  Open from a phone:    http://<this-pc-ip>:{port}  "
-          f"(e.g. http://10.0.0.229:{port})\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"  Open on this PC:      http://127.0.0.1:{port}/login")
+    print(f"  Open from a phone:    http://<this-pc-ip>:{port}/login  "
+          f"(e.g. http://10.0.0.229:{port}/login)\n")
+    # Prefer waitress (a production WSGI server) for stable 24/7 running as a
+    # Windows service; fall back to Flask's dev server if it isn't installed.
+    try:
+        from waitress import serve
+        print("  Serving with waitress (production).\n")
+        serve(app, host=host, port=port, threads=8)
+    except ImportError:
+        print("  waitress not installed — using Flask dev server. For 24/7, run"
+              " 'pip install waitress'.\n")
+        app.run(host=host, port=port, debug=False)
