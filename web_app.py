@@ -61,15 +61,23 @@ def _load_credentials() -> dict:
     except Exception:
         return {}
     df.columns = [str(c).strip().lower() for c in df.columns]
+
+    def _cell(v):
+        # Blank Excel cells read as NaN; normalise to "" instead of "nan".
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        s = str(v).strip()
+        return "" if s.lower() in ("nan", "none") else s
+
     out = {}
     for _, r in df.iterrows():
-        email = str(r.get("email", "")).strip().lower()
-        if not email or email in ("nan", "none"):
+        email = _cell(r.get("email", "")).lower()
+        if not email:
             continue
         out[email] = {
-            "password":    str(r.get("password", "")).strip(),
-            "ip":          str(r.get("ip", "")).strip(),
-            "device_name": str(r.get("device_name", "")).strip(),
+            "password":    _cell(r.get("password", "")),
+            "ip":          _cell(r.get("ip", "")),
+            "device_name": _cell(r.get("device_name", "")),
         }
     return out
 
@@ -81,7 +89,9 @@ def _check_credentials(email: str, password: str, device_name: str = ""):
     if not creds:
         return False, "No credentials configured. Add data/credentials.xlsx."
     rec = creds.get((email or "").strip().lower())
-    if not rec or (password or "").strip() != rec["password"]:
+    # Reject unknown email, an account with no password set (incomplete row),
+    # or a wrong password.
+    if not rec or not rec["password"] or (password or "").strip() != rec["password"]:
         return False, "Invalid email or password."
     # Device name is optional. Only enforce it when BOTH the account has one and
     # the user typed one. Compare loosely: ignore case and all whitespace
