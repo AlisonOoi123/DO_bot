@@ -2616,6 +2616,80 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
         _rlog.info("[OVERLOAD-RESCUE] placed %d urban DO(s) via slight overload.", rescued)
 
 
+def _downsize_lorries(sess):
+    """Reduce wasted capacity: if a used lorry's whole load would fit on a
+    SMALLER idle lorry, move it there and free the bigger one — so e.g. a lone
+    10T load stops rolling out on a 22T truck when an ~11T truck is idle.
+
+    Moves a lorry's entire DO group intact to an empty lorry, so directions are
+    never mixed and nothing becomes unassigned. Per-DO size caps and forbidden
+    plates are respected. Purely cosmetic w.r.t. what gets delivered — it only
+    right-sizes the truck used.
+    """
+    eng = sess.get("engine")
+    if eng is None:
+        return
+    try:
+        caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
+                for _, r in eng.eligible_lorries.iterrows()}
+    except Exception:
+        return
+    if not caps:
+        return
+    items = sess.get("items", []) or []
+
+    from collections import defaultdict as _dd
+    on = _dd(list)
+    for it in items:
+        l = it.get("LORRY")
+        if l in caps:
+            on[l].append(it)
+    load = {l: sum((x.get("WEIGHT", 0.0) or 0.0) for x in v) for l, v in on.items()}
+    used = set(on.keys())
+
+    def _fits_all(dos, l):
+        for x in dos:
+            mt = x.get("MAX_TON")
+            if mt is not None and caps[l] > mt + 1e-9:
+                return False
+            fp = x.get("FORBID_PLATES")
+            if fp and l in fp:
+                return False
+        return True
+
+    moved = 0
+    # Tackle the biggest (most wasteful) lorries first.
+    for l in sorted(list(used), key=lambda x: -caps[x]):
+        dos = on.get(l)
+        if not dos:
+            continue
+        L = load[l]
+        # Smallest idle lorry that (a) still holds the load within capacity and
+        # (b) is genuinely smaller than the current lorry.
+        idle = [m for m in caps
+                if m not in used
+                and caps[m] + 1e-9 >= L
+                and caps[m] < caps[l] - 1e-9
+                and _fits_all(dos, m)]
+        if not idle:
+            continue
+        tgt = min(idle, key=lambda m: caps[m])
+        for x in dos:
+            x["LORRY"] = tgt
+            sess["assigned"][x["DO NUMBER"]] = tgt
+        used.discard(l)
+        used.add(tgt)
+        on[tgt] = dos
+        on[l] = []
+        load[tgt] = L
+        load[l] = 0.0
+        moved += 1
+
+    if moved:
+        import logging as _rlog
+        _rlog.info("[DOWNSIZE] right-sized %d lorry load(s) onto smaller trucks.", moved)
+
+
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         # Keep the raw upload so "assign off-schedule DOs" (YES) can re-run the
@@ -6400,6 +6474,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
         except Exception as _e:
             import logging as _rlog
             _rlog.warning("[OVERLOAD-RESCUE] skipped: %s", _e)
+
+        # ── Right-size trucks: move a light load off a big lorry onto a
+        # smaller idle one so big trucks don't roll out half-empty. ──────────
+        try:
+            _downsize_lorries(sess)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[DOWNSIZE] skipped: %s", _e)
 
         # ── (legacy for-loop removed — replaced by _assign_one above) ────────
         # The block below was the old heaviest-first loop.  Keep a dummy
