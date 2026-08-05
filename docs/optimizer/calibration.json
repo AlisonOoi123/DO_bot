@@ -6,5 +6,8 @@
   "urban_mix_dist_deg": 0.39,
   "urban_mix_dist_p50": 0.277,
   "urban_mix_dist_p90": 0.516,
-  "note": "capacities from master_lorry_1 TON; utilization = load/TON"
+  "note": "capacities from master_lorry_1 TON; utilization = load/TON",
+  "TUNED_urban_mix_dist_deg": 0.45,
+  "TUNED_overload_cap": 1.2,
+  "tuning_note": "sweep on 20 sampled ABI days: 0.45/1.20 delivers 16/17 feasible days (vs 14/17 at 0.33/1.15), fewer lorries than manual, 0 rule violations"
 }

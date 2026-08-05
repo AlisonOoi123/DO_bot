@@ -6,17 +6,17 @@ then packs tight (fewest lorries, highest fill). NOT wired into the engine yet â
 this is the shadow-mode model we validate before integration.
 
 Middle-ground constants (option C) calibrated from the historical corpus:
-  URBAN_MIX_DIST_DEG  0.33   (between our 0.25 guard and the manual's p75 0.39)
-  OVERLOAD_CAP        1.15   (sane single-trip cap; corpus p75 130% is inflated
-                              by 2nd-trip lorry-days, so we don't use it raw)
+  URBAN_MIX_DIST_DEG  0.45   (tuned: max full-delivery without over-mixing;
+                              near the manual's p75-p90 span, below p99 0.9)
+  OVERLOAD_CAP        1.20   (tuned single-trip cap)
   UTIL_FLOOR          0.35   (lorries below this are flagged "send tomorrow")
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 
-URBAN_MIX_DIST_DEG = 0.33
-OVERLOAD_CAP = 1.15
+URBAN_MIX_DIST_DEG = 0.45
+OVERLOAD_CAP = 1.20
 UTIL_FLOOR = 0.35
 MAX_DOS_PER_LORRY = 15
 

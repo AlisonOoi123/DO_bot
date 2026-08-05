@@ -44,3 +44,23 @@ should be small. The full shadow run below must use the schedule filter.
 Model proven on the hardest part (fast, optimal, rule-abiding, single-trip).
 Remaining work is the full-corpus shadow gate + the tomorrow flag + guarded
 integration. Engine still untouched.
+
+## Shadow gate results (ABI, 57 days) + tuning
+- **0 hard-rule violations** on every day. ✅
+- Optimizer uses **fewer lorries than the manual** (9.0 vs 10.8).
+- Tuning sweep (deliver-everything is priority #1):
+
+  | dist / overload | fully-delivered (feasible days) | avg lorries | avg util |
+  |---|---|---|---|
+  | 0.33 / 1.15 | 14/17 | 9.9 | 77% |
+  | **0.45 / 1.20** | **16/17** | **9.6** | **81%** |
+  | 0.55 / 1.25 | 16/17 | 9.5 | 79% |
+
+- **Locked: 0.45° / 1.20** — best delivery without over-mixing (0.45° sits
+  between the manual's p75 and p90; below the p99 outliers). The ~6% of
+  feasible days not fully delivered are genuine overflow → "send tomorrow."
+
+## Remaining before integration
+1. Full 227-day run at 0.45/1.20 for the final acceptance table (background).
+2. The "send tomorrow" report (under-filled lorries + unassigned DOs).
+3. Wire behind `OPTIMIZER_ENABLED` with fallback; shadow -> canary (ABI) -> default.
