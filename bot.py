@@ -3981,38 +3981,43 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         lambda _it: (_it.get("GPS_LAT"), _it.get("GPS_LON")),
                         lambda _it: _it.get("CODE", ""))
                     # Keep each ROUTE CODE whole across the split (operator rule:
-                    # same route code → same lorry). Merge all components of a
-                    # route code into one chunk; fill the first lorry with whole
-                    # chunks by weight. A single route code heavier than one lorry
-                    # is the only thing allowed to straddle the split.
-                    _code_chunks: dict = {}
+                    # same route code → same lorry) — but ONLY when the whole code
+                    # fits a lorry. A route code heavier than one lorry is split
+                    # back into its atomic components so the fill always makes
+                    # progress (otherwise recursing on an oversized whole chunk
+                    # would never terminate).
+                    _cap_lim = _cap1 * NAIK_FACTOR
+                    _by_code: dict = {}
                     for _cl in _hs_comps:
-                        _code_chunks.setdefault(_route_code_of(_cl[0]), []).extend(_cl)
-                    _chunks = sorted(
-                        _code_chunks.values(),
-                        key=lambda ch: -sum(x["WEIGHT"] for x in ch))
+                        _by_code.setdefault(_route_code_of(_cl[0]), []).append(_cl)
+                    _units: list = []               # each unit = list of items
+                    for _code, _comps in _by_code.items():
+                        _flat = [x for c in _comps for x in c]
+                        if sum(x["WEIGHT"] for x in _flat) <= _cap_lim:
+                            _units.append(_flat)    # whole route code, kept together
+                        else:
+                            _units.extend(_comps)   # too big — split into components
+                    _units.sort(key=lambda u: -sum(x["WEIGHT"] for x in u))
                     half_a, half_b = [], []
                     _fill_w = 0.0
-                    _cap_lim = _cap1 * NAIK_FACTOR
-                    for _ch in _chunks:
-                        _cw = sum(x["WEIGHT"] for x in _ch)
-                        if _cw > _cap_lim:
-                            # One route code too big for a lorry — let the
-                            # recursion split just this code, keep it off half_a.
-                            (half_a if not half_a and not half_b else half_b).extend(_ch)
-                            continue
-                        if _fill_w + _cw <= _cap_lim or not half_a:
-                            half_a.extend(_ch)
-                            _fill_w += _cw
+                    for _u in _units:
+                        _uw = sum(x["WEIGHT"] for x in _u)
+                        if _fill_w + _uw <= _cap_lim or not half_a:
+                            half_a.extend(_u)
+                            _fill_w += _uw
                         else:
-                            half_b.extend(_ch)
-                    _assign_group(half_a)
-                    _assign_group(half_b)
-                    # Propagate back to _all_group items that were pre-filtered NO_LORRY
-                    for it in _all_group:
-                        if it.get("LORRY") == "NO_LORRY":
-                            sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
-                    return
+                            half_b.extend(_u)
+                    # Only recurse when BOTH halves are non-empty (a real split);
+                    # otherwise the split made no progress — fall through to the
+                    # normal single-lorry / multi-lorry path to avoid infinite
+                    # recursion on an indivisible oversized unit.
+                    if half_a and half_b:
+                        _assign_group(half_a)
+                        _assign_group(half_b)
+                        for it in _all_group:
+                            if it.get("LORRY") == "NO_LORRY":
+                                sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                        return
                 # else: weight fits one lorry — fall through to normal single-lorry path
 
             total_w  = sum(it["WEIGHT"] for it in group_items)
