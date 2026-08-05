@@ -3980,18 +3980,32 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _route_code_of,
                         lambda _it: (_it.get("GPS_LAT"), _it.get("GPS_LON")),
                         lambda _it: _it.get("CODE", ""))
-                    _hs_comps.sort(key=lambda c: (
-                        _route_code_of(c[0]),
-                        -sum(x["WEIGHT"] for x in c)))
+                    # Keep each ROUTE CODE whole across the split (operator rule:
+                    # same route code → same lorry). Merge all components of a
+                    # route code into one chunk; fill the first lorry with whole
+                    # chunks by weight. A single route code heavier than one lorry
+                    # is the only thing allowed to straddle the split.
+                    _code_chunks: dict = {}
+                    for _cl in _hs_comps:
+                        _code_chunks.setdefault(_route_code_of(_cl[0]), []).extend(_cl)
+                    _chunks = sorted(
+                        _code_chunks.values(),
+                        key=lambda ch: -sum(x["WEIGHT"] for x in ch))
                     half_a, half_b = [], []
                     _fill_w = 0.0
-                    for _cl in _hs_comps:
-                        _cw = sum(x["WEIGHT"] for x in _cl)
-                        if _fill_w + _cw <= _cap1 * NAIK_FACTOR or not half_a:
-                            half_a.extend(_cl)
+                    _cap_lim = _cap1 * NAIK_FACTOR
+                    for _ch in _chunks:
+                        _cw = sum(x["WEIGHT"] for x in _ch)
+                        if _cw > _cap_lim:
+                            # One route code too big for a lorry — let the
+                            # recursion split just this code, keep it off half_a.
+                            (half_a if not half_a and not half_b else half_b).extend(_ch)
+                            continue
+                        if _fill_w + _cw <= _cap_lim or not half_a:
+                            half_a.extend(_ch)
                             _fill_w += _cw
                         else:
-                            half_b.extend(_cl)
+                            half_b.extend(_ch)
                     _assign_group(half_a)
                     _assign_group(half_b)
                     # Propagate back to _all_group items that were pre-filtered NO_LORRY
