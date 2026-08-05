@@ -2769,10 +2769,23 @@ def _urban_rebalance(sess, max_over: float = SLIGHT_OVERLOAD):
                 continue
             if load[m] + L_w > caps[m] * max_over + 1e-9:
                 continue                               # no room even overloaded
-            m_cent = _centroid(on[m])
-            if L_cent and m_cent and _math.hypot(L_cent[0] - m_cent[0],
-                                                 L_cent[1] - m_cent[1]) > _URBAN_MERGE_SPREAD:
-                continue                               # too far — would be a far mix
+            # No far mix: the MAX pairwise distance between any two different
+            # urban route codes on the COMBINED lorry must stay within the
+            # guard (centroid-to-centroid is too loose for a wide cluster).
+            comb = [(x.get("GPS_LAT"), x.get("GPS_LON"), _pfx(x))
+                    for x in (on[m] + L_items)
+                    if x.get("GPS_LAT") is not None and _is_urban_do(x)]
+            _far_mix = False
+            for _a in range(len(comb)):
+                for _b in range(_a + 1, len(comb)):
+                    if comb[_a][2] != comb[_b][2] and _math.hypot(
+                            comb[_a][0] - comb[_b][0], comb[_a][1] - comb[_b][1]) > _URBAN_MERGE_SPREAD:
+                        _far_mix = True
+                        break
+                if _far_mix:
+                    break
+            if _far_mix:
+                continue
             cand.append(m)
         if not cand:
             continue
