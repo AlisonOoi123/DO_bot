@@ -92,3 +92,35 @@ integration. Engine still untouched.
 ## Status
 Integration is safe and wired; the model needs delivery + violation fixes
 before it's better than the greedy. Engine behavior unchanged with flag OFF.
+
+## Final Phase-1 assessment (after FFD floor)
+Full 202-day ABI shadow, constraints 0.45/1.20:
+- avg lorries: **optimizer 9.6 vs manual 11.0** — leaner. ✅
+- fully delivered: **135/202 (67%)** — UNCHANGED by the FFD floor.
+- violations: down to 1 day.
+
+**The FFD floor did NOT raise delivery — and that's the key finding.** The
+under-delivered days are NOT solver timeouts; the feasible construction leaves
+the *same* DOs. Full single-trip delivery is genuinely INFEASIBLE on ~1/3 of
+days under the 0.45/1.20 rules, because the optimizer keeps each route code
+whole, whereas the **greedy splits route codes freely across many small,
+slightly-overloaded lorries + rescue passes** and so delivers ~everything.
+
+So today: **optimizer = fewer trucks but under-delivers; greedy = everything
+delivered on more trucks.** Priority #1 is "deliver everything", so the
+optimizer is NOT yet a win.
+
+### Options
+- **A. Keep greedy in production (optimizer stays OFF).** It already delivers
+  everything; the optimizer's truck savings don't justify dropping ~33% of
+  days to "send tomorrow". Zero risk. **Recommended for now.**
+- **B. Deeper model** — finer, splittable clusters + longer/again-warm-started
+  solves to match greedy delivery AND keep the truck savings. This is real
+  research (a week+), uncertain payoff (finer clustering *hurt* in a quick test).
+- **C. Accept the tradeoff** — enable the optimizer for its truck efficiency and
+  live with more "send tomorrow" days. Only if fewer trucks matters more than
+  same-day delivery.
+
+The greedy engine is healthy and delivers everything. The optimizer is a
+proven-safe, flag-gated asset that isn't ready to replace it on the stated #1
+priority.
