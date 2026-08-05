@@ -1,0 +1,10 @@
+{
+  "overload_cap": 1.303,
+  "overload_p50": 0.824,
+  "overload_p90": 1.911,
+  "util_floor_flag": 0.296,
+  "urban_mix_dist_deg": 0.39,
+  "urban_mix_dist_p50": 0.277,
+  "urban_mix_dist_p90": 0.516,
+  "note": "capacities from master_lorry_1 TON; utilization = load/TON"
+}
