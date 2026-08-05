@@ -8,7 +8,7 @@
   "man_lor": 4,
   "man_util": 23,
   "opt_lor": 2,
-  "opt_util": 8,
+  "opt_util": 13,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -22,7 +22,7 @@
   "man_lor": 6,
   "man_util": 51,
   "opt_lor": 4,
-  "opt_util": 65,
+  "opt_util": 90,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -36,7 +36,7 @@
   "man_lor": 3,
   "man_util": 34,
   "opt_lor": 2,
-  "opt_util": 35,
+  "opt_util": 80,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -64,7 +64,7 @@
   "man_lor": 8,
   "man_util": 104,
   "opt_lor": 6,
-  "opt_util": 82,
+  "opt_util": 79,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -78,7 +78,7 @@
   "man_lor": 9,
   "man_util": 75,
   "opt_lor": 5,
-  "opt_util": 73,
+  "opt_util": 71,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -92,7 +92,7 @@
   "man_lor": 9,
   "man_util": 76,
   "opt_lor": 5,
-  "opt_util": 70,
+  "opt_util": 69,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -106,7 +106,7 @@
   "man_lor": 7,
   "man_util": 25,
   "opt_lor": 3,
-  "opt_util": 41,
+  "opt_util": 57,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -119,9 +119,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 110,
-  "opt_lor": 10,
-  "opt_util": 87,
-  "opt_unW": 0.01,
+  "opt_lor": 11,
+  "opt_util": 81,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -134,7 +134,7 @@
   "man_lor": 12,
   "man_util": 93,
   "opt_lor": 10,
-  "opt_util": 76,
+  "opt_util": 74,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -148,7 +148,7 @@
   "man_lor": 11,
   "man_util": 88,
   "opt_lor": 7,
-  "opt_util": 77,
+  "opt_util": 66,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -162,7 +162,7 @@
   "man_lor": 10,
   "man_util": 80,
   "opt_lor": 7,
-  "opt_util": 61,
+  "opt_util": 64,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -190,7 +190,7 @@
   "man_lor": 9,
   "man_util": 61,
   "opt_lor": 6,
-  "opt_util": 68,
+  "opt_util": 80,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -218,7 +218,7 @@
   "man_lor": 9,
   "man_util": 124,
   "opt_lor": 9,
-  "opt_util": 92,
+  "opt_util": 94,
   "opt_unW": 2.77,
   "viol": 0,
   "status": "OPTIMAL"
@@ -232,7 +232,7 @@
   "man_lor": 9,
   "man_util": 61,
   "opt_lor": 7,
-  "opt_util": 70,
+  "opt_util": 66,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -246,7 +246,7 @@
   "man_lor": 10,
   "man_util": 98,
   "opt_lor": 8,
-  "opt_util": 76,
+  "opt_util": 79,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -274,7 +274,7 @@
   "man_lor": 9,
   "man_util": 83,
   "opt_lor": 6,
-  "opt_util": 95,
+  "opt_util": 84,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -288,7 +288,7 @@
   "man_lor": 9,
   "man_util": 110,
   "opt_lor": 9,
-  "opt_util": 95,
+  "opt_util": 93,
   "opt_unW": 0.84,
   "viol": 0,
   "status": "OPTIMAL"
@@ -302,7 +302,7 @@
   "man_lor": 9,
   "man_util": 101,
   "opt_lor": 9,
-  "opt_util": 95,
+  "opt_util": 94,
   "opt_unW": 0.95,
   "viol": 0,
   "status": "OPTIMAL"
@@ -316,7 +316,7 @@
   "man_lor": 9,
   "man_util": 235,
   "opt_lor": 9,
-  "opt_util": 87,
+  "opt_util": 90,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -330,7 +330,7 @@
   "man_lor": 9,
   "man_util": 119,
   "opt_lor": 9,
-  "opt_util": 75,
+  "opt_util": 70,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -344,7 +344,7 @@
   "man_lor": 9,
   "man_util": 107,
   "opt_lor": 9,
-  "opt_util": 70,
+  "opt_util": 74,
   "opt_unW": 0.32,
   "viol": 0,
   "status": "OPTIMAL"
@@ -358,7 +358,7 @@
   "man_lor": 9,
   "man_util": 68,
   "opt_lor": 5,
-  "opt_util": 89,
+  "opt_util": 104,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -372,7 +372,7 @@
   "man_lor": 9,
   "man_util": 115,
   "opt_lor": 9,
-  "opt_util": 84,
+  "opt_util": 80,
   "opt_unW": 18.85,
   "viol": 0,
   "status": "OPTIMAL"
@@ -386,7 +386,7 @@
   "man_lor": 9,
   "man_util": 89,
   "opt_lor": 8,
-  "opt_util": 89,
+  "opt_util": 88,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -400,7 +400,7 @@
   "man_lor": 9,
   "man_util": 95,
   "opt_lor": 7,
-  "opt_util": 73,
+  "opt_util": 76,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -427,9 +427,9 @@
   "fits": true,
   "man_lor": 10,
   "man_util": 57,
-  "opt_lor": 5,
-  "opt_util": 89,
-  "opt_unW": 0.01,
+  "opt_lor": 6,
+  "opt_util": 72,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -442,7 +442,7 @@
   "man_lor": 11,
   "man_util": 158,
   "opt_lor": 11,
-  "opt_util": 96,
+  "opt_util": 95,
   "opt_unW": 19.93,
   "viol": 0,
   "status": "OPTIMAL"
@@ -456,7 +456,7 @@
   "man_lor": 10,
   "man_util": 91,
   "opt_lor": 8,
-  "opt_util": 79,
+  "opt_util": 78,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -470,7 +470,7 @@
   "man_lor": 10,
   "man_util": 98,
   "opt_lor": 9,
-  "opt_util": 82,
+  "opt_util": 84,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -484,7 +484,7 @@
   "man_lor": 11,
   "man_util": 94,
   "opt_lor": 7,
-  "opt_util": 85,
+  "opt_util": 69,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -498,7 +498,7 @@
   "man_lor": 11,
   "man_util": 126,
   "opt_lor": 11,
-  "opt_util": 70,
+  "opt_util": 65,
   "opt_unW": 0.07,
   "viol": 0,
   "status": "FEASIBLE"
@@ -512,7 +512,7 @@
   "man_lor": 11,
   "man_util": 82,
   "opt_lor": 7,
-  "opt_util": 76,
+  "opt_util": 71,
   "opt_unW": 19.25,
   "viol": 0,
   "status": "OPTIMAL"
@@ -529,7 +529,7 @@
   "opt_util": 91,
   "opt_unW": 2.02,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-05-13",
@@ -540,7 +540,7 @@
   "man_lor": 12,
   "man_util": 93,
   "opt_lor": 12,
-  "opt_util": 80,
+  "opt_util": 72,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -553,9 +553,9 @@
   "fits": true,
   "man_lor": 12,
   "man_util": 94,
-  "opt_lor": 10,
-  "opt_util": 82,
-  "opt_unW": 0.1,
+  "opt_lor": 11,
+  "opt_util": 83,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -568,7 +568,7 @@
   "man_lor": 10,
   "man_util": 108,
   "opt_lor": 8,
-  "opt_util": 65,
+  "opt_util": 67,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -582,7 +582,7 @@
   "man_lor": 10,
   "man_util": 101,
   "opt_lor": 9,
-  "opt_util": 74,
+  "opt_util": 71,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -596,7 +596,7 @@
   "man_lor": 10,
   "man_util": 61,
   "opt_lor": 6,
-  "opt_util": 73,
+  "opt_util": 87,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -610,10 +610,10 @@
   "man_lor": 12,
   "man_util": 111,
   "opt_lor": 12,
-  "opt_util": 82,
+  "opt_util": 81,
   "opt_unW": 0.01,
   "viol": 0,
-  "status": "OPTIMAL"
+  "status": "FEASIBLE"
  },
  {
   "date": "2025-05-20",
@@ -638,7 +638,7 @@
   "man_lor": 11,
   "man_util": 119,
   "opt_lor": 11,
-  "opt_util": 83,
+  "opt_util": 84,
   "opt_unW": 2.07,
   "viol": 0,
   "status": "FEASIBLE"
@@ -652,7 +652,7 @@
   "man_lor": 10,
   "man_util": 118,
   "opt_lor": 10,
-  "opt_util": 76,
+  "opt_util": 80,
   "opt_unW": 0.05,
   "viol": 0,
   "status": "OPTIMAL"
@@ -679,9 +679,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 69,
-  "opt_lor": 6,
-  "opt_util": 70,
-  "opt_unW": 0.03,
+  "opt_lor": 7,
+  "opt_util": 66,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -707,9 +707,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 63,
-  "opt_lor": 9,
-  "opt_util": 61,
-  "opt_unW": 0.02,
+  "opt_lor": 10,
+  "opt_util": 69,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -722,7 +722,7 @@
   "man_lor": 10,
   "man_util": 60,
   "opt_lor": 8,
-  "opt_util": 60,
+  "opt_util": 65,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -736,7 +736,7 @@
   "man_lor": 11,
   "man_util": 75,
   "opt_lor": 8,
-  "opt_util": 70,
+  "opt_util": 74,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -750,7 +750,7 @@
   "man_lor": 11,
   "man_util": 80,
   "opt_lor": 9,
-  "opt_util": 48,
+  "opt_util": 61,
   "opt_unW": 19.5,
   "viol": 0,
   "status": "FEASIBLE"
@@ -764,7 +764,7 @@
   "man_lor": 9,
   "man_util": 77,
   "opt_lor": 7,
-  "opt_util": 68,
+  "opt_util": 80,
   "opt_unW": 19.41,
   "viol": 0,
   "status": "OPTIMAL"
@@ -778,9 +778,9 @@
   "man_lor": 11,
   "man_util": 188,
   "opt_lor": 11,
-  "opt_util": 106,
+  "opt_util": 105,
   "opt_unW": 35.13,
-  "viol": 1,
+  "viol": 0,
   "status": "OPTIMAL"
  },
  {
@@ -805,9 +805,9 @@
   "fits": true,
   "man_lor": 12,
   "man_util": 106,
-  "opt_lor": 7,
-  "opt_util": 67,
-  "opt_unW": 62.89,
+  "opt_lor": 8,
+  "opt_util": 85,
+  "opt_unW": 62.77,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -820,7 +820,7 @@
   "man_lor": 12,
   "man_util": 89,
   "opt_lor": 7,
-  "opt_util": 86,
+  "opt_util": 89,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -848,7 +848,7 @@
   "man_lor": 12,
   "man_util": 81,
   "opt_lor": 12,
-  "opt_util": 79,
+  "opt_util": 77,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -862,7 +862,7 @@
   "man_lor": 12,
   "man_util": 94,
   "opt_lor": 11,
-  "opt_util": 88,
+  "opt_util": 92,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -876,7 +876,7 @@
   "man_lor": 12,
   "man_util": 84,
   "opt_lor": 10,
-  "opt_util": 87,
+  "opt_util": 80,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -893,7 +893,7 @@
   "opt_util": 84,
   "opt_unW": 2.92,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-06-14",
@@ -904,7 +904,7 @@
   "man_lor": 10,
   "man_util": 92,
   "opt_lor": 6,
-  "opt_util": 101,
+  "opt_util": 94,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -918,7 +918,7 @@
   "man_lor": 11,
   "man_util": 120,
   "opt_lor": 11,
-  "opt_util": 92,
+  "opt_util": 93,
   "opt_unW": 5.61,
   "viol": 0,
   "status": "FEASIBLE"
@@ -946,7 +946,7 @@
   "man_lor": 10,
   "man_util": 107,
   "opt_lor": 10,
-  "opt_util": 83,
+  "opt_util": 84,
   "opt_unW": 4.55,
   "viol": 0,
   "status": "OPTIMAL"
@@ -959,11 +959,11 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 119,
-  "opt_lor": 10,
-  "opt_util": 74,
-  "opt_unW": 0.03,
+  "opt_lor": 11,
+  "opt_util": 87,
+  "opt_unW": 0.0,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-06-20",
@@ -974,10 +974,10 @@
   "man_lor": 9,
   "man_util": 79,
   "opt_lor": 8,
-  "opt_util": 80,
+  "opt_util": 79,
   "opt_unW": 0.0,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-06-21",
@@ -988,7 +988,7 @@
   "man_lor": 10,
   "man_util": 80,
   "opt_lor": 7,
-  "opt_util": 79,
+  "opt_util": 76,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1016,7 +1016,7 @@
   "man_lor": 11,
   "man_util": 120,
   "opt_lor": 11,
-  "opt_util": 86,
+  "opt_util": 85,
   "opt_unW": 19.65,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1030,7 +1030,7 @@
   "man_lor": 11,
   "man_util": 70,
   "opt_lor": 7,
-  "opt_util": 87,
+  "opt_util": 81,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1043,9 +1043,9 @@
   "fits": true,
   "man_lor": 10,
   "man_util": 88,
-  "opt_lor": 8,
-  "opt_util": 55,
-  "opt_unW": 0.03,
+  "opt_lor": 9,
+  "opt_util": 56,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1058,7 +1058,7 @@
   "man_lor": 10,
   "man_util": 108,
   "opt_lor": 8,
-  "opt_util": 93,
+  "opt_util": 81,
   "opt_unW": 7.45,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1072,7 +1072,7 @@
   "man_lor": 9,
   "man_util": 66,
   "opt_lor": 6,
-  "opt_util": 76,
+  "opt_util": 105,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1086,7 +1086,7 @@
   "man_lor": 10,
   "man_util": 113,
   "opt_lor": 10,
-  "opt_util": 89,
+  "opt_util": 87,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1100,7 +1100,7 @@
   "man_lor": 11,
   "man_util": 109,
   "opt_lor": 11,
-  "opt_util": 86,
+  "opt_util": 87,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1114,7 +1114,7 @@
   "man_lor": 11,
   "man_util": 116,
   "opt_lor": 11,
-  "opt_util": 89,
+  "opt_util": 88,
   "opt_unW": 0.35,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1128,7 +1128,7 @@
   "man_lor": 12,
   "man_util": 88,
   "opt_lor": 10,
-  "opt_util": 82,
+  "opt_util": 77,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1142,10 +1142,10 @@
   "man_lor": 10,
   "man_util": 113,
   "opt_lor": 10,
-  "opt_util": 86,
+  "opt_util": 88,
   "opt_unW": 0.2,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-07-05",
@@ -1156,7 +1156,7 @@
   "man_lor": 11,
   "man_util": 67,
   "opt_lor": 8,
-  "opt_util": 82,
+  "opt_util": 83,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1170,7 +1170,7 @@
   "man_lor": 11,
   "man_util": 117,
   "opt_lor": 11,
-  "opt_util": 103,
+  "opt_util": 104,
   "opt_unW": 14.04,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1184,7 +1184,7 @@
   "man_lor": 11,
   "man_util": 82,
   "opt_lor": 10,
-  "opt_util": 75,
+  "opt_util": 74,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1198,7 +1198,7 @@
   "man_lor": 11,
   "man_util": 99,
   "opt_lor": 9,
-  "opt_util": 68,
+  "opt_util": 69,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1212,10 +1212,10 @@
   "man_lor": 11,
   "man_util": 103,
   "opt_lor": 11,
-  "opt_util": 84,
+  "opt_util": 92,
   "opt_unW": 0.32,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-07-11",
@@ -1226,7 +1226,7 @@
   "man_lor": 11,
   "man_util": 130,
   "opt_lor": 10,
-  "opt_util": 89,
+  "opt_util": 99,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1240,7 +1240,7 @@
   "man_lor": 12,
   "man_util": 53,
   "opt_lor": 9,
-  "opt_util": 63,
+  "opt_util": 65,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1254,8 +1254,8 @@
   "man_lor": 11,
   "man_util": 149,
   "opt_lor": 11,
-  "opt_util": 107,
-  "opt_unW": 5.25,
+  "opt_util": 106,
+  "opt_unW": 5.85,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1268,7 +1268,7 @@
   "man_lor": 10,
   "man_util": 118,
   "opt_lor": 10,
-  "opt_util": 96,
+  "opt_util": 99,
   "opt_unW": 0.43,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1282,7 +1282,7 @@
   "man_lor": 10,
   "man_util": 80,
   "opt_lor": 8,
-  "opt_util": 64,
+  "opt_util": 74,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1296,7 +1296,7 @@
   "man_lor": 10,
   "man_util": 130,
   "opt_lor": 10,
-  "opt_util": 84,
+  "opt_util": 83,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1338,7 +1338,7 @@
   "man_lor": 11,
   "man_util": 128,
   "opt_lor": 11,
-  "opt_util": 101,
+  "opt_util": 102,
   "opt_unW": 25.99,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1351,9 +1351,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 108,
-  "opt_lor": 10,
-  "opt_util": 78,
-  "opt_unW": 0.11,
+  "opt_lor": 11,
+  "opt_util": 82,
+  "opt_unW": 0.05,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1366,7 +1366,7 @@
   "man_lor": 11,
   "man_util": 81,
   "opt_lor": 9,
-  "opt_util": 70,
+  "opt_util": 89,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1379,9 +1379,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 88,
-  "opt_lor": 8,
-  "opt_util": 80,
-  "opt_unW": 0.01,
+  "opt_lor": 9,
+  "opt_util": 75,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -1393,9 +1393,9 @@
   "fits": true,
   "man_lor": 9,
   "man_util": 95,
-  "opt_lor": 7,
-  "opt_util": 74,
-  "opt_unW": 0.01,
+  "opt_lor": 8,
+  "opt_util": 73,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1408,7 +1408,7 @@
   "man_lor": 11,
   "man_util": 72,
   "opt_lor": 6,
-  "opt_util": 87,
+  "opt_util": 92,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1422,8 +1422,8 @@
   "man_lor": 11,
   "man_util": 127,
   "opt_lor": 11,
-  "opt_util": 97,
-  "opt_unW": 12.58,
+  "opt_util": 96,
+  "opt_unW": 12.77,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1436,10 +1436,10 @@
   "man_lor": 10,
   "man_util": 132,
   "opt_lor": 10,
-  "opt_util": 94,
+  "opt_util": 95,
   "opt_unW": 15.63,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-07-30",
@@ -1450,7 +1450,7 @@
   "man_lor": 11,
   "man_util": 54,
   "opt_lor": 9,
-  "opt_util": 60,
+  "opt_util": 56,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1492,7 +1492,7 @@
   "man_lor": 10,
   "man_util": 69,
   "opt_lor": 7,
-  "opt_util": 57,
+  "opt_util": 66,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1509,7 +1509,7 @@
   "opt_util": 98,
   "opt_unW": 13.08,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-08-05",
@@ -1520,8 +1520,8 @@
   "man_lor": 11,
   "man_util": 133,
   "opt_lor": 11,
-  "opt_util": 95,
-  "opt_unW": 15.23,
+  "opt_util": 94,
+  "opt_unW": 15.25,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1534,7 +1534,7 @@
   "man_lor": 11,
   "man_util": 96,
   "opt_lor": 9,
-  "opt_util": 77,
+  "opt_util": 84,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1562,7 +1562,7 @@
   "man_lor": 10,
   "man_util": 120,
   "opt_lor": 10,
-  "opt_util": 92,
+  "opt_util": 91,
   "opt_unW": 0.23,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1576,7 +1576,7 @@
   "man_lor": 10,
   "man_util": 69,
   "opt_lor": 7,
-  "opt_util": 79,
+  "opt_util": 83,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1590,7 +1590,7 @@
   "man_lor": 11,
   "man_util": 162,
   "opt_lor": 11,
-  "opt_util": 101,
+  "opt_util": 99,
   "opt_unW": 19.4,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1618,7 +1618,7 @@
   "man_lor": 12,
   "man_util": 81,
   "opt_lor": 9,
-  "opt_util": 65,
+  "opt_util": 81,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1631,9 +1631,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 118,
-  "opt_lor": 10,
-  "opt_util": 87,
-  "opt_unW": 0.02,
+  "opt_lor": 11,
+  "opt_util": 81,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -1646,7 +1646,7 @@
   "man_lor": 10,
   "man_util": 104,
   "opt_lor": 10,
-  "opt_util": 87,
+  "opt_util": 82,
   "opt_unW": 0.23,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1659,9 +1659,9 @@
   "fits": true,
   "man_lor": 10,
   "man_util": 64,
-  "opt_lor": 6,
-  "opt_util": 88,
-  "opt_unW": 0.02,
+  "opt_lor": 7,
+  "opt_util": 68,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -1688,7 +1688,7 @@
   "man_lor": 13,
   "man_util": 101,
   "opt_lor": 13,
-  "opt_util": 87,
+  "opt_util": 86,
   "opt_unW": 0.7,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1702,7 +1702,7 @@
   "man_lor": 13,
   "man_util": 95,
   "opt_lor": 13,
-  "opt_util": 82,
+  "opt_util": 79,
   "opt_unW": 0.02,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1715,9 +1715,9 @@
   "fits": true,
   "man_lor": 12,
   "man_util": 113,
-  "opt_lor": 11,
-  "opt_util": 75,
-  "opt_unW": 0.03,
+  "opt_lor": 12,
+  "opt_util": 83,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1730,7 +1730,7 @@
   "man_lor": 13,
   "man_util": 90,
   "opt_lor": 9,
-  "opt_util": 83,
+  "opt_util": 84,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1744,7 +1744,7 @@
   "man_lor": 12,
   "man_util": 72,
   "opt_lor": 7,
-  "opt_util": 84,
+  "opt_util": 79,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1758,7 +1758,7 @@
   "man_lor": 12,
   "man_util": 167,
   "opt_lor": 12,
-  "opt_util": 102,
+  "opt_util": 101,
   "opt_unW": 29.78,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1772,7 +1772,7 @@
   "man_lor": 11,
   "man_util": 106,
   "opt_lor": 11,
-  "opt_util": 82,
+  "opt_util": 84,
   "opt_unW": 0.01,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1786,7 +1786,7 @@
   "man_lor": 13,
   "man_util": 87,
   "opt_lor": 11,
-  "opt_util": 69,
+  "opt_util": 67,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1799,9 +1799,9 @@
   "fits": true,
   "man_lor": 12,
   "man_util": 121,
-  "opt_lor": 8,
-  "opt_util": 89,
-  "opt_unW": 40.48,
+  "opt_lor": 9,
+  "opt_util": 81,
+  "opt_unW": 40.37,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1814,7 +1814,7 @@
   "man_lor": 12,
   "man_util": 100,
   "opt_lor": 10,
-  "opt_util": 70,
+  "opt_util": 69,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1828,7 +1828,7 @@
   "man_lor": 12,
   "man_util": 74,
   "opt_lor": 8,
-  "opt_util": 88,
+  "opt_util": 83,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1842,7 +1842,7 @@
   "man_lor": 13,
   "man_util": 212,
   "opt_lor": 13,
-  "opt_util": 99,
+  "opt_util": 100,
   "opt_unW": 63.13,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1856,10 +1856,10 @@
   "man_lor": 13,
   "man_util": 111,
   "opt_lor": 13,
-  "opt_util": 97,
+  "opt_util": 98,
   "opt_unW": 4.85,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-09-04",
@@ -1870,7 +1870,7 @@
   "man_lor": 13,
   "man_util": 123,
   "opt_lor": 13,
-  "opt_util": 69,
+  "opt_util": 60,
   "opt_unW": 20.4,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1884,7 +1884,7 @@
   "man_lor": 12,
   "man_util": 120,
   "opt_lor": 12,
-  "opt_util": 97,
+  "opt_util": 96,
   "opt_unW": 0.23,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1898,7 +1898,7 @@
   "man_lor": 12,
   "man_util": 71,
   "opt_lor": 9,
-  "opt_util": 81,
+  "opt_util": 72,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1912,7 +1912,7 @@
   "man_lor": 13,
   "man_util": 139,
   "opt_lor": 13,
-  "opt_util": 86,
+  "opt_util": 87,
   "opt_unW": 30.59,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1926,7 +1926,7 @@
   "man_lor": 13,
   "man_util": 107,
   "opt_lor": 13,
-  "opt_util": 77,
+  "opt_util": 75,
   "opt_unW": 0.15,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1939,9 +1939,9 @@
   "fits": true,
   "man_lor": 13,
   "man_util": 110,
-  "opt_lor": 12,
+  "opt_lor": 13,
   "opt_util": 79,
-  "opt_unW": 40.62,
+  "opt_unW": 40.57,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -1968,7 +1968,7 @@
   "man_lor": 11,
   "man_util": 78,
   "opt_lor": 9,
-  "opt_util": 64,
+  "opt_util": 68,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -1982,7 +1982,7 @@
   "man_lor": 11,
   "man_util": 53,
   "opt_lor": 7,
-  "opt_util": 65,
+  "opt_util": 85,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -1996,7 +1996,7 @@
   "man_lor": 3,
   "man_util": 36,
   "opt_lor": 2,
-  "opt_util": 38,
+  "opt_util": 19,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2010,7 +2010,7 @@
   "man_lor": 12,
   "man_util": 152,
   "opt_lor": 12,
-  "opt_util": 104,
+  "opt_util": 105,
   "opt_unW": 31.37,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2023,9 +2023,9 @@
   "fits": true,
   "man_lor": 13,
   "man_util": 109,
-  "opt_lor": 11,
+  "opt_lor": 12,
   "opt_util": 78,
-  "opt_unW": 0.08,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2052,10 +2052,10 @@
   "man_lor": 12,
   "man_util": 48,
   "opt_lor": 7,
-  "opt_util": 55,
+  "opt_util": 73,
   "opt_unW": 0.0,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-09-22",
@@ -2069,7 +2069,7 @@
   "opt_util": 109,
   "opt_unW": 11.02,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-09-23",
@@ -2080,7 +2080,7 @@
   "man_lor": 12,
   "man_util": 123,
   "opt_lor": 12,
-  "opt_util": 100,
+  "opt_util": 99,
   "opt_unW": 30.74,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2107,9 +2107,9 @@
   "fits": true,
   "man_lor": 12,
   "man_util": 101,
-  "opt_lor": 10,
+  "opt_lor": 11,
   "opt_util": 80,
-  "opt_unW": 0.05,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2122,7 +2122,7 @@
   "man_lor": 12,
   "man_util": 120,
   "opt_lor": 12,
-  "opt_util": 95,
+  "opt_util": 94,
   "opt_unW": 22.72,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2135,9 +2135,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 45,
-  "opt_lor": 5,
-  "opt_util": 75,
-  "opt_unW": 0.02,
+  "opt_lor": 6,
+  "opt_util": 86,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -2150,10 +2150,10 @@
   "man_lor": 12,
   "man_util": 132,
   "opt_lor": 12,
-  "opt_util": 98,
+  "opt_util": 99,
   "opt_unW": 1.78,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-09-30",
@@ -2164,8 +2164,8 @@
   "man_lor": 13,
   "man_util": 118,
   "opt_lor": 13,
-  "opt_util": 97,
-  "opt_unW": 2.18,
+  "opt_util": 98,
+  "opt_unW": 2.13,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2177,11 +2177,11 @@
   "fits": true,
   "man_lor": 12,
   "man_util": 115,
-  "opt_lor": 12,
-  "opt_util": 81,
+  "opt_lor": 11,
+  "opt_util": 85,
   "opt_unW": 0.0,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-10-02",
@@ -2191,9 +2191,9 @@
   "fits": true,
   "man_lor": 13,
   "man_util": 110,
-  "opt_lor": 10,
-  "opt_util": 91,
-  "opt_unW": 0.03,
+  "opt_lor": 11,
+  "opt_util": 89,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2206,7 +2206,7 @@
   "man_lor": 10,
   "man_util": 75,
   "opt_lor": 9,
-  "opt_util": 70,
+  "opt_util": 52,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2219,9 +2219,9 @@
   "fits": true,
   "man_lor": 11,
   "man_util": 66,
-  "opt_lor": 5,
-  "opt_util": 108,
-  "opt_unW": 0.04,
+  "opt_lor": 6,
+  "opt_util": 82,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -2248,7 +2248,7 @@
   "man_lor": 12,
   "man_util": 96,
   "opt_lor": 12,
-  "opt_util": 80,
+  "opt_util": 87,
   "opt_unW": 0.24,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2262,7 +2262,7 @@
   "man_lor": 13,
   "man_util": 125,
   "opt_lor": 13,
-  "opt_util": 97,
+  "opt_util": 96,
   "opt_unW": 2.07,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2276,7 +2276,7 @@
   "man_lor": 13,
   "man_util": 110,
   "opt_lor": 12,
-  "opt_util": 80,
+  "opt_util": 83,
   "opt_unW": 20.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2290,7 +2290,7 @@
   "man_lor": 13,
   "man_util": 92,
   "opt_lor": 13,
-  "opt_util": 71,
+  "opt_util": 69,
   "opt_unW": 0.03,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2304,7 +2304,7 @@
   "man_lor": 12,
   "man_util": 59,
   "opt_lor": 7,
-  "opt_util": 80,
+  "opt_util": 68,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2346,7 +2346,7 @@
   "man_lor": 13,
   "man_util": 111,
   "opt_lor": 13,
-  "opt_util": 93,
+  "opt_util": 94,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2359,11 +2359,11 @@
   "fits": true,
   "man_lor": 12,
   "man_util": 149,
-  "opt_lor": 11,
-  "opt_util": 85,
-  "opt_unW": 41.79,
+  "opt_lor": 12,
+  "opt_util": 88,
+  "opt_unW": 41.7,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-10-17",
@@ -2374,7 +2374,7 @@
   "man_lor": 13,
   "man_util": 83,
   "opt_lor": 9,
-  "opt_util": 72,
+  "opt_util": 70,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2388,7 +2388,7 @@
   "man_lor": 11,
   "man_util": 82,
   "opt_lor": 7,
-  "opt_util": 81,
+  "opt_util": 83,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2402,7 +2402,7 @@
   "man_lor": 13,
   "man_util": 186,
   "opt_lor": 13,
-  "opt_util": 105,
+  "opt_util": 104,
   "opt_unW": 70.01,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2416,7 +2416,7 @@
   "man_lor": 13,
   "man_util": 91,
   "opt_lor": 11,
-  "opt_util": 78,
+  "opt_util": 74,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2444,10 +2444,10 @@
   "man_lor": 13,
   "man_util": 138,
   "opt_lor": 12,
-  "opt_util": 106,
+  "opt_util": 107,
   "opt_unW": 19.51,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-10-25",
@@ -2458,10 +2458,10 @@
   "man_lor": 13,
   "man_util": 58,
   "opt_lor": 7,
-  "opt_util": 71,
+  "opt_util": 69,
   "opt_unW": 0.0,
   "viol": 0,
-  "status": "OPTIMAL"
+  "status": "FEASIBLE"
  },
  {
   "date": "2025-10-27",
@@ -2485,9 +2485,9 @@
   "fits": true,
   "man_lor": 13,
   "man_util": 112,
-  "opt_lor": 11,
-  "opt_util": 68,
-  "opt_unW": 41.62,
+  "opt_lor": 12,
+  "opt_util": 76,
+  "opt_unW": 41.53,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2500,7 +2500,7 @@
   "man_lor": 13,
   "man_util": 99,
   "opt_lor": 12,
-  "opt_util": 99,
+  "opt_util": 97,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2514,7 +2514,7 @@
   "man_lor": 12,
   "man_util": 100,
   "opt_lor": 9,
-  "opt_util": 101,
+  "opt_util": 92,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2527,9 +2527,9 @@
   "fits": true,
   "man_lor": 13,
   "man_util": 128,
-  "opt_lor": 11,
-  "opt_util": 96,
-  "opt_unW": 0.19,
+  "opt_lor": 13,
+  "opt_util": 84,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -2542,7 +2542,7 @@
   "man_lor": 13,
   "man_util": 68,
   "opt_lor": 9,
-  "opt_util": 78,
+  "opt_util": 84,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2570,7 +2570,7 @@
   "man_lor": 13,
   "man_util": 111,
   "opt_lor": 13,
-  "opt_util": 81,
+  "opt_util": 82,
   "opt_unW": 0.54,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2583,9 +2583,9 @@
   "fits": true,
   "man_lor": 13,
   "man_util": 99,
-  "opt_lor": 10,
-  "opt_util": 94,
-  "opt_unW": 0.02,
+  "opt_lor": 11,
+  "opt_util": 78,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2598,10 +2598,10 @@
   "man_lor": 13,
   "man_util": 125,
   "opt_lor": 12,
-  "opt_util": 81,
+  "opt_util": 85,
   "opt_unW": 7.23,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-11-07",
@@ -2612,7 +2612,7 @@
   "man_lor": 13,
   "man_util": 90,
   "opt_lor": 9,
-  "opt_util": 65,
+  "opt_util": 64,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2626,7 +2626,7 @@
   "man_lor": 13,
   "man_util": 47,
   "opt_lor": 7,
-  "opt_util": 71,
+  "opt_util": 75,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2643,7 +2643,7 @@
   "opt_util": 98,
   "opt_unW": 2.77,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-11-11",
@@ -2654,7 +2654,7 @@
   "man_lor": 13,
   "man_util": 109,
   "opt_lor": 13,
-  "opt_util": 89,
+  "opt_util": 87,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2668,7 +2668,7 @@
   "man_lor": 11,
   "man_util": 98,
   "opt_lor": 9,
-  "opt_util": 72,
+  "opt_util": 83,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2696,7 +2696,7 @@
   "man_lor": 12,
   "man_util": 101,
   "opt_lor": 10,
-  "opt_util": 74,
+  "opt_util": 87,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2710,7 +2710,7 @@
   "man_lor": 12,
   "man_util": 79,
   "opt_lor": 9,
-  "opt_util": 77,
+  "opt_util": 76,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2751,9 +2751,9 @@
   "fits": false,
   "man_lor": 12,
   "man_util": 133,
-  "opt_lor": 11,
-  "opt_util": 92,
-  "opt_unW": 38.52,
+  "opt_lor": 12,
+  "opt_util": 88,
+  "opt_unW": 38.44,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2766,7 +2766,7 @@
   "man_lor": 12,
   "man_util": 143,
   "opt_lor": 9,
-  "opt_util": 89,
+  "opt_util": 92,
   "opt_unW": 51.32,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2779,9 +2779,9 @@
   "fits": true,
   "man_lor": 13,
   "man_util": 135,
-  "opt_lor": 10,
-  "opt_util": 87,
-  "opt_unW": 0.06,
+  "opt_lor": 11,
+  "opt_util": 81,
+  "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
  },
@@ -2794,10 +2794,10 @@
   "man_lor": 12,
   "man_util": 64,
   "opt_lor": 6,
-  "opt_util": 71,
+  "opt_util": 67,
   "opt_unW": 0.0,
   "viol": 0,
-  "status": "FEASIBLE"
+  "status": "OPTIMAL"
  },
  {
   "date": "2025-11-24",
@@ -2822,7 +2822,7 @@
   "man_lor": 11,
   "man_util": 103,
   "opt_lor": 10,
-  "opt_util": 86,
+  "opt_util": 90,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2836,7 +2836,7 @@
   "man_lor": 12,
   "man_util": 93,
   "opt_lor": 11,
-  "opt_util": 71,
+  "opt_util": 69,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2850,7 +2850,7 @@
   "man_lor": 11,
   "man_util": 103,
   "opt_lor": 9,
-  "opt_util": 83,
+  "opt_util": 92,
   "opt_unW": 21.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2864,7 +2864,7 @@
   "man_lor": 11,
   "man_util": 74,
   "opt_lor": 10,
-  "opt_util": 60,
+  "opt_util": 59,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2878,7 +2878,7 @@
   "man_lor": 11,
   "man_util": 91,
   "opt_lor": 9,
-  "opt_util": 105,
+  "opt_util": 107,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2892,7 +2892,7 @@
   "man_lor": 12,
   "man_util": 179,
   "opt_lor": 12,
-  "opt_util": 98,
+  "opt_util": 100,
   "opt_unW": 30.03,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2920,7 +2920,7 @@
   "man_lor": 13,
   "man_util": 104,
   "opt_lor": 12,
-  "opt_util": 95,
+  "opt_util": 88,
   "opt_unW": 18.7,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2933,9 +2933,9 @@
   "fits": false,
   "man_lor": 10,
   "man_util": 152,
-  "opt_lor": 9,
-  "opt_util": 101,
-  "opt_unW": 19.71,
+  "opt_lor": 10,
+  "opt_util": 92,
+  "opt_unW": 19.64,
   "viol": 0,
   "status": "OPTIMAL"
  },
@@ -2948,7 +2948,7 @@
   "man_lor": 12,
   "man_util": 95,
   "opt_lor": 9,
-  "opt_util": 72,
+  "opt_util": 71,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2962,7 +2962,7 @@
   "man_lor": 12,
   "man_util": 84,
   "opt_lor": 10,
-  "opt_util": 97,
+  "opt_util": 96,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
@@ -2976,7 +2976,7 @@
   "man_lor": 13,
   "man_util": 126,
   "opt_lor": 13,
-  "opt_util": 74,
+  "opt_util": 75,
   "opt_unW": 24.24,
   "viol": 0,
   "status": "FEASIBLE"
@@ -2990,7 +2990,7 @@
   "man_lor": 12,
   "man_util": 149,
   "opt_lor": 12,
-  "opt_util": 97,
+  "opt_util": 92,
   "opt_unW": 12.47,
   "viol": 0,
   "status": "FEASIBLE"
@@ -3004,7 +3004,7 @@
   "man_lor": 11,
   "man_util": 96,
   "opt_lor": 7,
-  "opt_util": 67,
+  "opt_util": 83,
   "opt_unW": 0.0,
   "viol": 0,
   "status": "OPTIMAL"
