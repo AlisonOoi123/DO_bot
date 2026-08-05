@@ -779,8 +779,47 @@ def _classify_dest_group(route: str, state: str = "") -> str:
 
 # _DEST_SORT_PRI, _LORRY_STRICT_ROUTE, _ROUTE_CORRIDOR_GROUPS imported from assignment_config
 
-def _same_corridor_group(route1: str, route2: str) -> bool:
-    """Return True when both routes belong to the same delivery corridor group."""
+# Actual destination STATE → outstation corridor. Used to group routes by their
+# REAL geography instead of a possibly-misleading route code. e.g. some
+# "NS04-->Port Dickson" DOs are actually delivered to Kuala Lipis, PAHANG — their
+# state (PAHANG) puts them with the Pahang run (PH03/PH04), not the Seremban run.
+_STATE_TO_CORRIDOR = {
+    "PAHANG":           "PH_INT",
+    "NEGERI SEMBILAN":  "NS",
+    "PERAK":            "PERAK",
+}
+
+
+def _state_corridor(state: str, route: str = "") -> str:
+    # KV (Klang Valley) routes are handled by city/urban bucketing — never let a
+    # border state (e.g. KV01A touching Perak at Tanjung Malim) reclassify them
+    # into a deep-outstation corridor. Only genuine outstation route codes use
+    # the state override.
+    if str(route).strip().upper().startswith("KV"):
+        return ""
+    return _STATE_TO_CORRIDOR.get(str(state).strip().upper(), "")
+
+
+def _prefix_corridor(route: str) -> str:
+    r = str(route).strip().upper()
+    for _name, _pfxs in _ROUTE_CORRIDOR_GROUPS.items():
+        if any(r.startswith(p) for p in _pfxs):
+            return _name
+    return ""
+
+
+def _same_corridor_group(route1: str, route2: str,
+                         state1: str = "", state2: str = "") -> bool:
+    """Return True when both routes belong to the same delivery corridor group.
+
+    When BOTH actual states are known outstation states, group purely by state
+    (so a mislabeled route rides the truck for its real geography). Otherwise
+    fall back to route-code corridor groups.
+    """
+    c1 = _state_corridor(state1, route1)
+    c2 = _state_corridor(state2, route2)
+    if c1 and c2:
+        return c1 == c2
     r1 = route1.strip().upper()
     r2 = route2.strip().upper()
     for pfxs in _ROUTE_CORRIDOR_GROUPS.values():
@@ -789,16 +828,22 @@ def _same_corridor_group(route1: str, route2: str) -> bool:
             return True
     return False
 
-def _direction_key(route: str) -> str:
+def _direction_key(route: str, state: str = "") -> str:
     """Coarse outstation 'direction' for a route: the corridor-group name if the
     route belongs to one (PH_INT, KV_NORTH, NS, …), else the route code. Used to
     reserve one lorry per distinct outstation direction so the biggest direction
     (e.g. Pahang/Kuantan) does not consume every lorry and starve a smaller one
-    (e.g. the KV01A/KV02A northern run)."""
+    (e.g. the KV01A/KV02A northern run).
+
+    If the DO's actual state maps to a known outstation corridor, that wins over
+    the route-code prefix — so NS04-in-Pahang is directed with the Pahang run."""
+    sc = _state_corridor(state, route)
+    if sc:
+        return sc
     r = str(route).strip().upper()
-    for _name, _pfxs in _ROUTE_CORRIDOR_GROUPS.items():
-        if any(r.startswith(p) for p in _pfxs):
-            return _name
+    cg = _prefix_corridor(r)
+    if cg:
+        return cg
     _m = re.match(r"([A-Z]+\d+[A-Z]?)", r)
     return _m.group(1) if _m else r[:6]
 
@@ -3414,7 +3459,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 <= _MAX_CITY_MERGE_KM_OUTSTATION
                             )
 
-                _corridor_merge = _same_corridor_group(base_route, cand_route)
+                _corridor_merge = _same_corridor_group(base_route, cand_route,
+                                                       _st_base, _st_cand)
                 _urban_prox_merge = _geo_close
 
                 # ── Priority-ordered merge rules (per user request) ───────────
@@ -3787,7 +3833,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _dg = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
             if _dg in _DEST_URBAN_GROUPS:
                 continue                            # urban → no reservation
-            _dir_weight[_direction_key(_it.get("ROUTE", ""))] += _it["WEIGHT"]
+            _dir_weight[_direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""))] += _it["WEIGHT"]
         if len(_dir_weight) > 1:                     # only when directions compete
             _res_excl = sess["unavailable"] | get_assigned_today()
             _res_avail = sorted(
@@ -4109,7 +4155,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # for ITS OWN direction, or any unreserved lorry.
             _reserve_excl: set = set()
             if _reserved_lorry:
-                _grp_dir = _direction_key(route)
+                _grp_dir = _direction_key(route,
+                    group_items[0].get("STATE", "") if group_items else "")
                 _reserve_excl = {p for p, dk in _reserved_lorry.items()
                                  if dk != _grp_dir}
                 if _reserve_excl:
@@ -5967,7 +6014,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if (_it.get("LORRY") in _lorry_cap_map
                     and _classify_dest_group(_it.get("ROUTE", ""),
                                              _it.get("STATE", "")) not in _DEST_URBAN_GROUPS):
-                _out_routes.setdefault(_direction_key(_it.get("ROUTE", "")), []).append(_it)
+                _out_routes.setdefault(_direction_key(_it.get("ROUTE", ""), _it.get("STATE", "")), []).append(_it)
         for _dir, _rits in _out_routes.items():
             _lset = {x["LORRY"] for x in _rits}
             if len(_lset) < 2:
@@ -6002,7 +6049,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # must be in the SAME direction and form one geo cluster with it.
                 _other_items = [y for y in items
                                 if y.get("LORRY") == _cand and id(y) not in _rits_ids]
-                if any(_direction_key(y.get("ROUTE", "")) != _dir for y in _other_items):
+                if any(_direction_key(y.get("ROUTE", ""), y.get("STATE", "")) != _dir for y in _other_items):
                     return False
                 _other = [_pt_of(y) for y in _other_items if _pt_of(y)]
                 _add = [_pt_of(x) for x in _rits if _pt_of(x)]
@@ -6061,7 +6108,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return False
                 # empty lorry, or one already holding ONLY this corridor — never
                 # mix a different direction (urban, or another outstation corridor).
-                _cand_dirs = {_direction_key(y.get("ROUTE", "")) for y in items
+                _cand_dirs = {_direction_key(y.get("ROUTE", ""), y.get("STATE", "")) for y in items
                               if y.get("LORRY") == _cand and id(y) not in _cids_all}
                 if _cand_dirs and _cand_dirs != {_dir}:
                     return False
@@ -6359,7 +6406,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _classify_dest_group(_it.get("ROUTE", ""),
                                     _it.get("STATE", "")) not in _DEST_URBAN_GROUPS:
                 return None
-            _dk = _direction_key(_it.get("ROUTE", ""))
+            _dk = _direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""))
             return _dk if _dk in _corridor_names else None
 
         _tc_phys: dict[str, float] = defaultdict(float)
