@@ -2622,12 +2622,16 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
 
     load = {l: 0.0 for l in caps}
     has_outstation = {l: False for l in caps}   # lorry carries a non-urban DO
+    lpts = {l: [] for l in caps}                 # urban (lat, lon, code) per lorry
     for it in items:
         l = it.get("LORRY")
         if l in caps:
             load[l] += it.get("WEIGHT", 0.0) or 0.0
             if not _is_urban_do(it):
                 has_outstation[l] = True
+            _la, _lo = it.get("GPS_LAT"), it.get("GPS_LON")
+            if _la is not None and _lo is not None:
+                lpts[l].append((_la, _lo, _pfx(it)))
 
     def _allowed(it, l):
         mt = it.get("MAX_TON")
@@ -2638,10 +2642,25 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
             return False
         return True
 
+    def _near_ok(it, l):
+        # Don't add an urban DO to a lorry that already carries a DIFFERENT
+        # urban route code more than _URBAN_MERGE_SPREAD away — no far mixing.
+        _la, _lo = it.get("GPS_LAT"), it.get("GPS_LON")
+        if _la is None or _lo is None:
+            return True
+        _c = _pfx(it)
+        for _pla, _plo, _pc in lpts[l]:
+            if _pc != _c and ((_la - _pla) ** 2 + (_lo - _plo) ** 2) ** 0.5 > _URBAN_MERGE_SPREAD:
+                return False
+        return True
+
     def _place(it, l):
         it["LORRY"] = l
         sess["assigned"][it["DO NUMBER"]] = l
         load[l] += it.get("WEIGHT", 0.0) or 0.0
+        _la, _lo = it.get("GPS_LAT"), it.get("GPS_LON")
+        if _la is not None and _lo is not None:
+            lpts[l].append((_la, _lo, _pfx(it)))
 
     # Only urban DOs are eligible for the slight-overload rescue.
     unplaced = [it for it in items
@@ -2652,8 +2671,10 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
     rescued = 0
     for it in unplaced:
         w = it.get("WEIGHT", 0.0) or 0.0
-        # Target only lorries that carry NO outstation route (urban-only or empty).
-        cands = [l for l in caps if _allowed(it, l) and not has_outstation[l]]
+        # Target only lorries that carry NO outstation route (urban-only or
+        # empty) AND are geographically near this DO (no far urban mixing).
+        cands = [l for l in caps
+                 if _allowed(it, l) and not has_outstation[l] and _near_ok(it, l)]
         # Tier 1 — fits within capacity (tightest fit first).
         fit = [l for l in cands if load[l] + w <= caps[l] + 1e-9]
         if fit:
@@ -6495,6 +6516,47 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _free -= _uw
                 if _free <= 0.05:
                     break
+
+        # ── Final geo-cleanup — no far urban mixing ───────────────────────────
+        # After every top-up/spillover, enforce the urban spread rule one last
+        # time so nothing slips a far drop onto the wrong lorry: on any lorry,
+        # two DIFFERENT urban route codes may not sit more than
+        # _URBAN_MERGE_SPREAD apart. Detach the lighter offending route code to
+        # NO_LORRY (the overload-rescue that runs next re-homes it on a NEAR
+        # lorry, or it stays unassigned rather than ride a far-away truck).
+        # A single route code spanning several towns is never split (only
+        # DIFFERENT codes are compared).
+        def _cleanup_far_urban():
+            for _l in list(_lorry_cap_map):
+                for _guard in range(20):                 # bounded refinement
+                    _lit = [x for x in items if x.get("LORRY") == _l]
+                    _upts = [(x, _pt_of(x)) for x in _lit if _pt_of(x)]
+                    _upts = [(x, p) for x, p in _upts
+                             if p[3] in _URBAN_COMPATIBLE_STATES]
+                    _worst, _pair = 0.0, None
+                    for _a in range(len(_upts)):
+                        for _b in range(_a + 1, len(_upts)):
+                            _pa, _pb = _upts[_a][1], _upts[_b][1]
+                            if _pa[2] != _pb[2]:
+                                _dd = _geo_deg(_pa[:2], _pb[:2])
+                                if _dd > _worst:
+                                    _worst, _pair = _dd, (_pa[2], _pb[2])
+                    if _pair is None or _worst <= _URBAN_MERGE_SPREAD:
+                        break
+                    _ra, _rb = _pair
+                    _wa = sum(x["WEIGHT"] for x in _lit if _route_code_of(x) == _ra)
+                    _wb = sum(x["WEIGHT"] for x in _lit if _route_code_of(x) == _rb)
+                    _drop = _ra if _wa <= _wb else _rb
+                    for x in _lit:
+                        if _route_code_of(x) == _drop:
+                            x["LORRY"] = "NO_LORRY"
+                            sess["assigned"][x["DO NUMBER"]] = "NO_LORRY"
+                            _unassigned_reasons[x["DO NUMBER"]] = "GEO_FAR_URBAN"
+        try:
+            _cleanup_far_urban()
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[GEO-CLEANUP] skipped: %s", _e)
 
         # ── RULES-COMPLIANCE GATE (ASSIGNMENT_RULES.md / DO_BOT_SKILL.md §A) ───
         # Final deterministic audit: every assigned DO must obey the HARD rules.
