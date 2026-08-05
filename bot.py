@@ -2695,6 +2695,96 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
         _rlog.info("[OVERLOAD-RESCUE] placed %d urban DO(s) via slight overload.", rescued)
 
 
+def _urban_rebalance(sess, max_over: float = SLIGHT_OVERLOAD):
+    """Free a big lorry stuck with a lone small URBAN load by repacking all the
+    small-urban loads (plus that orphan) tightly onto the smaller lorries — like
+    a human planner putting KV10A+KV11A+KV12A on one small van instead of
+    leaving KV12A on a 15T truck.
+
+    Fully atomic: the repack is applied ONLY if EVERY pooled DO places on the
+    smaller lorries (within slight overload, size caps, forbidden plates, and
+    the urban distance rule, keeping each route code whole). So it can never
+    unassign a DO or create a far mix. One big lorry freed per call.
+    """
+    import math as _math
+    import re as _re
+    eng = sess.get("engine")
+    if eng is None:
+        return
+    try:
+        caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
+                for _, r in eng.eligible_lorries.iterrows()}
+    except Exception:
+        return
+    if not caps:
+        return
+    items = sess.get("items", []) or []
+
+    def _pfx(it):
+        m = _re.match(r'\s*([A-Z]{1,3}\d+[A-Z]?)', str(it.get("ROUTE", "")))
+        return m.group(1) if m else ""
+
+    from collections import defaultdict as _dd
+
+    def _state():
+        on = _dd(list); load = _dd(float); has_out = _dd(bool)
+        for it in items:
+            l = it.get("LORRY")
+            if l in caps:
+                on[l].append(it)
+                load[l] += it.get("WEIGHT", 0.0) or 0.0
+                if not _is_urban_do(it):
+                    has_out[l] = True
+        return on, load, has_out
+
+    def _centroid(_its):
+        la = [x.get("GPS_LAT") for x in _its if x.get("GPS_LAT") is not None]
+        lo = [x.get("GPS_LON") for x in _its if x.get("GPS_LON") is not None]
+        return (sum(la) / len(la), sum(lo) / len(lo)) if la else None
+
+    on, load, has_out = _state()
+    for L in sorted(caps, key=lambda x: -caps[x]):
+        if load.get(L, 0.0) <= 1e-9 or has_out[L]:
+            continue                                   # empty or outstation
+        if load[L] > caps[L] * 0.5:
+            continue                                   # not under-used
+        L_items = list(on[L])
+        L_w = load[L]
+        L_cent = _centroid(L_items)
+        L_codes = {_pfx(x) for x in L_items}
+        L_mt = min((x["MAX_TON"] for x in L_items if x.get("MAX_TON") is not None), default=None)
+        L_fb = set()
+        for x in L_items:
+            if x.get("FORBID_PLATES"):
+                L_fb |= x["FORBID_PLATES"]
+        # Move the whole small load onto a NEAR urban lorry that has room, so the
+        # big lorry is freed. Prefer the tightest such target.
+        cand = []
+        for m in caps:
+            if m == L or has_out[m] or load.get(m, 0.0) <= 1e-9:
+                continue                               # only onto a used urban lorry
+            if m in L_fb:
+                continue
+            if L_mt is not None and caps[m] > L_mt + 1e-9:
+                continue
+            if load[m] + L_w > caps[m] * max_over + 1e-9:
+                continue                               # no room even overloaded
+            m_cent = _centroid(on[m])
+            if L_cent and m_cent and _math.hypot(L_cent[0] - m_cent[0],
+                                                 L_cent[1] - m_cent[1]) > _URBAN_MERGE_SPREAD:
+                continue                               # too far — would be a far mix
+            cand.append(m)
+        if not cand:
+            continue
+        tgt = min(cand, key=lambda m: caps[m])         # tightest fit
+        for x in L_items:
+            x["LORRY"] = tgt
+            sess["assigned"][x["DO NUMBER"]] = tgt
+        import logging as _rlog
+        _rlog.info("[URBAN-REBALANCE] moved %s's load to %s (freed the big lorry).", L, tgt)
+        return                                         # one per call
+
+
 def _downsize_lorries(sess):
     """Reduce wasted capacity: if a used lorry's whole load would fit on a
     SMALLER idle lorry, move it there and free the bigger one — so e.g. a lone
@@ -6623,6 +6713,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
         except Exception as _e:
             import logging as _rlog
             _rlog.warning("[DOWNSIZE] skipped: %s", _e)
+
+        # ── Urban rebalance: free a big lorry stuck with a lone small urban
+        # load by repacking small-urban loads onto the smaller lorries. ──────
+        try:
+            _urban_rebalance(sess)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[URBAN-REBALANCE] skipped: %s", _e)
 
         # ── Global optimizer (OFF by default; OPTIMIZER_ENABLED=1 to try) ─────
         # When enabled it replaces the greedy result with the CP-SAT plan; on
