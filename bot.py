@@ -6624,6 +6624,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
             import logging as _rlog
             _rlog.warning("[DOWNSIZE] skipped: %s", _e)
 
+        # ── Global optimizer (OFF by default; OPTIMIZER_ENABLED=1 to try) ─────
+        # When enabled it replaces the greedy result with the CP-SAT plan; on
+        # any problem it returns False and the greedy result above stands.
+        try:
+            import optimizer_bridge as _optb
+            if _optb.optimizer_enabled():
+                _optb.run_optimizer(sess, _is_urban_do, _is_kuantan)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[OPTIMIZER] skipped, keeping greedy result: %s", _e)
+
         # ── (legacy for-loop removed — replaced by _assign_one above) ────────
         # The block below was the old heaviest-first loop.  Keep a dummy
         # reference so diff is minimal.

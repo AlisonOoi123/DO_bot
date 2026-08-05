@@ -64,3 +64,31 @@ integration. Engine still untouched.
 1. Full 227-day run at 0.45/1.20 for the final acceptance table (background).
 2. The "send tomorrow" report (under-filled lorries + unassigned DOs).
 3. Wire behind `OPTIMIZER_ENABLED` with fallback; shadow -> canary (ABI) -> default.
+
+## Integration built (behind OPTIMIZER_ENABLED, default OFF)
+- `optimizer_bridge.py`: builds clusters from the engine's parsed items
+  (grouped by route-code + size-cap tier, chunked to cap/15-stops), runs the
+  CP-SAT model warm-started from the greedy result, and overwrites LORRY on
+  success. On any failure → keeps the greedy result (fallback).
+- Hooked at the end of `_handle_excel_upload`, gated by the flag.
+- **Flag OFF = byte-identical to current greedy** (verified: same unassigned /
+  lorries / util). Production is untouched.
+
+## Full 202-day shadow (ABI) at 0.45/1.20
+- avg lorries: **manual 11.0 vs optimizer 9.4** (optimizer is leaner). ✅
+- BUT fully-delivered only **135/202** days at the 3-5 s solve budget, and
+  **2 days show a rule violation** — both to fix before canary.
+
+## Open items (must close before canary)
+1. **Delivery**: the solver under-delivers within the time budget. Options:
+   longer budget (slower upload), a faster model (fewer vars via pre-merged
+   clusters), or a stronger warm-start (the greedy hint may be getting rejected
+   as infeasible under stricter constraints — needs checking). Target:
+   optimizer delivers >= greedy on every day.
+2. **The 2 violation days**: identify the constraint slip (likely a distance or
+   cluster-centroid edge case in either the model or the checker) and fix.
+3. Then: canary (ABI) behind the flag with fallback.
+
+## Status
+Integration is safe and wired; the model needs delivery + violation fixes
+before it's better than the greedy. Engine behavior unchanged with flag OFF.

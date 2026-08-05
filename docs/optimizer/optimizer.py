@@ -47,8 +47,12 @@ def _far(a: Cluster, b: Cluster) -> bool:
 
 
 def optimize(clusters: list[Cluster], fleet: list[Lorry],
-             time_limit_s: float = 5.0) -> dict:
-    """Return {'assign': {cluster_id: plate|None}, 'status': str}."""
+             time_limit_s: float = 5.0, hint: dict | None = None) -> dict:
+    """Return {'assign': {cluster_id: plate|None}, 'status': str}.
+
+    `hint` (optional) is {cluster_id: plate} — e.g. the greedy result — used to
+    warm-start the solver so it converges fast within the time limit.
+    """
     from ortools.sat.python import cp_model
     mdl = cp_model.CpModel()
     C, L = clusters, fleet
@@ -122,12 +126,19 @@ def optimize(clusters: list[Cluster], fleet: list[Lorry],
                     if (i, l.plate) in x and (j, l.plate) in x:
                         mdl.Add(x[(i, l.plate)] + x[(j, l.plate)] <= 1)
 
-    # Objective: (1) deliver weight, (2) fewer lorries, (3) tight fill.
-    W = int(sum(c.weight for c in C) * 1000) + 1
+    # Objective: deliver weight FIRST (dominant), fewer lorries as tiebreak.
     mdl.Maximize(
-        sum(int(round(C[ci].weight * 1000)) * assigned[ci] for ci in range(len(C))) * 1000
-        - sum(used[l.plate] for l in L) * W
+        sum(int(round(C[ci].weight * 1000)) * assigned[ci] for ci in range(len(C))) * 10000
+        - sum(used[l.plate] for l in L)
     )
+
+    # Warm-start from the greedy result so we converge fast within the budget.
+    if hint:
+        id2i = {c.id: i for i, c in enumerate(C)}
+        for cid, plate in hint.items():
+            ci = id2i.get(cid)
+            if ci is not None and plate and (ci, plate) in x:
+                mdl.AddHint(x[(ci, plate)], 1)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_s
