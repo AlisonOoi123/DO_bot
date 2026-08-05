@@ -790,6 +790,13 @@ _STATE_TO_CORRIDOR = {
 }
 
 
+def _is_kuantan(route: str) -> bool:
+    """Kuantan (PH09) is a far east-coast run that must ALWAYS be independent —
+    it never shares a lorry with any non-Kuantan route."""
+    r = str(route).strip().upper()
+    return r.startswith("PH09") or "KUANTAN" in r
+
+
 def _state_corridor(state: str, route: str = "") -> str:
     # KV (Klang Valley) routes are handled by city/urban bucketing — never let a
     # border state (e.g. KV01A touching Perak at Tanjung Malim) reclassify them
@@ -816,6 +823,10 @@ def _same_corridor_group(route1: str, route2: str,
     (so a mislabeled route rides the truck for its real geography). Otherwise
     fall back to route-code corridor groups.
     """
+    # Kuantan only ever groups with Kuantan — never with any other route.
+    k1, k2 = _is_kuantan(route1), _is_kuantan(route2)
+    if k1 or k2:
+        return k1 and k2
     c1 = _state_corridor(state1, route1)
     c2 = _state_corridor(state2, route2)
     if c1 and c2:
@@ -837,6 +848,8 @@ def _direction_key(route: str, state: str = "") -> str:
 
     If the DO's actual state maps to a known outstation corridor, that wins over
     the route-code prefix — so NS04-in-Pahang is directed with the Pahang run."""
+    if _is_kuantan(route):
+        return "KUANTAN"                 # its own reserved direction, always
     sc = _state_corridor(state, route)
     if sc:
         return sc
