@@ -790,11 +790,34 @@ _STATE_TO_CORRIDOR = {
 }
 
 
-def _is_kuantan(route: str) -> bool:
-    """Kuantan (PH09) is a far east-coast run that must ALWAYS be independent —
-    it never shares a lorry with any non-Kuantan route."""
+def _norm_cust(c: str) -> str:
+    return re.sub(r'[^A-Z0-9 ]', '', str(c).upper()).strip()
+
+# Exception to Kuantan-independence: these specific customers' Kuantan (PH09)
+# DOs may ride with the TR02 / Kemaman run (Kuantan & Kemaman are adjacent on
+# the east coast). Treated as the Kemaman corridor, not independent Kuantan.
+_KUANTAN_TR02_MIX_CUSTOMERS = {
+    _norm_cust("GOLDEN HP AGENCY SDN BHD"),
+    _norm_cust("HASIL LAUTAN JUN KEE SDN. BHD."),
+}
+
+
+def _kemaman_ph09(route: str, customer: str) -> bool:
+    """True if this is a PH09/Kuantan DO for one of the special customers that
+    may mix with TR02/Kemaman."""
     r = str(route).strip().upper()
-    return r.startswith("PH09") or "KUANTAN" in r
+    return (r.startswith("PH09") or "KUANTAN" in r) \
+        and _norm_cust(customer) in _KUANTAN_TR02_MIX_CUSTOMERS
+
+
+def _is_kuantan(route: str, customer: str = "") -> bool:
+    """Kuantan (PH09) is a far east-coast run that must ALWAYS be independent —
+    it never shares a lorry with any non-Kuantan route. EXCEPTION: the two
+    special customers ride with TR02/Kemaman, so they are NOT flagged Kuantan."""
+    r = str(route).strip().upper()
+    if not (r.startswith("PH09") or "KUANTAN" in r):
+        return False
+    return not _kemaman_ph09(route, customer)
 
 
 def _state_corridor(state: str, route: str = "") -> str:
@@ -816,17 +839,24 @@ def _prefix_corridor(route: str) -> str:
 
 
 def _same_corridor_group(route1: str, route2: str,
-                         state1: str = "", state2: str = "") -> bool:
+                         state1: str = "", state2: str = "",
+                         cust1: str = "", cust2: str = "") -> bool:
     """Return True when both routes belong to the same delivery corridor group.
 
     When BOTH actual states are known outstation states, group purely by state
     (so a mislabeled route rides the truck for its real geography). Otherwise
     fall back to route-code corridor groups.
     """
-    # Kuantan only ever groups with Kuantan — never with any other route.
-    k1, k2 = _is_kuantan(route1), _is_kuantan(route2)
+    # Kuantan only ever groups with Kuantan — never with any other route
+    # (except the two special customers, handled as the KEMAMAN corridor below).
+    k1, k2 = _is_kuantan(route1, cust1), _is_kuantan(route2, cust2)
     if k1 or k2:
         return k1 and k2
+    # Special-customer PH09 rides with TR02 (both map to the KEMAMAN direction).
+    d1 = _direction_key(route1, state1, cust1)
+    d2 = _direction_key(route2, state2, cust2)
+    if d1 == "KEMAMAN" and d2 == "KEMAMAN":
+        return True
     c1 = _state_corridor(state1, route1)
     c2 = _state_corridor(state2, route2)
     if c1 and c2:
@@ -839,7 +869,7 @@ def _same_corridor_group(route1: str, route2: str,
             return True
     return False
 
-def _direction_key(route: str, state: str = "") -> str:
+def _direction_key(route: str, state: str = "", customer: str = "") -> str:
     """Coarse outstation 'direction' for a route: the corridor-group name if the
     route belongs to one (PH_INT, KV_NORTH, NS, …), else the route code. Used to
     reserve one lorry per distinct outstation direction so the biggest direction
@@ -848,7 +878,12 @@ def _direction_key(route: str, state: str = "") -> str:
 
     If the DO's actual state maps to a known outstation corridor, that wins over
     the route-code prefix — so NS04-in-Pahang is directed with the Pahang run."""
-    if _is_kuantan(route):
+    r = str(route).strip().upper()
+    # Special-customer PH09 and any TR02 share the KEMAMAN direction (they may
+    # ride one east-coast lorry together).
+    if r.startswith("TR02") or _kemaman_ph09(route, customer):
+        return "KEMAMAN"
+    if _is_kuantan(route, customer):
         return "KUANTAN"                 # its own reserved direction, always
     sc = _state_corridor(state, route)
     if sc:
@@ -3353,9 +3388,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if lorry and lorry not in (None,) and re.match(r'^[A-Z]{1,3}\d', lorry.strip().upper()):
                 continue
             _rt_key = it["ROUTE"].strip().upper()
+            # Special-customer PH09 rides the Kemaman run — bucket it apart from
+            # ordinary Kuantan so it can group with TR02 instead.
+            if _kemaman_ph09(it.get("ROUTE", ""), it.get("CUSTOMER NAME", "")):
+                _rt_key = _rt_key + "@KMN"
             _st_key = it.get("STATE", "")
             _ct_key = it.get("CITY", "").strip().upper()
-            dest_grp = _classify_dest_group(_rt_key, _st_key)
+            dest_grp = _classify_dest_group(it["ROUTE"].strip().upper(), _st_key)
 
             # Geographic sub-bucketing — applies to ALL routes.
             # Primary key: state (identifies destination region).
@@ -3403,6 +3442,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for _bk in list(route_buckets.keys()):
             _bare_rt = _bk.split("||")[0]
             _pfx = _extract_route_prefix(_bare_rt)
+            # Keep special-customer PH09 (@KMN) in its own prefix group so it is
+            # never re-merged with ordinary Kuantan.
+            if "@KMN" in _bare_rt:
+                _pfx = (_pfx or "") + "@KMN"
             if _pfx:
                 _pfx_to_keys.setdefault(_pfx, []).append(_bk)
         for _pfx, _bkeys in _pfx_to_keys.items():
@@ -3596,8 +3639,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 <= _MAX_CITY_MERGE_KM_OUTSTATION
                             )
 
-                _corridor_merge = _same_corridor_group(base_route, cand_route,
-                                                       _st_base, _st_cand)
+                _corridor_merge = _same_corridor_group(
+                    base_route, cand_route, _st_base, _st_cand,
+                    base_bucket[0].get("CUSTOMER NAME", ""),
+                    cand_bucket[0].get("CUSTOMER NAME", ""))
                 _urban_prox_merge = _geo_close
 
                 # ── Priority-ordered merge rules (per user request) ───────────
@@ -3970,7 +4015,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _dg = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
             if _dg in _DEST_URBAN_GROUPS:
                 continue                            # urban → no reservation
-            _dir_weight[_direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""))] += _it["WEIGHT"]
+            _dir_weight[_direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""), _it.get("CUSTOMER NAME", ""))] += _it["WEIGHT"]
         if len(_dir_weight) > 1:                     # only when directions compete
             _res_excl = sess["unavailable"] | get_assigned_today()
             _res_avail = sorted(
@@ -4312,7 +4357,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _reserve_excl: set = set()
             if _reserved_lorry:
                 _grp_dir = _direction_key(route,
-                    group_items[0].get("STATE", "") if group_items else "")
+                    group_items[0].get("STATE", "") if group_items else "",
+                    group_items[0].get("CUSTOMER NAME", "") if group_items else "")
                 _reserve_excl = {p for p, dk in _reserved_lorry.items()
                                  if dk != _grp_dir}
                 if _reserve_excl:
@@ -6170,7 +6216,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if (_it.get("LORRY") in _lorry_cap_map
                     and _classify_dest_group(_it.get("ROUTE", ""),
                                              _it.get("STATE", "")) not in _DEST_URBAN_GROUPS):
-                _out_routes.setdefault(_direction_key(_it.get("ROUTE", ""), _it.get("STATE", "")), []).append(_it)
+                _out_routes.setdefault(_direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""), _it.get("CUSTOMER NAME", "")), []).append(_it)
         for _dir, _rits in _out_routes.items():
             _lset = {x["LORRY"] for x in _rits}
             if len(_lset) < 2:
@@ -6205,7 +6251,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # must be in the SAME direction and form one geo cluster with it.
                 _other_items = [y for y in items
                                 if y.get("LORRY") == _cand and id(y) not in _rits_ids]
-                if any(_direction_key(y.get("ROUTE", ""), y.get("STATE", "")) != _dir for y in _other_items):
+                if any(_direction_key(y.get("ROUTE", ""), y.get("STATE", ""), y.get("CUSTOMER NAME", "")) != _dir for y in _other_items):
                     return False
                 _other = [_pt_of(y) for y in _other_items if _pt_of(y)]
                 _add = [_pt_of(x) for x in _rits if _pt_of(x)]
@@ -6264,7 +6310,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return False
                 # empty lorry, or one already holding ONLY this corridor — never
                 # mix a different direction (urban, or another outstation corridor).
-                _cand_dirs = {_direction_key(y.get("ROUTE", ""), y.get("STATE", "")) for y in items
+                _cand_dirs = {_direction_key(y.get("ROUTE", ""), y.get("STATE", ""), y.get("CUSTOMER NAME", "")) for y in items
                               if y.get("LORRY") == _cand and id(y) not in _cids_all}
                 if _cand_dirs and _cand_dirs != {_dir}:
                     return False
@@ -6562,7 +6608,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _classify_dest_group(_it.get("ROUTE", ""),
                                     _it.get("STATE", "")) not in _DEST_URBAN_GROUPS:
                 return None
-            _dk = _direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""))
+            _dk = _direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""), _it.get("CUSTOMER NAME", ""))
             return _dk if _dk in _corridor_names else None
 
         _tc_phys: dict[str, float] = defaultdict(float)
