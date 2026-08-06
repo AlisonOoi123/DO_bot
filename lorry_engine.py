@@ -638,7 +638,7 @@ class LorryEngine:
         self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
 
     def _load_fit_in_lorry(self, path):
-        """Load per-route default/eligible lorry lists from the optional
+        """Load per-route default lorry lists from the optional
         "FIT IN LORRY" sheet in LORRY DAILY PLANNING.xlsx.
 
         Sheet layout (no header row):
@@ -646,13 +646,16 @@ class LorryEngine:
                         that owner's sessions.
           Row 1+, Col 0: route description starting with the route code
                         (e.g. "NS05-->Seremban", "KV01A - T.MALIM - ...").
-          Row 1+, Col 1+: ordered list of plates this route may use (a row
-                        may list any number of plates; blanks are skipped).
+          Row 1+, Col 1+: ordered list of default plates for this route (a
+                        row may list any number of plates; blanks skipped).
 
-        A route listed here is HARD-restricted to only these plates — see
-        ASSIGNMENT_RULES.md Section 9 (FIT IN LORRY default-lorry list).
-        Missing/malformed sheet, or a route not listed, means no
-        restriction (falls through to normal eligibility rules).
+        This is a PREFERENCE list, not a restriction — see
+        ASSIGNMENT_RULES.md RULE 9A. A route listed here has its plates
+        tried first (tightest-fitting available one wins); any other
+        lorry owned by this route's user and marked Available in the
+        master (MUATAN) sheet remains eligible as a fallback. Missing/
+        malformed sheet, or a route not listed, means no preference data
+        (falls straight through to normal weight-based selection).
         """
         self.fit_in_lorry: dict = {}
         self.fit_in_lorry_owner: str = ""
@@ -676,11 +679,13 @@ class LorryEngine:
             if plates:
                 self.fit_in_lorry[route_pfx] = plates
 
-    def fit_in_lorry_allowed(self, route: str):
-        """Return the hard-restricted plate set for `route` from the FIT IN
-        LORRY sheet, or None if no restriction applies (route not listed,
-        sheet absent, or this engine's owner differs from the sheet's
-        designated owner). Longest route-code prefix wins."""
+    def fit_in_lorry_preferred(self, route: str):
+        """Return the ordered list of default/preferred plates for `route`
+        from the FIT IN LORRY sheet, or None if no preference data applies
+        (route not listed, sheet absent, or this engine's owner differs
+        from the sheet's designated owner). Longest route-code prefix
+        wins. This is a HINT for selection order only — it does not
+        exclude any otherwise-eligible (owner/SPARE + Available) lorry."""
         if not self.fit_in_lorry or self.owner_user != self.fit_in_lorry_owner:
             return None
         r = str(route).strip().upper()
@@ -688,15 +693,7 @@ class LorryEngine:
         for pfx, plates in self.fit_in_lorry.items():
             if r.startswith(pfx) and len(pfx) > len(best_pfx):
                 best_pfx, best_plates = pfx, plates
-        return set(best_plates) if best_plates else None
-
-    def _apply_fit_in_lorry(self, df: "pd.DataFrame", route: str) -> "pd.DataFrame":
-        """Narrow an eligible-lorry DataFrame to the FIT IN LORRY allowed
-        plates for `route`, if a restriction applies; otherwise unchanged."""
-        allowed = self.fit_in_lorry_allowed(route)
-        if allowed is None:
-            return df
-        return df[df["LORRY"].isin(allowed)]
+        return list(best_plates) if best_plates else None
 
     @staticmethod
     def _parse_longitud_centroids(df: pd.DataFrame) -> dict:
@@ -910,7 +907,6 @@ class LorryEngine:
             (self.eligible_lorries["TON"] * _SAME_ROUTE_OVERLOAD >= total_ton) &
             (~self.eligible_lorries["LORRY"].isin(unavailable))
         ].copy()
-        eligible = self._apply_fit_in_lorry(eligible, route)
         if eligible.empty:
             return []
 
@@ -1047,7 +1043,6 @@ class LorryEngine:
             (self.eligible_lorries["TON"] >= total_ton) &
             (~self.eligible_lorries["LORRY"].isin(unavailable))
         ].copy()
-        eligible = self._apply_fit_in_lorry(eligible, route)
 
         if eligible.empty:
             best_surplus = float("inf")
@@ -1066,7 +1061,6 @@ class LorryEngine:
             (self.eligible_lorries["TON"] < best_cap) &
             (~self.eligible_lorries["LORRY"].isin(unavailable))
         ].copy()
-        small_pool = self._apply_fit_in_lorry(small_pool, route)
         if small_pool.empty:
             return None
 
@@ -1137,7 +1131,6 @@ class LorryEngine:
         eligible = self.eligible_lorries[
             ~self.eligible_lorries["LORRY"].isin(unavailable)
         ].copy()
-        eligible = self._apply_fit_in_lorry(eligible, route)
         if eligible.empty:
             return []
 
