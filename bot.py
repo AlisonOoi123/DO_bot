@@ -4024,10 +4024,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 }
 
             # ── Within-session lorry sharing ──────────────────────────────────
+            _fil_allowed_grp = engine.fit_in_lorry_allowed(route)
             _share_pool = [
                 (_eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)), p)
                 for p in _session_loads
                 if p in _lorry_cap_map
+                and (_fil_allowed_grp is None or p in _fil_allowed_grp)
                 and _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)) >= total_w
                 and p not in excluded
                 and float(_lorry_cap_map.get(p, 0)) >= _dest_min_t
@@ -4351,6 +4353,64 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _session_routes[_pl] = route
                     _record_lorry_state(_pl, _it.get("STATE", ""))
 
+        # ── FIT IN LORRY contention priority (ABI only) ─────────────────────────
+        # Two independent groups can both be restricted (via the FIT IN LORRY
+        # sheet) to plate lists that overlap without ever actually competing —
+        # engine.suggest() picks each one's own tightest-fitting lorry from its
+        # list independently. Real contention only exists when BOTH groups'
+        # natural best-fit choice is the SAME plate. Detect that by asking
+        # engine.suggest() what each restricted group would get if it ran
+        # alone (dry run, no side effects), then — only for groups that
+        # actually collide on one plate — move whichever group would push
+        # that plate closer to full utilisation FIRST in the loop below, so
+        # it claims the plate via the normal call; the loser simply falls
+        # through to its own next listed plate. This only reorders
+        # sorted_groups — it does not change bucketing (Section 2) or the
+        # corridor/mix-route merge already finalised above (Section 8), and it
+        # does not touch any later pass (consolidation, swap, fill-to-80%).
+        if engine.fit_in_lorry and sess.get("user_id", "").strip().upper() == engine.fit_in_lorry_owner:
+            def _grp_dominant_route(g):
+                _rc: dict[str, int] = {}
+                for _it in g:
+                    _rc[_it.get("ROUTE", "")] = _rc.get(_it.get("ROUTE", ""), 0) + 1
+                return max(_rc, key=lambda r: _rc[r]) if _rc else ""
+
+            _grp_routes  = [_grp_dominant_route(g) for g in sorted_groups]
+            _grp_weights = [sum(it["WEIGHT"] for it in g) for g in sorted_groups]
+
+            _dry_excl = sess["unavailable"] | get_assigned_today()
+            _grp_bestfit = [None] * len(sorted_groups)
+            for _gi, _r in enumerate(_grp_routes):
+                if engine.fit_in_lorry_allowed(_r) is None:
+                    continue   # unrestricted group — not part of this feature
+                _sug = engine.suggest(route=_r, total_ton=_grp_weights[_gi],
+                                       unavailable=_dry_excl, top_n=1)
+                if _sug:
+                    _grp_bestfit[_gi] = _sug[0]["LORRY"]
+
+            _plate_claimants: dict[str, list[int]] = defaultdict(list)
+            for _gi, _p in enumerate(_grp_bestfit):
+                if _p:
+                    _plate_claimants[_p].append(_gi)
+
+            _fil_boost = [0.0] * len(sorted_groups)
+            for _plate, _gis in _plate_claimants.items():
+                if len(_gis) < 2:
+                    continue   # only one group's best-fit choice — no collision
+                _cap = _lorry_cap_map.get(_plate)
+                if not _cap:
+                    continue
+                _scores = {_gi: min(_grp_weights[_gi], _cap) / _cap for _gi in _gis}
+                # Ties keep the earlier (already date-prioritised) group in front.
+                _winner = max(_gis, key=lambda gi: (_scores[gi], -gi))
+                _fil_boost[_winner] = max(_fil_boost[_winner], _scores[_winner])
+
+            if any(_fil_boost):
+                # Stable sort: groups with equal (usually zero) boost keep their
+                # existing Rule-1.1 date order relative to one another.
+                _fil_order = sorted(range(len(sorted_groups)), key=lambda i: -_fil_boost[i])
+                sorted_groups = [sorted_groups[i] for i in _fil_order]
+
         for group in sorted_groups:
             _assign_group(group)
 
@@ -4576,6 +4636,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _it_is_urban = it_dest in _DEST_URBAN_GROUPS
             _it_strict   = _strict_route_excl(it_route)
             _it_dest_min = _DEST_MIN_TON.get(it_dest, 0.0)
+            _it_fil_allowed = engine.fit_in_lorry_allowed(it_route)
             _cands = []
             for _op in _lorry_cap_map:
                 if _op in sess.get("unavailable", set()):
@@ -4584,6 +4645,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _ol = float(_session_loads.get(_op, 0))
                 _or = _oc - _ol
                 if _op in _it_strict:
+                    continue
+                if _it_fil_allowed is not None and _op not in _it_fil_allowed:
                     continue
                 # Outstation minimum tonnage: lorries ≤5T can never serve an
                 # outstation route (LARGE_LONG / MEDIUM_LONG), even as overflow.
@@ -6273,6 +6336,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # Rule — REMARKS forbids this specific plate ("3875 tak boleh masuk")
             elif _it.get("FORBID_PLATES") and _l in _it["FORBID_PLATES"]:
                 _reason = "PLATE_FORBIDDEN"
+            else:
+                # Rule A6 — FIT IN LORRY default-lorry list (ASSIGNMENT_RULES.md §9A).
+                # Routes listed in the "FIT IN LORRY" sheet may ONLY use one of
+                # their listed plates. Final backstop in case an earlier pass
+                # (overflow / within-session sharing) picked outside the list.
+                _fil_allowed_a6 = engine.fit_in_lorry_allowed(_rt)
+                if _fil_allowed_a6 is not None and _l not in _fil_allowed_a6:
+                    _reason = "NOT_IN_FIT_IN_LORRY_LIST"
             if _reason:
                 _audit_viol.append(f"{_it.get('DO NUMBER')}:{_l}({_lt}T):{_reason}")
                 _it["LORRY"] = "NO_LORRY"
@@ -6383,6 +6454,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "NO_ELIGIBLE_LORRY":        "no eligible lorry found",
                 "CAPACITY_FULL":            "all lorries at capacity",
                 "LOAD_BELOW_MIN_UTIL":      "load too small (min util rule)",
+                "NOT_IN_FIT_IN_LORRY_LIST": "no default lorry (FIT IN LORRY) free",
             }
             _reason_parts = [
                 f"{v}× {_reason_labels.get(k, k)}"

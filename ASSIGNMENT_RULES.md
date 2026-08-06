@@ -202,6 +202,37 @@ The full decision procedure lives in **DO_BOT_SKILL.md** (authoritative).
 **RULE 9.2 — Tiny-Item Routes (Small Lorry Mandatory)**
 Routes with average DO weight ≤ 150 kg (e.g., KV11A ~46 kg/DO) MUST use small lorries or vans. Lorries ≥ 4.5T are excluded from tiny-item routes because large trucks cannot maneuver in narrow shophouse streets.
 
+**RULE 9A — FIT IN LORRY Default-Lorry List (ABI only, HARD restriction)**
+The optional "FIT IN LORRY" sheet in LORRY DAILY PLANNING.xlsx lists, per
+route, the ordered set of plates that route may use. Unlike RULE 9.1's
+open weight-based selection, a route listed on this sheet is HARD-restricted
+to only its listed plates — no other otherwise-eligible lorry may serve it,
+even if idle. This is the one exception to "no route→lorry hardcode": it is
+data-driven from the planners' own sheet, not a code constant.
+  - **Scope**: cell A1 of the sheet names the owning user (currently "ABI").
+    The restriction applies only to that user's routes; other users'
+    routes are unaffected and keep the RULE 9.1 open selection.
+  - **Enforcement**: applied inside `LorryEngine.suggest()` /
+    `suggest_split()` / `suggest_largest_available()` (so every automatic
+    assignment path is restricted at the source), plus a final backstop in
+    the RULES-COMPLIANCE GATE that unassigns (`NO_LORRY`,
+    `NOT_IN_FIT_IN_LORRY_LIST`) any DO that still ended up outside its
+    route's list.
+  - **Contention priority (closer-to-full-utilisation wins)**: if two
+    different routes' lists overlap and, on a given day, both would
+    naturally land on the SAME plate as their tightest-fitting choice, the
+    route whose gross weight pushes that plate CLOSER to full capacity is
+    processed first and claims it; the other route falls through to its own
+    next listed plate (or NO_LORRY if none remain). Example: NS05 totalling
+    14T and PH09 totalling 13T both eligible for VJN9910 (15.389T) — NS05
+    wins (91% vs 84% utilisation). This priority OVERRIDES RULE 1.1's
+    earliest-date-first ordering for the specific pair of groups in
+    contention; all other groups keep their normal date order.
+  - **Does not affect mixing**: routes that the corridor/geography rules
+    (Section 2, Section 8) already merge onto one shared lorry — e.g.
+    KV19A + KV20A — are combined into a single group before this rule ever
+    runs, so they are never treated as competitors under RULE 9A.
+
 ---
 
 ## SECTION 6A — SHIP_DETAIL COLUMN

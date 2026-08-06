@@ -246,6 +246,14 @@ change.
 Assignment is entirely driven by owner + outstation + geography + weight +
 SHIP_DETAIL, per the principles above.
 
+**Exception — FIT IN LORRY sheet (ABI only, data-driven, not a code
+constant):** if the optional "FIT IN LORRY" sheet in LORRY DAILY
+PLANNING.xlsx lists a route, that route IS hard-restricted to only its
+listed plates — see ASSIGNMENT_RULES.md RULE 9A. This differs from the
+removed constants above only in that the restriction lives in the
+planners' spreadsheet, not in `assignment_config.py`, and only applies to
+the owner named in the sheet's header cell.
+
 ---
 
 ## H. SENTINEL VALUES (rows that are intentionally NOT assigned)
