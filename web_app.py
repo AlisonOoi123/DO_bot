@@ -187,9 +187,15 @@ def _result_json(sess) -> dict:
         g["util"] = round(100.0 * g["load"] / cap, 1) if cap else None
 
     total_dos = sum(len(g["dos"]) for g in lorry_list)
+    used_plates = {g["lorry"] for g in lorry_list}
+    # Full fleet for the reassign picker (plate, capacity, whether already used).
+    fleet = [{"plate": p, "capacity": round(c, 3), "used": p in used_plates}
+             for p, c in sorted(caps.items())]
     return {
         "lorries": lorry_list,
         "unassigned": unassigned,
+        "unassigned_weight": round(sum(d["weight"] for d in unassigned), 3),
+        "fleet": fleet,
         "summary": {
             "lorries_used": len(lorry_list),
             "dos_assigned": total_dos,
@@ -353,23 +359,36 @@ def api_offschedule():
     }, sid)
 
 
-@app.route("/api/unassigned-lorries", methods=["POST"])
-def api_unassigned_lorries():
-    """Reply to 'which lorries are available for the unassigned DOs?' —
-    bin-packs the still-unassigned DOs onto the named plate(s) directly
-    from session state (no re-upload), same as the WhatsApp flow."""
+@app.route("/api/reassign", methods=["POST"])
+def api_reassign():
+    """Assign the still-unassigned DOs onto the lorries the user says are now
+    available — no re-upload. Returns the refreshed result."""
     sid = _sid()
     sess = bot.get_session(sid)
-    plates = (request.json or {}).get("plates", "")
-    if not sess.get("items"):
-        return _with_cookie({"error": "No active assignment in this session."}, sid, 400)
-    msgs = bot._handle_unassigned_lorry_reply(sid, sess, str(plates))
-    result = _result_json(sess)
-    return _with_cookie({
-        "messages": msgs,
-        "state": sess.get("state"),
-        "result": result,
-    }, sid)
+    plates = (request.json or {}).get("lorries", []) or []
+    if isinstance(plates, str):
+        plates = [p for p in re.split(r"[,\s]+", plates) if p]
+    outcome = bot.reassign_unassigned(sess, plates)
+    result = _result_json(sess) if sess.get("items") else None
+    return _with_cookie({"outcome": outcome, "result": result}, sid)
+
+
+@app.route("/api/assign-specific", methods=["POST"])
+def api_assign_specific():
+    """Manually assign a hand-picked list of unassigned DOs onto ONE named
+    lorry — the counterpart to /api/reassign (which auto-bin-packs across
+    multiple ticked lorries). All-or-nothing: rejects an unrecognised plate,
+    a DO that's no longer unassigned, or a selection over capacity."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    body = request.json or {}
+    plate = str(body.get("plate", ""))
+    dos = body.get("dos", []) or []
+    outcome = bot.assign_specific_dos(sess, plate, dos)
+    if not outcome.get("ok"):
+        return _with_cookie(outcome, sid, 400)
+    outcome["result"] = _result_json(sess) if sess.get("items") else None
+    return _with_cookie(outcome, sid)
 
 
 @app.route("/api/download")
@@ -718,20 +737,42 @@ _PAGE = r"""<!doctype html>
       <a class="dl" href="/api/download"><button class="btn">⬇️ Download filled Excel</button></a>
     </div>
     <div id="result-body"></div>
-    <div class="card hidden" id="unassigned-actions" style="margin:0 0 8px">
-      <div style="font-size:13px;color:var(--muted);margin-bottom:8px">
-        🚚 Reply with available lorry plate(s) to assign the unassigned DOs now
-        (e.g. <code>VJN9910 BQX9983</code>) — no need to re-upload:
-      </div>
-      <div class="row">
-        <input id="unassigned-plates" type="text" placeholder="Plate(s), space or comma separated"
-               style="flex:2 1 200px;padding:12px 14px;border-radius:10px;border:1px solid var(--line);
-                      background:var(--card2);color:var(--ink);font-size:15px">
-        <button class="btn" id="btn-assign-unassigned" style="flex:0 0 auto;width:auto;padding:12px 18px">Assign</button>
-      </div>
-      <div class="msg hidden" id="unassigned-msg"></div>
+
+    <!-- Reassign leftover DOs onto now-available lorries (no re-upload) -->
+    <div id="reassign-box" class="hidden" style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+      <p class="step-title">Leftover DOs — assign to available lorries</p>
+      <div class="msg" id="reassign-msg"></div>
+      <p style="font-size:14px;color:var(--muted);margin:4px 0 10px">
+        <b id="reassign-count">0</b> DO(s), <b id="reassign-weight">0</b> T unassigned.
+        Tick the lorries that are now free and assign them — no need to re-upload.
+      </p>
+      <div id="reassign-fleet" class="grid-users" style="justify-content:flex-start;margin-bottom:12px"></div>
+      <button class="btn" id="btn-reassign" style="width:auto">Assign leftover DOs to ticked lorries</button>
     </div>
-    <button class="btn secondary" id="btn-restart" style="margin-top:8px">Start over</button>
+
+    <!-- Manually assign hand-picked DOs onto ONE named lorry (no re-upload) -->
+    <div id="manual-assign-box" class="hidden" style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+      <p class="step-title">Or assign specific DOs to one lorry</p>
+      <div class="row">
+        <input id="manual-plate" type="text" placeholder="Lorry plate (e.g. VEA2818)"
+               style="flex:1 1 200px;padding:12px 14px;border-radius:10px;border:1px solid var(--line);
+                      background:var(--card2);color:var(--ink);font-size:15px">
+        <button class="btn secondary" id="btn-manual-lookup" style="flex:0 0 auto;width:auto;padding:12px 18px">Find DOs for this plate</button>
+      </div>
+      <div class="msg hidden" id="manual-msg"></div>
+      <div id="manual-picker" class="hidden" style="margin-top:12px">
+        <div class="scroll"><table><thead><tr><th></th><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th></tr></thead>
+          <tbody id="manual-do-rows"></tbody>
+        </table></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-top:10px;font-size:14px">
+          <span>Selected: <b id="manual-selected-total">0.000</b>T / <span id="manual-plate-cap">0</span>T
+            <span id="manual-cap-warn" class="hidden" style="color:var(--bad);font-weight:700"> — over capacity!</span></span>
+          <button class="btn" id="btn-manual-assign" style="width:auto" disabled>Assign selected to this lorry</button>
+        </div>
+      </div>
+    </div>
+
+    <button class="btn secondary" id="btn-restart" style="margin-top:14px">Start over</button>
   </div>
 
   <div class="foot">Same assignment engine as the WhatsApp bot · works on phone &amp; desktop</div>
@@ -848,7 +889,7 @@ document.getElementById('offsched-no').onclick=()=>answerOffsched(false);
 
 // ---- Step 5: render ----
 function esc(s){ return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-let lastUnassignedCount=0;
+let lastFleet=[], lastUnassignedList=[];
 function renderResult(r){
   const s=r.summary;
   $('#result-stat').innerHTML =
@@ -873,36 +914,103 @@ function renderResult(r){
     html+=`</tbody></table></div></div>`;
   }
   $('#result-body').innerHTML=html;
-  lastUnassignedCount=r.unassigned.length;
-  show('#unassigned-actions', r.unassigned.length>0);
+
+  // ---- Reassign leftover DOs onto now-available lorries ----
+  lastFleet=r.fleet||[];
+  lastUnassignedList=r.unassigned||[];
+  const box=$('#reassign-box');
+  if(r.unassigned.length && r.fleet){
+    $('#reassign-count').textContent=r.unassigned.length;
+    $('#reassign-weight').textContent=(r.unassigned_weight||0).toFixed(3);
+    let f='';
+    r.fleet.forEach(l=>{
+      f+=`<label class="userbtn" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:10px 14px">`+
+         `<input type="checkbox" class="reassign-cb" value="${esc(l.plate)}"> ${esc(l.plate)} `+
+         `<small style="color:var(--muted)">${l.capacity.toFixed(1)}T${l.used?' · in use':''}</small></label>`;
+    });
+    $('#reassign-fleet').innerHTML=f;
+    setMsg('#reassign-msg',null);
+    box.classList.remove('hidden');
+  } else {
+    box.classList.add('hidden');
+  }
+
+  // ---- Manually assign hand-picked DOs onto one named lorry ----
+  show('#manual-assign-box', r.unassigned.length>0);
+  $('#manual-picker').classList.add('hidden');
+  setMsg('#manual-msg', null);
 }
 
-async function submitUnassignedPlates(){
-  const inp=$('#unassigned-plates');
-  const val=(inp.value||'').trim();
-  if(!val) return;
-  const before=lastUnassignedCount;
-  const btn=$('#btn-assign-unassigned');
-  btn.disabled=true;
-  setMsg('#unassigned-msg','Assigning… ',false);
-  try{
-    const d=await jpost('/api/unassigned-lorries',{plates:val});
-    if(d.result){
-      const after=d.result.unassigned.length;
-      const placed=before-after;
-      inp.value='';
-      renderResult(d.result);   // this also re-shows/hides #unassigned-actions
-      if(placed>0){ setMsg('#unassigned-msg', `✅ Assigned ${placed} DO(s). ${after} still unassigned.`, false); }
-      else { setMsg('#unassigned-msg', `❌ None of the unassigned DOs fit on that plate(s).`, true); }
-      show('#unassigned-msg', true);
-      show('#unassigned-actions', true);   // keep visible to show the outcome even if now 0 unassigned
-    } else {
-      setMsg('#unassigned-msg', d.messages||d.error||'Something went wrong', true);
-    }
-  } finally { btn.disabled=false; }
+async function doReassign(){
+  const plates=[...document.querySelectorAll('.reassign-cb:checked')].map(c=>c.value);
+  if(!plates.length){ setMsg('#reassign-msg','Tick at least one lorry first.',true); return; }
+  setMsg('#reassign-msg','Assigning leftover DOs… ');
+  const d=await jpost('/api/reassign',{lorries:plates});
+  const o=d.outcome||{};
+  if(d.result){
+    renderResult(d.result);
+    let m=`✅ Assigned ${o.assigned||0} of ${o.total||0} leftover DO(s)`+(o.used&&o.used.length?` to ${o.used.join(', ')}`:'')+'.';
+    if(o.still&&o.still.length) m+=`  ⚠️ ${o.still.length} still don't fit (size/route/state rules) — tick another lorry.`;
+    if(o.skipped&&o.skipped.length) m+=`  (Ignored ${o.skipped.join(', ')} — already in use today.)`;
+    setMsg('#reassign-msg', m, (o.assigned||0)===0);
+  } else {
+    setMsg('#reassign-msg', d.error||'Reassign failed', true);
+  }
 }
-$('#btn-assign-unassigned').onclick=submitUnassignedPlates;
-$('#unassigned-plates').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitUnassignedPlates(); } });
+document.getElementById('btn-reassign').onclick=doReassign;
+
+// ---- Manually assign hand-picked DOs onto one named lorry ----
+function manualLookup(){
+  const plate=($('#manual-plate').value||'').trim().toUpperCase();
+  if(!plate) return;
+  const found=lastFleet.find(l=>l.plate===plate);
+  if(!found){
+    setMsg('#manual-msg', `Unknown plate "${esc(plate)}". Check the spelling, or update the master lorry file first.`, true);
+    $('#manual-picker').classList.add('hidden');
+    return;
+  }
+  setMsg('#manual-msg', null);
+  $('#manual-plate-cap').textContent=found.capacity.toFixed(2);
+  let rows='';
+  lastUnassignedList.forEach(d=>{
+    rows+=`<tr><td><input type="checkbox" class="manual-do-cb" data-w="${d.weight}" value="${esc(d.do)}"></td>`+
+          `<td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td></tr>`;
+  });
+  $('#manual-do-rows').innerHTML=rows;
+  document.querySelectorAll('.manual-do-cb').forEach(cb=>cb.addEventListener('change',()=>updateManualTotal(found.capacity)));
+  updateManualTotal(found.capacity);
+  $('#manual-picker').classList.remove('hidden');
+}
+
+function updateManualTotal(cap){
+  const checked=[...document.querySelectorAll('.manual-do-cb:checked')];
+  const total=checked.reduce((s,c)=>s+parseFloat(c.dataset.w),0);
+  $('#manual-selected-total').textContent=total.toFixed(3);
+  $('#manual-cap-warn').classList.toggle('hidden', total<=cap+1e-6);
+  $('#btn-manual-assign').disabled = checked.length===0;
+}
+
+async function manualAssign(){
+  const plate=($('#manual-plate').value||'').trim().toUpperCase();
+  const checked=[...document.querySelectorAll('.manual-do-cb:checked')].map(c=>c.value);
+  if(!plate || !checked.length) return;
+  const btn=$('#btn-manual-assign'); btn.disabled=true;
+  setMsg('#manual-msg','Assigning… ',false);
+  try{
+    const d=await jpost('/api/assign-specific',{plate:plate, dos:checked});
+    if(d.ok){
+      renderResult(d.result);
+      setMsg('#manual-msg', `✅ Assigned ${d.assigned} DO(s) to ${plate} (${d.weight}T).`, false);
+      show('#manual-msg', true);
+    } else {
+      setMsg('#manual-msg', d.message || d.error || 'Could not assign.', true);
+      btn.disabled=false;
+    }
+  } catch(e){ setMsg('#manual-msg','Something went wrong.',true); btn.disabled=false; }
+}
+$('#btn-manual-lookup').onclick=manualLookup;
+$('#btn-manual-assign').onclick=manualAssign;
+$('#manual-plate').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); manualLookup(); } });
 
 $('#btn-restart').onclick=()=>goTo('login');
 

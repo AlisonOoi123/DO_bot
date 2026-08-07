@@ -202,40 +202,6 @@ The full decision procedure lives in **DO_BOT_SKILL.md** (authoritative).
 **RULE 9.2 — Tiny-Item Routes (Small Lorry Mandatory)**
 Routes with average DO weight ≤ 150 kg (e.g., KV11A ~46 kg/DO) MUST use small lorries or vans. Lorries ≥ 4.5T are excluded from tiny-item routes because large trucks cannot maneuver in narrow shophouse streets.
 
-**RULE 9A — FIT IN LORRY Default-Lorry List (ABI only, PREFERENCE not restriction)**
-The optional "FIT IN LORRY" sheet in LORRY DAILY PLANNING.xlsx lists, per
-route, the ordered set of DEFAULT plates that route should try first. This
-populates RULE 9.1's `_preferred_lorries_for_route()` hint mechanism from
-the planners' sheet instead of a code constant — it is data-driven, not a
-hardcoded route→lorry table, and it does NOT exclude any other lorry.
-  - **Scope**: cell A1 of the sheet names the owning user (currently "ABI").
-    The preference applies only to that user's routes; other users' routes
-    are unaffected and keep the RULE 9.1 open selection.
-  - **Preference, not restriction — full fallback to the master fleet**: the
-    listed plates are tried first (tightest-fitting available one wins,
-    same as any other `_preferred_lorries_for_route` hint). If none of a
-    route's listed plates are available/free/big-enough that day, ANY other
-    lorry owned by that user and marked `Available` in the MUATAN (master
-    lorry) sheet remains fully eligible — the existing open weight-based
-    selection (RULE 9.1) takes over exactly as if the route had no FIT IN
-    LORRY entry at all. A route is never left `NO_LORRY` just because its
-    default plates happen to be busy.
-  - **Contention priority (closer-to-full-utilisation wins)**: if two
-    different routes' lists overlap and, on a given day, both would
-    naturally claim the SAME plate as their tightest-fitting preferred
-    choice, the route whose gross weight pushes that plate CLOSER to full
-    capacity is processed first and claims it; the other route falls
-    through to its own next preferred plate, or the open master-fleet
-    fallback above. Example: NS05 totalling 14T and PH09 totalling 13T both
-    preferring VJN9910 (15.389T) — NS05 wins (91% vs 84% utilisation). This
-    priority OVERRIDES RULE 1.1's earliest-date-first ordering for the
-    specific pair of groups in contention; all other groups keep their
-    normal date order.
-  - **Does not affect mixing**: routes that the corridor/geography rules
-    (Section 2, Section 8) already merge onto one shared lorry — e.g.
-    KV19A + KV20A — are combined into a single group before this rule ever
-    runs, so they are never treated as competitors under RULE 9A.
-
 ---
 
 ## SECTION 6A — SHIP_DETAIL COLUMN

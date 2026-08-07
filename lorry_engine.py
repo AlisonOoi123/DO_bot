@@ -638,24 +638,20 @@ class LorryEngine:
         self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
 
     def _load_fit_in_lorry(self, path):
-        """Load per-route default lorry lists from the optional
-        "FIT IN LORRY" sheet in LORRY DAILY PLANNING.xlsx.
+        """Load per-route default lorry lists from the optional "FIT IN LORRY"
+        sheet in LORRY DAILY PLANNING.xlsx.
 
         Sheet layout (no header row):
           Row 0, Col 0: owner label (e.g. "ABI") — the list only applies to
                         that owner's sessions.
           Row 1+, Col 0: route description starting with the route code
                         (e.g. "NS05-->Seremban", "KV01A - T.MALIM - ...").
-          Row 1+, Col 1+: ordered list of default plates for this route (a
-                        row may list any number of plates; blanks skipped).
+          Row 1+, Col 1+: ordered list of default plates for this route.
 
-        This is a PREFERENCE list, not a restriction — see
-        ASSIGNMENT_RULES.md RULE 9A. A route listed here has its plates
-        tried first (tightest-fitting available one wins); any other
-        lorry owned by this route's user and marked Available in the
-        master (MUATAN) sheet remains eligible as a fallback. Missing/
-        malformed sheet, or a route not listed, means no preference data
-        (falls straight through to normal weight-based selection).
+        PREFERENCE, not a restriction (RULE 9A): a listed route has its plates
+        tried first (tightest-fitting available one wins); any other Available
+        lorry owned by this route's user stays eligible as a fallback. Missing
+        sheet or unlisted route → no preference data (normal weight-based pick).
         """
         self.fit_in_lorry: dict = {}
         self.fit_in_lorry_owner: str = ""
@@ -680,12 +676,10 @@ class LorryEngine:
                 self.fit_in_lorry[route_pfx] = plates
 
     def fit_in_lorry_preferred(self, route: str):
-        """Return the ordered list of default/preferred plates for `route`
-        from the FIT IN LORRY sheet, or None if no preference data applies
-        (route not listed, sheet absent, or this engine's owner differs
-        from the sheet's designated owner). Longest route-code prefix
-        wins. This is a HINT for selection order only — it does not
-        exclude any otherwise-eligible (owner/SPARE + Available) lorry."""
+        """Return the ordered default/preferred plates for `route` from the FIT
+        IN LORRY sheet, or None (route not listed, sheet absent, or this
+        engine's owner differs from the sheet owner). Longest route-code prefix
+        wins. HINT for selection order only — excludes no eligible lorry."""
         if not self.fit_in_lorry or self.owner_user != self.fit_in_lorry_owner:
             return None
         r = str(route).strip().upper()

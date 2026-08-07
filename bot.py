@@ -901,16 +901,14 @@ def _direction_key(route: str, state: str = "", customer: str = "") -> str:
 
 def _preferred_lorries_for_route(route_text: str, engine=None) -> list[str]:
     """Return the ordered list of preferred plates for this route, or [].
+
     Source priority:
-      1. The FIT IN LORRY sheet (data-driven, per-owner — RULE 9A), via
-         `engine.fit_in_lorry_preferred()`, when `engine` is passed and the
-         route is listed there for the engine's owner.
-      2. `ROUTE_PREFERRED_LORRY` in assignment_config.py (kept empty by
-         design — RULE 9.1).
-    Either source matches the LONGEST route-code prefix so specific codes
-    (e.g. KV24A) win over shorter ones (e.g. KV24) regardless of dict
-    insertion order. This list is a HINT only — callers fall back to the
-    full eligible fleet when none of these plates are available/fit.
+      1. The FIT IN LORRY sheet (data-driven, per-owner — RULE 9A) via
+         engine.fit_in_lorry_preferred(), when `engine` is passed and the route
+         is listed there for the engine's owner.
+      2. ROUTE_PREFERRED_LORRY in assignment_config.py (kept empty by design).
+    Both match the LONGEST route-code prefix. HINT only — callers fall back to
+    the full eligible fleet when none of these plates are available/fit.
     """
     r = route_text.strip().upper()
     if engine is not None:
@@ -2202,8 +2200,6 @@ def handle_message(phone: str, text: str = None,
         return ["Your assignments have been exported. Send *hi* to start a new session."]
     elif state == "AWAIT_BROKEN_REPLACEMENT":
         return _handle_broken_replacement(phone, sess, text)
-    elif state == "AWAIT_UNASSIGNED_LORRY_REPLY":
-        return _handle_unassigned_lorry_reply(phone, sess, text)
 
     return ["Sorry, I didn't understand that. Send *hi* to start."]
 
@@ -2919,6 +2915,209 @@ def _downsize_lorries(sess):
     if moved:
         import logging as _rlog
         _rlog.info("[DOWNSIZE] right-sized %d lorry load(s) onto smaller trucks.", moved)
+
+
+def reassign_unassigned(sess, plates: list) -> dict:
+    """Assign still-unassigned (NO_LORRY) DOs onto the given available lorry
+    plates — best-fit-decreasing (heaviest DO first, tightest-fitting plate
+    wins) — WITHOUT re-uploading, since the items are already in sess["items"].
+    Enforces the same hard rules as normal assignment: eligible fleet, strict
+    route exclusions, forbidden plates, capacity (+naik), outstation minimum
+    tonnage, REMARKS/SHIP size cap, and destination-state compatibility.
+
+    Returns a summary dict for the caller (web/whatsapp) to display.
+    """
+    engine = sess.get("engine")
+    if engine is None:
+        return {"error": "no_engine", "assigned": 0}
+    items = sess.get("items", []) or []
+    no_lorry = [it for it in items
+                if it.get("LORRY") in ("NO_LORRY", "NO_ELIGIBLE_LORRY")]
+    total = len(no_lorry)
+    if not no_lorry:
+        return {"assigned": 0, "total": 0, "still": [], "used": [], "skipped": []}
+
+    # The user is telling us which lorries are NOW free — so accept ANY of their
+    # own lorries (owner + SPARE), including ones that were Blocked at upload
+    # time (they're overriding that). Only reject a lorry genuinely taken by
+    # ANOTHER user today.
+    _me = str(sess.get("user_id", "")).strip().upper()
+    _fleet_df = getattr(engine, "all_lorries", engine.eligible_lorries)
+    cap_map = {}
+    for _, r in _fleet_df.iterrows():
+        _u = str(r.get("USER", "")).strip().upper()
+        if _u in (_me, "SPARE"):
+            cap_map[str(r["LORRY"]).strip().upper()] = float(r["TON"])
+    known = set(cap_map)
+    given = [str(p).strip().upper() for p in (plates or []) if str(p).strip()]
+    _taken_by_other = {p for p, u in get_assigned_by().items() if u != _me}
+    avail = [p for p in given if p in known and p not in _taken_by_other]
+    skipped = [p for p in given if p not in known or p in _taken_by_other]
+    if not avail:
+        return {"assigned": 0, "total": total, "still": [], "used": [],
+                "skipped": skipped, "error": "no_available_plates"}
+
+    load = {p: 0.0 for p in avail}
+    states = {p: set() for p in avail}
+    reasons = sess.setdefault("unassigned_reasons", {})
+    done, still = [], []
+    for it in sorted(no_lorry, key=lambda x: -(x.get("WEIGHT", 0.0) or 0.0)):
+        w = it.get("WEIGHT", 0.0) or 0.0
+        route = it.get("ROUTE", "")
+        st = str(it.get("STATE", "")).strip().upper()
+        dest = _classify_dest_group(route, st)
+        strict = _strict_route_excl(route)
+        forbid = it.get("FORBID_PLATES") or set()
+        cands = []
+        for p in avail:
+            if p in strict or p in forbid:
+                continue
+            cap = cap_map.get(p, 0.0)
+            if cap * NAIK_FACTOR - load[p] < w:
+                continue
+            if cap < _eff_dest_min_ton(route, dest, load[p] + w):
+                continue
+            if it.get("MAX_TON") is not None and cap > it["MAX_TON"]:
+                continue
+            if st and states[p] and not any(_states_compatible(st, s) for s in states[p]):
+                continue
+            cands.append((cap * NAIK_FACTOR - load[p], p))
+        if not cands:
+            still.append(it)
+            reasons[it["DO NUMBER"]] = "NO_FIT_ON_GIVEN_PLATES"
+            continue
+        cands.sort()                      # tightest remaining fit first
+        chosen = cands[0][1]
+        it["LORRY"] = chosen
+        load[chosen] += w
+        if st:
+            states[chosen].add(st)
+        sess["assigned"][it["DO NUMBER"]] = chosen
+        reasons.pop(it["DO NUMBER"], None)
+        done.append(it)
+
+    for do in sess.get("pending_dos", []):
+        do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
+
+    return {
+        "assigned": len(done), "total": total,
+        "used": sorted({it["LORRY"] for it in done}),
+        "skipped": skipped,
+        "still": [{"do": str(x["DO NUMBER"]), "route": x.get("ROUTE", ""),
+                   "weight": round(x.get("WEIGHT", 0.0) or 0.0, 3)} for x in still],
+    }
+
+
+def assign_specific_dos(sess, plate: str, do_numbers: list) -> dict:
+    """Manually assign a hand-picked list of still-unassigned DOs onto ONE
+    user-named plate — the counterpart to reassign_unassigned() (which
+    auto-bin-packs across multiple lorries). This is a deliberate,
+    all-or-nothing action: the plate must be a known fleet lorry (owned by
+    this user or SPARE — an unrecognised plate is always rejected, never
+    accepted with a manually-typed capacity), every requested DO must still
+    be unassigned, the combined weight (existing load already on that plate
+    + the new picks) must not exceed its rated tonnage, and each DO must
+    still pass the same hard rules as normal assignment. If anything fails,
+    NOTHING is assigned and the caller gets a clear reason so the user can
+    adjust their selection and retry.
+    """
+    engine = sess.get("engine")
+    if engine is None:
+        return {"error": "no_engine", "message": "Session expired — please upload the DO file again."}
+
+    plate = str(plate).strip().upper()
+    _me = str(sess.get("user_id", "")).strip().upper()
+    _fleet_df = getattr(engine, "all_lorries", engine.eligible_lorries)
+    cap = None
+    for _, r in _fleet_df.iterrows():
+        _u = str(r.get("USER", "")).strip().upper()
+        if str(r["LORRY"]).strip().upper() == plate and _u in (_me, "SPARE"):
+            cap = float(r["TON"])
+            break
+    if cap is None:
+        return {"error": "unknown_plate",
+                "message": f"{plate} is not a known lorry on your fleet. "
+                           f"Check the spelling, or add it to the master lorry file first."}
+
+    _taken_by_other = {p for p, u in get_assigned_by().items() if u != _me}
+    if plate in _taken_by_other:
+        return {"error": "plate_taken", "message": f"{plate} is already assigned to another user today."}
+
+    items = sess.get("items", []) or []
+    by_do = {str(it.get("DO NUMBER")): it for it in items}
+    wanted = [str(d).strip() for d in (do_numbers or []) if str(d).strip()]
+    if not wanted:
+        return {"error": "no_dos", "message": "No DOs selected."}
+
+    selected, missing = [], []
+    for dn in wanted:
+        it = by_do.get(dn)
+        if it is None or it.get("LORRY") not in ("NO_LORRY", "NO_ELIGIBLE_LORRY"):
+            missing.append(dn)
+        else:
+            selected.append(it)
+    if missing:
+        return {"error": "not_unassigned",
+                "message": f"These DOs are no longer unassigned: {', '.join(missing)}. Refresh and try again."}
+
+    existing_items = [it for it in items if it.get("LORRY") == plate]
+    existing_load = sum((it.get("WEIGHT", 0.0) or 0.0) for it in existing_items)
+    existing_states = {str(it.get("STATE", "")).strip().upper()
+                        for it in existing_items if it.get("STATE")}
+
+    new_w = sum((it.get("WEIGHT", 0.0) or 0.0) for it in selected)
+    total_w = existing_load + new_w
+    if total_w > cap * NAIK_FACTOR + 1e-6:
+        return {"error": "over_capacity",
+                "message": f"Selected DOs total {new_w:.3f}T"
+                           + (f" (plus {existing_load:.3f}T already on {plate})" if existing_load else "")
+                           + f" — exceeds {plate}'s {cap:.3f}T capacity by {total_w - cap:.3f}T. "
+                             f"Deselect some and try again."}
+
+    states = set(existing_states)
+    violations = []
+    for it in selected:
+        route = it.get("ROUTE", "")
+        st = str(it.get("STATE", "")).strip().upper()
+        dest = _classify_dest_group(route, st)
+        if plate in _strict_route_excl(route):
+            violations.append((it["DO NUMBER"], "PLATE_FORBIDDEN_FOR_ROUTE"))
+            continue
+        if it.get("FORBID_PLATES") and plate in it["FORBID_PLATES"]:
+            violations.append((it["DO NUMBER"], "PLATE_FORBIDDEN"))
+            continue
+        if cap < _eff_dest_min_ton(route, dest, total_w):
+            violations.append((it["DO NUMBER"], "OUTSTATION_NEEDS_LARGER_LORRY"))
+            continue
+        if it.get("MAX_TON") is not None and cap > it["MAX_TON"]:
+            violations.append((it["DO NUMBER"], "SIZE_CAP_EXCEEDED"))
+            continue
+        if st and states and not any(_states_compatible(st, s) for s in states):
+            violations.append((it["DO NUMBER"], "STATE_MISMATCH"))
+            continue
+        if st:
+            states.add(st)
+    if violations:
+        return {"error": "rule_violation",
+                "message": "Some selected DOs can't go on " + plate + ": " +
+                           "; ".join(f"{d}({r})" for d, r in violations)}
+
+    reasons = sess.setdefault("unassigned_reasons", {})
+    for it in selected:
+        it["LORRY"] = plate
+        sess["assigned"][it["DO NUMBER"]] = plate
+        reasons.pop(it["DO NUMBER"], None)
+
+    for do in sess.get("pending_dos", []):
+        do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
+
+    if sess.get("raw_df") is not None:
+        try:
+            _export_result(sess)
+        except Exception:
+            pass
+
+    return {"ok": True, "assigned": len(selected), "plate": plate, "weight": round(new_w, 3)}
 
 
 def _handle_excel_upload(phone, sess, file_bytes):
@@ -4795,31 +4994,26 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _session_routes[_pl] = route
                     _record_lorry_state(_pl, _it.get("STATE", ""))
 
-        # ── FIT IN LORRY contention priority (ABI only) ─────────────────────────
-        # FIT IN LORRY plates are a PREFERENCE, not a restriction (RULE 9A) —
-        # any lorry owned by this user and marked Available in the master
-        # (MUATAN) sheet stays eligible even if it's not on a route's list.
-        # But two groups can still both prefer the SAME plate. Detect that by
-        # simulating, for each group with FIT IN LORRY data, which of its
-        # preferred plates it would naturally claim if it ran alone (tightest-
-        # fitting available one — mirrors the real preferred-lorry pick
-        # further below). Only for groups that actually collide on one plate,
-        # move whichever group would push that plate closer to full
-        # utilisation FIRST in the loop below, so it claims the plate; the
-        # loser simply falls through to its own next preferred plate, or the
-        # open fleet. This only reorders sorted_groups — it does not change
-        # bucketing (Section 2) or the corridor/mix-route merge already
-        # finalised above (Section 8), and does not touch any later pass.
-        if engine.fit_in_lorry and sess.get("user_id", "").strip().upper() == engine.fit_in_lorry_owner:
+        # ── FIT IN LORRY contention priority ───────────────────────────────────
+        # FIT IN LORRY plates are a PREFERENCE, not a restriction (RULE 9A) — any
+        # Available lorry owned by this user stays eligible even if not on a
+        # route's list. But two groups can both prefer the SAME plate. For each
+        # group with FIT IN LORRY data, simulate which preferred plate it would
+        # naturally claim alone (tightest-fitting available). Where two collide,
+        # let the group that pushes that plate CLOSER TO FULL go first, so it
+        # claims the plate; the loser falls through to its next preferred plate
+        # or the open fleet. Only reorders sorted_groups — no bucketing/merge
+        # change. (Your NS05-14T vs PH09-13T on VJN9910 example.)
+        if getattr(engine, "fit_in_lorry", None) and \
+                sess.get("user_id", "").strip().upper() == engine.fit_in_lorry_owner:
             def _grp_dominant_route(g):
-                _rc: dict[str, int] = {}
+                _rc: dict = {}
                 for _it in g:
                     _rc[_it.get("ROUTE", "")] = _rc.get(_it.get("ROUTE", ""), 0) + 1
                 return max(_rc, key=lambda r: _rc[r]) if _rc else ""
 
             _grp_routes  = [_grp_dominant_route(g) for g in sorted_groups]
             _grp_weights = [sum(it["WEIGHT"] for it in g) for g in sorted_groups]
-
             _dry_excl = sess["unavailable"] | get_assigned_today()
 
             def _natural_preferred_pick(_r, _w):
@@ -4835,8 +5029,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
             _grp_bestfit = [_natural_preferred_pick(_r, _grp_weights[_gi])
                             for _gi, _r in enumerate(_grp_routes)]
-
-            _plate_claimants: dict[str, list[int]] = defaultdict(list)
+            _plate_claimants: dict = defaultdict(list)
             for _gi, _p in enumerate(_grp_bestfit):
                 if _p:
                     _plate_claimants[_p].append(_gi)
@@ -4844,18 +5037,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _fil_boost = [0.0] * len(sorted_groups)
             for _plate, _gis in _plate_claimants.items():
                 if len(_gis) < 2:
-                    continue   # only one group's natural pick — no collision
+                    continue
                 _cap = _lorry_cap_map.get(_plate)
                 if not _cap:
                     continue
                 _scores = {_gi: min(_grp_weights[_gi], _cap) / _cap for _gi in _gis}
-                # Ties keep the earlier (already date-prioritised) group in front.
                 _winner = max(_gis, key=lambda gi: (_scores[gi], -gi))
                 _fil_boost[_winner] = max(_fil_boost[_winner], _scores[_winner])
 
             if any(_fil_boost):
-                # Stable sort: groups with equal (usually zero) boost keep their
-                # existing Rule-1.1 date order relative to one another.
                 _fil_order = sorted(range(len(sorted_groups)), key=lambda i: -_fil_boost[i])
                 sorted_groups = [sorted_groups[i] for i in _fil_order]
 
@@ -6975,20 +7165,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
             ]
             header += f"\n❌ *Unassigned reasons:* " + ", ".join(_reason_parts)
 
-        # ── Offer to manually assign unassigned DOs to user-given plates ──────
-        # Skipped when the AWAIT_OTHER_USER_REPLY (NOT_TODAY) question is also
-        # pending this round — that question takes precedence; this follow-up
-        # will appear after the user resolves it, on the next upload/summary.
-        _unassigned_followup = None
-        if _no_lorry_items and sess.get("state") != "AWAIT_OTHER_USER_REPLY":
-            _no_lorry_weight = round(sum(it["WEIGHT"] for it in _no_lorry_items), 3)
-            sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"
-            _unassigned_followup = (
-                f"🚚 *{len(_no_lorry_items)} DO(s) totalling {_no_lorry_weight}T are still unassigned.*\n"
-                f"Reply with available lorry plate(s) (e.g. `VJN9910 BQX9983`) to assign them now — "
-                f"no need to re-upload — or reply *SKIP* to leave them as is."
-            )
-
         # ── DEBUG: show why each NO_LORRY item couldn't be assigned ──────────
         _debug_lines = []
         for _dbg_it in _no_lorry_items:
@@ -7069,9 +7245,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 f"⏭ *{_nt_count} of your DO(s) are not on today's route schedule* and were left blank.\n"
                 f"Do you want to assign them anyway? Reply *YES* to assign, or *NO* to leave them blank.",
             ]
-
-        if _unassigned_followup:
-            result_msgs.append(_unassigned_followup)
 
         return result_msgs
 
@@ -7216,151 +7389,6 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
     return [
         "Please reply *YES* to assign the off-schedule DOs, or *NO* to leave them blank."
     ]
-
-
-def _parse_plate_tokens(text: str, known_plates: set) -> list[str]:
-    """Extract plate tokens from free text (comma/space separated,
-    case-insensitive), keeping only ones that match a known plate."""
-    raw = re.split(r'[,\s]+', text.strip().upper())
-    seen = set()
-    out = []
-    for t in raw:
-        if t in known_plates and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-def _handle_unassigned_lorry_reply(phone, sess, text: str) -> list[str]:
-    """Handle the reply to the post-assignment 'which lorries are available
-    for the unassigned DOs?' prompt (sess["state"] == AWAIT_UNASSIGNED_LORRY_REPLY).
-
-    Assigns as many still-unassigned (NO_LORRY) DOs as fit onto the plate(s)
-    the user names — best-fit-decreasing bin pack, heaviest DO first, tightest
-    remaining-capacity plate wins — while still enforcing the same hard rules
-    as normal assignment: owner/eligible fleet, outstation minimum tonnage,
-    REMARKS/SHIP_DETAIL size cap, forbidden-plate remarks, and destination
-    state compatibility across DOs sharing a plate. No re-upload needed —
-    the unassigned items are already sitting in sess["items"].
-    """
-    reply = text.strip().upper()
-    sess["state"] = "CONFIRMING"
-
-    if reply in ("SKIP", "NO", "TIDAK", "N", "CANCEL"):
-        return _build_summary(sess)
-
-    engine = sess.get("engine")
-    if engine is None:
-        return ["⚠️ Session expired — please upload the DO file again."]
-
-    items = sess.get("items", [])
-    no_lorry_items = [it for it in items if it.get("LORRY") == "NO_LORRY"]
-    if not no_lorry_items:
-        _summ0 = _build_summary(sess)
-        return ["Nothing left to assign — all DOs are already placed."] + (
-            _summ0 if isinstance(_summ0, list) else [_summ0]
-        )
-
-    known_plates = set(engine.eligible_lorries["LORRY"].astype(str).str.upper())
-    given_plates = _parse_plate_tokens(reply, known_plates)
-    if not given_plates:
-        sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"   # let them try again
-        return [
-            f"⚠️ I didn't recognise any lorry plate in that reply.\n"
-            f"Your fleet: {', '.join(sorted(known_plates))}\n"
-            f"Reply with the plate(s) to use, or *SKIP*."
-        ]
-
-    _lorry_cap_map = {row["LORRY"]: float(row["TON"]) for _, row in engine.eligible_lorries.iterrows()}
-    _hard_excl = sess.get("unavailable", set()) | get_assigned_today()
-    _avail_plates = [p for p in given_plates if p not in _hard_excl]
-    _skipped_plates = [p for p in given_plates if p in _hard_excl]
-
-    if not _avail_plates:
-        sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"
-        return [
-            f"⚠️ {', '.join(_skipped_plates)} — already committed/unavailable today. "
-            f"Give a different plate, or *SKIP*."
-        ]
-
-    _plate_load: dict[str, float] = {p: 0.0 for p in _avail_plates}
-    _plate_states: dict[str, set] = {p: set() for p in _avail_plates}
-    _unassigned_reasons = sess.setdefault("unassigned_reasons", {})
-    _assigned_now: list[dict] = []
-    _still_unassigned: list[dict] = []
-
-    for it in sorted(no_lorry_items, key=lambda x: -x["WEIGHT"]):
-        _w = it["WEIGHT"]
-        _route = it.get("ROUTE", "")
-        _state = it.get("STATE", "").strip().upper()
-        _dest = _classify_dest_group(_route, _state)
-        _strict_excl = _strict_route_excl(_route)
-        _forbid = it.get("FORBID_PLATES") or set()
-        _cands = []
-        for p in _avail_plates:
-            if p in _strict_excl or p in _forbid:
-                continue
-            _cap = _lorry_cap_map.get(p, 0)
-            _remain = _cap * NAIK_FACTOR - _plate_load[p]
-            if _remain < _w:
-                continue
-            _min_t = _eff_dest_min_ton(_route, _dest, _plate_load[p] + _w)
-            if _cap < _min_t:
-                continue
-            if it.get("MAX_TON") is not None and _cap > it["MAX_TON"]:
-                continue
-            if _state and _plate_states[p] and not any(
-                    _states_compatible(_state, s) for s in _plate_states[p]):
-                continue
-            _cands.append((_remain, p))
-        if not _cands:
-            _still_unassigned.append(it)
-            _unassigned_reasons[it["DO NUMBER"]] = "NO_FIT_ON_GIVEN_PLATES"
-            continue
-        _cands.sort()   # smallest remaining capacity that still fits = tightest fit
-        _chosen = _cands[0][1]
-        it["LORRY"] = _chosen
-        _plate_load[_chosen] += _w
-        if _state:
-            _plate_states[_chosen].add(_state)
-        sess["assigned"][it["DO NUMBER"]] = _chosen
-        _unassigned_reasons.pop(it["DO NUMBER"], None)
-        _assigned_now.append(it)
-
-    # Recompute display totals for affected DOs (items already mutated in place).
-    for do in sess.get("pending_dos", []):
-        do["TOTAL_TON"] = round(sum(it["WEIGHT"] for it in do["ITEMS"]), 3)
-
-    msg = []
-    if _assigned_now:
-        _used_plates = sorted({it["LORRY"] for it in _assigned_now})
-        msg.append(
-            f"✅ Assigned {len(_assigned_now)} of {len(no_lorry_items)} previously-unassigned "
-            f"DO(s) to {', '.join(_used_plates)}."
-        )
-    else:
-        msg.append("❌ None of the unassigned DOs fit on that plate(s).")
-    if _skipped_plates:
-        msg.append(f"⚠️ Ignored (already committed today): {', '.join(_skipped_plates)}")
-    if _still_unassigned:
-        _still_w = round(sum(x["WEIGHT"] for x in _still_unassigned), 3)
-        msg.append(
-            f"❌ {len(_still_unassigned)} DO(s) totalling {_still_w}T still don't fit "
-            f"those plate(s) (size/route/state rules). Reply with another plate to try again, "
-            f"or *SKIP* to leave them unassigned."
-        )
-        sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"
-
-    # Any prior export is now stale — regenerate it silently if one exists
-    # (mirrors the same re-export step used after a broken-lorry replacement).
-    if _assigned_now and sess.get("raw_df") is not None:
-        try:
-            _export_result(sess)
-        except Exception:
-            pass
-
-    _summ = _build_summary(sess)
-    return msg + (_summ if isinstance(_summ, list) else [_summ])
 
 
 def _suggest_current(sess) -> list[str]:

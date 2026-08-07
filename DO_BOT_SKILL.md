@@ -246,17 +246,6 @@ change.
 Assignment is entirely driven by owner + outstation + geography + weight +
 SHIP_DETAIL, per the principles above.
 
-**Addition — FIT IN LORRY sheet (ABI only, data-driven, still not a
-hardcode):** if the optional "FIT IN LORRY" sheet in LORRY DAILY
-PLANNING.xlsx lists a route, that route's listed plates feed the SAME
-`_preferred_lorries_for_route()` hint used throughout this document —
-tried first, tightest-fitting one wins, but any other lorry owned by that
-user and marked `Available` in the MUATAN sheet is still fully eligible if
-none of the listed ones fit. See ASSIGNMENT_RULES.md RULE 9A. This differs
-from `ROUTE_PREFERRED_LORRY` above only in that the preference data lives
-in the planners' spreadsheet instead of `assignment_config.py`, and only
-applies to the owner named in the sheet's header cell.
-
 ---
 
 ## H. SENTINEL VALUES (rows that are intentionally NOT assigned)
