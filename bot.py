@@ -7351,6 +7351,14 @@ def _handle_unassigned_lorry_reply(phone, sess, text: str) -> list[str]:
         )
         sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"
 
+    # Any prior export is now stale — regenerate it silently if one exists
+    # (mirrors the same re-export step used after a broken-lorry replacement).
+    if _assigned_now and sess.get("raw_df") is not None:
+        try:
+            _export_result(sess)
+        except Exception:
+            pass
+
     _summ = _build_summary(sess)
     return msg + (_summ if isinstance(_summ, list) else [_summ])
 

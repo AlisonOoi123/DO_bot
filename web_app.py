@@ -168,9 +168,8 @@ def _result_json(sess) -> dict:
             skipped_other += 1
             continue
         if lorry in _SENTINELS:
-            do["reason"] = sess.get("_unassigned_reasons", {}).get(
-                do["do"], "NO_LORRY") if isinstance(
-                sess.get("_unassigned_reasons"), dict) else "NO_LORRY"
+            _reasons = sess.get("unassigned_reasons")
+            do["reason"] = _reasons.get(do["do"], "NO_LORRY") if isinstance(_reasons, dict) else "NO_LORRY"
             unassigned.append(do)
             continue
         grp = lorries.setdefault(lorry, {
@@ -347,6 +346,25 @@ def api_offschedule():
     assign = bool((request.json or {}).get("assign"))
     msgs = bot._handle_other_user_reply(sid, sess, "YES" if assign else "NO")
     result = _result_json(sess) if sess.get("items") else None
+    return _with_cookie({
+        "messages": msgs,
+        "state": sess.get("state"),
+        "result": result,
+    }, sid)
+
+
+@app.route("/api/unassigned-lorries", methods=["POST"])
+def api_unassigned_lorries():
+    """Reply to 'which lorries are available for the unassigned DOs?' —
+    bin-packs the still-unassigned DOs onto the named plate(s) directly
+    from session state (no re-upload), same as the WhatsApp flow."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    plates = (request.json or {}).get("plates", "")
+    if not sess.get("items"):
+        return _with_cookie({"error": "No active assignment in this session."}, sid, 400)
+    msgs = bot._handle_unassigned_lorry_reply(sid, sess, str(plates))
+    result = _result_json(sess)
     return _with_cookie({
         "messages": msgs,
         "state": sess.get("state"),
@@ -700,6 +718,19 @@ _PAGE = r"""<!doctype html>
       <a class="dl" href="/api/download"><button class="btn">⬇️ Download filled Excel</button></a>
     </div>
     <div id="result-body"></div>
+    <div class="card hidden" id="unassigned-actions" style="margin:0 0 8px">
+      <div style="font-size:13px;color:var(--muted);margin-bottom:8px">
+        🚚 Reply with available lorry plate(s) to assign the unassigned DOs now
+        (e.g. <code>VJN9910 BQX9983</code>) — no need to re-upload:
+      </div>
+      <div class="row">
+        <input id="unassigned-plates" type="text" placeholder="Plate(s), space or comma separated"
+               style="flex:2 1 200px;padding:12px 14px;border-radius:10px;border:1px solid var(--line);
+                      background:var(--card2);color:var(--ink);font-size:15px">
+        <button class="btn" id="btn-assign-unassigned" style="flex:0 0 auto;width:auto;padding:12px 18px">Assign</button>
+      </div>
+      <div class="msg hidden" id="unassigned-msg"></div>
+    </div>
     <button class="btn secondary" id="btn-restart" style="margin-top:8px">Start over</button>
   </div>
 
@@ -817,6 +848,7 @@ document.getElementById('offsched-no').onclick=()=>answerOffsched(false);
 
 // ---- Step 5: render ----
 function esc(s){ return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+let lastUnassignedCount=0;
 function renderResult(r){
   const s=r.summary;
   $('#result-stat').innerHTML =
@@ -841,7 +873,36 @@ function renderResult(r){
     html+=`</tbody></table></div></div>`;
   }
   $('#result-body').innerHTML=html;
+  lastUnassignedCount=r.unassigned.length;
+  show('#unassigned-actions', r.unassigned.length>0);
 }
+
+async function submitUnassignedPlates(){
+  const inp=$('#unassigned-plates');
+  const val=(inp.value||'').trim();
+  if(!val) return;
+  const before=lastUnassignedCount;
+  const btn=$('#btn-assign-unassigned');
+  btn.disabled=true;
+  setMsg('#unassigned-msg','Assigning… ',false);
+  try{
+    const d=await jpost('/api/unassigned-lorries',{plates:val});
+    if(d.result){
+      const after=d.result.unassigned.length;
+      const placed=before-after;
+      inp.value='';
+      renderResult(d.result);   // this also re-shows/hides #unassigned-actions
+      if(placed>0){ setMsg('#unassigned-msg', `✅ Assigned ${placed} DO(s). ${after} still unassigned.`, false); }
+      else { setMsg('#unassigned-msg', `❌ None of the unassigned DOs fit on that plate(s).`, true); }
+      show('#unassigned-msg', true);
+      show('#unassigned-actions', true);   // keep visible to show the outcome even if now 0 unassigned
+    } else {
+      setMsg('#unassigned-msg', d.messages||d.error||'Something went wrong', true);
+    }
+  } finally { btn.disabled=false; }
+}
+$('#btn-assign-unassigned').onclick=submitUnassignedPlates;
+$('#unassigned-plates').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitUnassignedPlates(); } });
 
 $('#btn-restart').onclick=()=>goTo('login');
 
