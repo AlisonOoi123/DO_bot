@@ -146,23 +146,7 @@ Bot auto-assigns all DOs and shows a summary:
   1DO6030948, 1DO6030951
 ```
 
-If any DOs are still `NO_LORRY` after the automatic pass, the bot also asks
-right away, without waiting for a `change`/`force` command:
-```
-🚚 2 DO(s) totalling 8.4T are still unassigned.
-Reply with available lorry plate(s) (e.g. VJN9910 BQX9983) to assign them
-now — no need to re-upload — or reply SKIP to leave them as is.
-```
-Reply with one or more plates and the bot bin-packs the still-unassigned
-DOs across them (heaviest DO first, tightest-fitting plate wins), still
-enforcing the same hard rules (owner fleet, outstation minimum tonnage,
-REMARKS/SHIP_DETAIL size cap, state compatibility) — nothing gets forced
-onto a plate that genuinely can't take it. Whatever doesn't fit stays
-`NO_LORRY` and the bot asks again for a different plate, or `SKIP` to stop.
-This re-uses the same DOs already in the session, so no re-upload is
-needed.
-
-Planner can also still handle it manually:
+Planner can then:
 - `change 1DO6030948` → Pick a different lorry
 - `block WUD4927` → Mark lorry unavailable
 - `force BQY7823 1DO6030948` → Override assignment

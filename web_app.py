@@ -188,9 +188,15 @@ def _result_json(sess) -> dict:
         g["util"] = round(100.0 * g["load"] / cap, 1) if cap else None
 
     total_dos = sum(len(g["dos"]) for g in lorry_list)
+    used_plates = {g["lorry"] for g in lorry_list}
+    # Full fleet for the reassign picker (plate, capacity, whether already used).
+    fleet = [{"plate": p, "capacity": round(c, 3), "used": p in used_plates}
+             for p, c in sorted(caps.items())]
     return {
         "lorries": lorry_list,
         "unassigned": unassigned,
+        "unassigned_weight": round(sum(d["weight"] for d in unassigned), 3),
+        "fleet": fleet,
         "summary": {
             "lorries_used": len(lorry_list),
             "dos_assigned": total_dos,
@@ -352,6 +358,20 @@ def api_offschedule():
         "state": sess.get("state"),
         "result": result,
     }, sid)
+
+
+@app.route("/api/reassign", methods=["POST"])
+def api_reassign():
+    """Assign the still-unassigned DOs onto the lorries the user says are now
+    available — no re-upload. Returns the refreshed result."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    plates = (request.json or {}).get("lorries", []) or []
+    if isinstance(plates, str):
+        plates = [p for p in re.split(r"[,\s]+", plates) if p]
+    outcome = bot.reassign_unassigned(sess, plates)
+    result = _result_json(sess) if sess.get("items") else None
+    return _with_cookie({"outcome": outcome, "result": result}, sid)
 
 
 @app.route("/api/download")
@@ -700,7 +720,20 @@ _PAGE = r"""<!doctype html>
       <a class="dl" href="/api/download"><button class="btn">⬇️ Download filled Excel</button></a>
     </div>
     <div id="result-body"></div>
-    <button class="btn secondary" id="btn-restart" style="margin-top:8px">Start over</button>
+
+    <!-- Reassign leftover DOs onto now-available lorries (no re-upload) -->
+    <div id="reassign-box" class="hidden" style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+      <p class="step-title">Leftover DOs — assign to available lorries</p>
+      <div class="msg" id="reassign-msg"></div>
+      <p style="font-size:14px;color:var(--muted);margin:4px 0 10px">
+        <b id="reassign-count">0</b> DO(s), <b id="reassign-weight">0</b> T unassigned.
+        Tick the lorries that are now free and assign them — no need to re-upload.
+      </p>
+      <div id="reassign-fleet" class="grid-users" style="justify-content:flex-start;margin-bottom:12px"></div>
+      <button class="btn" id="btn-reassign" style="width:auto">Assign leftover DOs to ticked lorries</button>
+    </div>
+
+    <button class="btn secondary" id="btn-restart" style="margin-top:14px">Start over</button>
   </div>
 
   <div class="foot">Same assignment engine as the WhatsApp bot · works on phone &amp; desktop</div>
@@ -841,7 +874,43 @@ function renderResult(r){
     html+=`</tbody></table></div></div>`;
   }
   $('#result-body').innerHTML=html;
+
+  // ---- Reassign leftover DOs onto now-available lorries ----
+  const box=$('#reassign-box');
+  if(r.unassigned.length && r.fleet){
+    $('#reassign-count').textContent=r.unassigned.length;
+    $('#reassign-weight').textContent=(r.unassigned_weight||0).toFixed(3);
+    let f='';
+    r.fleet.forEach(l=>{
+      f+=`<label class="userbtn" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:10px 14px">`+
+         `<input type="checkbox" class="reassign-cb" value="${esc(l.plate)}"> ${esc(l.plate)} `+
+         `<small style="color:var(--muted)">${l.capacity.toFixed(1)}T${l.used?' · in use':''}</small></label>`;
+    });
+    $('#reassign-fleet').innerHTML=f;
+    setMsg('#reassign-msg',null);
+    box.classList.remove('hidden');
+  } else {
+    box.classList.add('hidden');
+  }
 }
+
+async function doReassign(){
+  const plates=[...document.querySelectorAll('.reassign-cb:checked')].map(c=>c.value);
+  if(!plates.length){ setMsg('#reassign-msg','Tick at least one lorry first.',true); return; }
+  setMsg('#reassign-msg','Assigning leftover DOs… ');
+  const d=await jpost('/api/reassign',{lorries:plates});
+  const o=d.outcome||{};
+  if(d.result){
+    renderResult(d.result);
+    let m=`✅ Assigned ${o.assigned||0} of ${o.total||0} leftover DO(s)`+(o.used&&o.used.length?` to ${o.used.join(', ')}`:'')+'.';
+    if(o.still&&o.still.length) m+=`  ⚠️ ${o.still.length} still don't fit (size/route/state rules) — tick another lorry.`;
+    if(o.skipped&&o.skipped.length) m+=`  (Ignored ${o.skipped.join(', ')} — already in use today.)`;
+    setMsg('#reassign-msg', m, (o.assigned||0)===0);
+  } else {
+    setMsg('#reassign-msg', d.error||'Reassign failed', true);
+  }
+}
+document.getElementById('btn-reassign').onclick=doReassign;
 
 $('#btn-restart').onclick=()=>goTo('login');
 
