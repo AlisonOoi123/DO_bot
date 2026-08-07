@@ -150,6 +150,17 @@ def _result_json(sess) -> dict:
                 caps[str(r["LORRY"]).strip().upper()] = float(r["TON"])
         except Exception:
             caps = {}
+    # Full cross-owner fleet (for the manual "type a plate" box only — the
+    # checkbox grid above it stays scoped to this user's own fleet via `caps`).
+    full_caps = {}
+    if engine is not None and getattr(engine, "all_lorries", None) is not None:
+        try:
+            for _, r in engine.all_lorries.iterrows():
+                full_caps[str(r["LORRY"]).strip().upper()] = float(r["TON"])
+        except Exception:
+            full_caps = dict(caps)
+    else:
+        full_caps = dict(caps)
 
     lorries: dict[str, dict] = {}
     unassigned: list[dict] = []
@@ -191,11 +202,16 @@ def _result_json(sess) -> dict:
     # Full fleet for the reassign picker (plate, capacity, whether already used).
     fleet = [{"plate": p, "capacity": round(c, 3), "used": p in used_plates}
              for p, c in sorted(caps.items())]
+    # Cross-owner fleet for the manual "type a plate" box (§ assign_specific_dos
+    # in bot.py accepts any owner's plate — this just lets the client know a
+    # typed plate is real before it submits, without a false "unknown plate").
+    full_fleet = [{"plate": p, "capacity": round(c, 3)} for p, c in sorted(full_caps.items())]
     return {
         "lorries": lorry_list,
         "unassigned": unassigned,
         "unassigned_weight": round(sum(d["weight"] for d in unassigned), 3),
         "fleet": fleet,
+        "full_fleet": full_fleet,
         "summary": {
             "lorries_used": len(lorry_list),
             "dos_assigned": total_dos,
@@ -889,7 +905,7 @@ document.getElementById('offsched-no').onclick=()=>answerOffsched(false);
 
 // ---- Step 5: render ----
 function esc(s){ return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-let lastFleet=[], lastUnassignedList=[];
+let lastFleet=[], lastFullFleet=[], lastUnassignedList=[];
 function renderResult(r){
   const s=r.summary;
   $('#result-stat').innerHTML =
@@ -917,6 +933,7 @@ function renderResult(r){
 
   // ---- Reassign leftover DOs onto now-available lorries ----
   lastFleet=r.fleet||[];
+  lastFullFleet=r.full_fleet||r.fleet||[];
   lastUnassignedList=r.unassigned||[];
   const box=$('#reassign-box');
   if(r.unassigned.length && r.fleet){
@@ -963,7 +980,7 @@ document.getElementById('btn-reassign').onclick=doReassign;
 function manualLookup(){
   const plate=($('#manual-plate').value||'').trim().toUpperCase();
   if(!plate) return;
-  const found=lastFleet.find(l=>l.plate===plate);
+  const found=lastFullFleet.find(l=>l.plate===plate);
   if(!found){
     setMsg('#manual-msg', `Unknown plate "${esc(plate)}". Check the spelling, or update the master lorry file first.`, true);
     $('#manual-picker').classList.add('hidden');

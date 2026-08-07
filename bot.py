@@ -3011,37 +3011,40 @@ def reassign_unassigned(sess, plates: list) -> dict:
 def assign_specific_dos(sess, plate: str, do_numbers: list) -> dict:
     """Manually assign a hand-picked list of still-unassigned DOs onto ONE
     user-named plate — the counterpart to reassign_unassigned() (which
-    auto-bin-packs across multiple lorries). This is a deliberate,
-    all-or-nothing action: the plate must be a known fleet lorry (owned by
-    this user or SPARE — an unrecognised plate is always rejected, never
-    accepted with a manually-typed capacity), every requested DO must still
-    be unassigned, the combined weight (existing load already on that plate
-    + the new picks) must not exceed its rated tonnage, and each DO must
-    still pass the same hard rules as normal assignment. If anything fails,
-    NOTHING is assigned and the caller gets a clear reason so the user can
-    adjust their selection and retry.
+    auto-bin-packs across multiple lorries, and stays owner-scoped). This
+    manual box is a deliberate override: it searches the FULL fleet across
+    every owner (not just this user's + SPARE) and ignores the master
+    file's Blocked/Available status, on the theory that a human is
+    consciously picking one plate and a handful of DOs, not an algorithm —
+    so a lorry belonging to another user, or one flagged Blocked, is still
+    offered as long as it isn't already full. "Already full" is judged
+    against this session's own knowledge only (existing load already on
+    that plate within sess["items"]); a plate another user is loading up
+    concurrently in a separate session isn't visible here.
+    An unrecognised plate (not in ANY owner's fleet at all) is always
+    rejected — never accepted with a manually-typed capacity. Every
+    requested DO must still be unassigned, the combined weight (existing
+    load + new picks) must not exceed the plate's rated tonnage, and each
+    DO must still pass the same hard rules as normal assignment (route
+    reservations, forbidden plates, outstation minimum, size cap, state
+    compatibility). If anything fails, NOTHING is assigned and the caller
+    gets a clear reason so the user can adjust their selection and retry.
     """
     engine = sess.get("engine")
     if engine is None:
         return {"error": "no_engine", "message": "Session expired — please upload the DO file again."}
 
     plate = str(plate).strip().upper()
-    _me = str(sess.get("user_id", "")).strip().upper()
     _fleet_df = getattr(engine, "all_lorries", engine.eligible_lorries)
     cap = None
     for _, r in _fleet_df.iterrows():
-        _u = str(r.get("USER", "")).strip().upper()
-        if str(r["LORRY"]).strip().upper() == plate and _u in (_me, "SPARE"):
+        if str(r["LORRY"]).strip().upper() == plate:
             cap = float(r["TON"])
             break
     if cap is None:
         return {"error": "unknown_plate",
-                "message": f"{plate} is not a known lorry on your fleet. "
+                "message": f"{plate} is not a known lorry. "
                            f"Check the spelling, or add it to the master lorry file first."}
-
-    _taken_by_other = {p for p, u in get_assigned_by().items() if u != _me}
-    if plate in _taken_by_other:
-        return {"error": "plate_taken", "message": f"{plate} is already assigned to another user today."}
 
     items = sess.get("items", []) or []
     by_do = {str(it.get("DO NUMBER")): it for it in items}
