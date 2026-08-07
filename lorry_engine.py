@@ -551,6 +551,7 @@ class LorryEngine:
     def __init__(self, master_path: str, history_path: str, owner_user: str):
         self.owner_user = owner_user.upper()
         self._load_master(master_path)
+        self._load_fit_in_lorry(master_path)
         self._load_history(history_path)
         self._build_route_frequency()
         self._build_daily_stop_counts()
@@ -635,6 +636,58 @@ class LorryEngine:
         df = pd.DataFrame(rows).drop_duplicates(subset=["LORRY"], keep="first")
         self.all_lorries = df.copy()
         self.eligible_lorries = df[df["USER"].isin({self.owner_user, "SPARE"})].copy()
+
+    def _load_fit_in_lorry(self, path):
+        """Load per-route default lorry lists from the optional "FIT IN LORRY"
+        sheet in LORRY DAILY PLANNING.xlsx.
+
+        Sheet layout (no header row):
+          Row 0, Col 0: owner label (e.g. "ABI") — the list only applies to
+                        that owner's sessions.
+          Row 1+, Col 0: route description starting with the route code
+                        (e.g. "NS05-->Seremban", "KV01A - T.MALIM - ...").
+          Row 1+, Col 1+: ordered list of default plates for this route.
+
+        PREFERENCE, not a restriction (RULE 9A): a listed route has its plates
+        tried first (tightest-fitting available one wins); any other Available
+        lorry owned by this route's user stays eligible as a fallback. Missing
+        sheet or unlisted route → no preference data (normal weight-based pick).
+        """
+        self.fit_in_lorry: dict = {}
+        self.fit_in_lorry_owner: str = ""
+        try:
+            raw = pd.read_excel(path, sheet_name="FIT IN LORRY", header=None)
+        except Exception:
+            return
+        if raw.empty:
+            return
+        self.fit_in_lorry_owner = (
+            str(raw.iloc[0, 0]).strip().upper() if pd.notna(raw.iloc[0, 0]) else ""
+        )
+        for _, r in raw.iloc[1:].iterrows():
+            desc = str(r.iloc[0]).strip() if pd.notna(r.iloc[0]) else ""
+            m = re.match(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)', desc)
+            if not m:
+                continue
+            route_pfx = m.group(1).upper()
+            plates = [str(v).strip().upper() for v in r.iloc[1:]
+                      if pd.notna(v) and str(v).strip()]
+            if plates:
+                self.fit_in_lorry[route_pfx] = plates
+
+    def fit_in_lorry_preferred(self, route: str):
+        """Return the ordered default/preferred plates for `route` from the FIT
+        IN LORRY sheet, or None (route not listed, sheet absent, or this
+        engine's owner differs from the sheet owner). Longest route-code prefix
+        wins. HINT for selection order only — excludes no eligible lorry."""
+        if not self.fit_in_lorry or self.owner_user != self.fit_in_lorry_owner:
+            return None
+        r = str(route).strip().upper()
+        best_pfx, best_plates = "", None
+        for pfx, plates in self.fit_in_lorry.items():
+            if r.startswith(pfx) and len(pfx) > len(best_pfx):
+                best_pfx, best_plates = pfx, plates
+        return list(best_plates) if best_plates else None
 
     @staticmethod
     def _parse_longitud_centroids(df: pd.DataFrame) -> dict:

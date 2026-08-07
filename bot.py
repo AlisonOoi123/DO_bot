@@ -899,12 +899,22 @@ def _direction_key(route: str, state: str = "", customer: str = "") -> str:
 # _MAX_CITY_MERGE_KM_OUTSTATION imported from assignment_config
 
 
-def _preferred_lorries_for_route(route_text: str) -> list[str]:
+def _preferred_lorries_for_route(route_text: str, engine=None) -> list[str]:
     """Return the ordered list of preferred plates for this route, or [].
-    Matches the LONGEST route-code prefix so specific codes (e.g. KV24A) win
-    over shorter ones (e.g. KV24) regardless of dict insertion order.
+
+    Source priority:
+      1. The FIT IN LORRY sheet (data-driven, per-owner — RULE 9A) via
+         engine.fit_in_lorry_preferred(), when `engine` is passed and the route
+         is listed there for the engine's owner.
+      2. ROUTE_PREFERRED_LORRY in assignment_config.py (kept empty by design).
+    Both match the LONGEST route-code prefix. HINT only — callers fall back to
+    the full eligible fleet when none of these plates are available/fit.
     """
     r = route_text.strip().upper()
+    if engine is not None:
+        _fil = engine.fit_in_lorry_preferred(r)
+        if _fil:
+            return _fil
     best_pfx = ""
     best_plates: list[str] = []
     for pfx, plates in _ROUTE_PREFERRED_LORRY.items():
@@ -3533,8 +3543,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # are within _MAX_CITY_MERGE_KM_OUTSTATION of each other, in which
                 # case proximity overrides the preferred-lorry constraint so nearby
                 # city routes (e.g. KV05A + KV19A, both around KL) can share one lorry.
-                _base_pref = set(_preferred_lorries_for_route(base_route))
-                _cand_pref = set(_preferred_lorries_for_route(cand_route))
+                _base_pref = set(_preferred_lorries_for_route(base_route, engine))
+                _cand_pref = set(_preferred_lorries_for_route(cand_route, engine))
                 _base_dest_g_pref = _classify_dest_group(base_route, "")
                 _cand_dest_g_pref = _classify_dest_group(cand_route, "")
                 _both_urban = (_base_dest_g_pref in _DEST_URBAN_GROUPS
@@ -4375,7 +4385,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             for _it in group_items:
                 _route_counts[_it.get("ROUTE", "")] = _route_counts.get(_it.get("ROUTE", ""), 0) + 1
             _dominant_route = max(_route_counts, key=lambda r: _route_counts[r])
-            _preferred = _preferred_lorries_for_route(_dominant_route)
+            _preferred = _preferred_lorries_for_route(_dominant_route, engine)
             _base_excluded = excluded   # save pre-size excluded set for fallback
             # REMARKS size cap (FIELD 3) — smallest cap among this group's DOs.
             _grp_caps_pre = [it["MAX_TON"] for it in group_items
@@ -4615,7 +4625,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # Promote preferred lorries to the front of the bin-pack
                     # selection so config priority is respected even when the
                     # engine's route-history scoring would pick a different lorry.
-                    _bp_pref = _preferred_lorries_for_route(route)
+                    _bp_pref = _preferred_lorries_for_route(route, engine)
                     if _bp_pref:
                         _bp_pref_idx = {p: i for i, p in enumerate(_bp_pref)}
                         _sug_pref = sorted(
@@ -4781,6 +4791,61 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _session_routes[_pl] = route
                     _record_lorry_state(_pl, _it.get("STATE", ""))
 
+        # ── FIT IN LORRY contention priority ───────────────────────────────────
+        # FIT IN LORRY plates are a PREFERENCE, not a restriction (RULE 9A) — any
+        # Available lorry owned by this user stays eligible even if not on a
+        # route's list. But two groups can both prefer the SAME plate. For each
+        # group with FIT IN LORRY data, simulate which preferred plate it would
+        # naturally claim alone (tightest-fitting available). Where two collide,
+        # let the group that pushes that plate CLOSER TO FULL go first, so it
+        # claims the plate; the loser falls through to its next preferred plate
+        # or the open fleet. Only reorders sorted_groups — no bucketing/merge
+        # change. (Your NS05-14T vs PH09-13T on VJN9910 example.)
+        if getattr(engine, "fit_in_lorry", None) and \
+                sess.get("user_id", "").strip().upper() == engine.fit_in_lorry_owner:
+            def _grp_dominant_route(g):
+                _rc: dict = {}
+                for _it in g:
+                    _rc[_it.get("ROUTE", "")] = _rc.get(_it.get("ROUTE", ""), 0) + 1
+                return max(_rc, key=lambda r: _rc[r]) if _rc else ""
+
+            _grp_routes  = [_grp_dominant_route(g) for g in sorted_groups]
+            _grp_weights = [sum(it["WEIGHT"] for it in g) for g in sorted_groups]
+            _dry_excl = sess["unavailable"] | get_assigned_today()
+
+            def _natural_preferred_pick(_r, _w):
+                _plates = engine.fit_in_lorry_preferred(_r)
+                if not _plates:
+                    return None
+                _cands = [p for p in _plates
+                          if p in _lorry_cap_map and p not in _dry_excl
+                          and float(_lorry_cap_map[p]) >= _w]
+                if not _cands:
+                    return None
+                return min(_cands, key=lambda p: float(_lorry_cap_map[p]))
+
+            _grp_bestfit = [_natural_preferred_pick(_r, _grp_weights[_gi])
+                            for _gi, _r in enumerate(_grp_routes)]
+            _plate_claimants: dict = defaultdict(list)
+            for _gi, _p in enumerate(_grp_bestfit):
+                if _p:
+                    _plate_claimants[_p].append(_gi)
+
+            _fil_boost = [0.0] * len(sorted_groups)
+            for _plate, _gis in _plate_claimants.items():
+                if len(_gis) < 2:
+                    continue
+                _cap = _lorry_cap_map.get(_plate)
+                if not _cap:
+                    continue
+                _scores = {_gi: min(_grp_weights[_gi], _cap) / _cap for _gi in _gis}
+                _winner = max(_gis, key=lambda gi: (_scores[gi], -gi))
+                _fil_boost[_winner] = max(_fil_boost[_winner], _scores[_winner])
+
+            if any(_fil_boost):
+                _fil_order = sorted(range(len(sorted_groups)), key=lambda i: -_fil_boost[i])
+                sorted_groups = [sorted_groups[i] for i in _fil_order]
+
         for group in sorted_groups:
             _assign_group(group)
 
@@ -4816,7 +4881,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             it_dest = _classify_dest_group(it.get("ROUTE", ""), it.get("STATE", ""))
             it_state = it.get("STATE", "").strip().upper()
             _it_dest_min_t = _DEST_MIN_TON.get(it_dest, 0.0)
-            _it_pref = _preferred_lorries_for_route(it.get("ROUTE", ""))
+            _it_pref = _preferred_lorries_for_route(it.get("ROUTE", ""), engine)
             _it_strict_excl = _strict_route_excl(it.get("ROUTE", ""))
 
             def _consol_eligible(p: str) -> bool:
@@ -5360,8 +5425,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _merge_route_ok = _state_merge_ok and _cap_merge_ok and _dstmin_merge_ok and not any(
                     _best_dst in _strict_route_excl(r) for r in _src_routes
                 ) and not any(
-                    _preferred_lorries_for_route(r)
-                    and _best_dst not in _preferred_lorries_for_route(r)
+                    _preferred_lorries_for_route(r, engine)
+                    and _best_dst not in _preferred_lorries_for_route(r, engine)
                     for r in _src_routes
                 )
                 if _merge_route_ok:
@@ -5438,7 +5503,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         # Preferred lorry guard: prefer designated lorries, but
                         # don't block the move entirely — rebalance is an optimisation,
                         # not an assignment gate. Only block if _dst is strictly excluded.
-                        _it_pref_rb = _preferred_lorries_for_route(_route_it)
+                        _it_pref_rb = _preferred_lorries_for_route(_route_it, engine)
                         if _it_pref_rb and _dst not in _it_pref_rb:
                             # Still allow if no preferred lorry is present in the
                             # underloaded pool (all full/unavailable → any is OK)
