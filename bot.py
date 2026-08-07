@@ -2109,6 +2109,8 @@ def handle_message(phone: str, text: str = None,
         return ["Your assignments have been exported. Send *hi* to start a new session."]
     elif state == "AWAIT_BROKEN_REPLACEMENT":
         return _handle_broken_replacement(phone, sess, text)
+    elif state == "AWAIT_UNASSIGNED_LORRY_REPLY":
+        return _handle_unassigned_lorry_reply(phone, sess, text)
 
     return ["Sorry, I didn't understand that. Send *hi* to start."]
 
@@ -6466,6 +6468,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
             ]
             header += f"\n❌ *Unassigned reasons:* " + ", ".join(_reason_parts)
 
+        # ── Offer to manually assign unassigned DOs to user-given plates ──────
+        # Skipped when the AWAIT_OTHER_USER_REPLY (NOT_TODAY) question is also
+        # pending this round — that question takes precedence; this follow-up
+        # will appear after the user resolves it, on the next upload/summary.
+        _unassigned_followup = None
+        if _no_lorry_items and sess.get("state") != "AWAIT_OTHER_USER_REPLY":
+            _no_lorry_weight = round(sum(it["WEIGHT"] for it in _no_lorry_items), 3)
+            sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"
+            _unassigned_followup = (
+                f"🚚 *{len(_no_lorry_items)} DO(s) totalling {_no_lorry_weight}T are still unassigned.*\n"
+                f"Reply with available lorry plate(s) (e.g. `VJN9910 BQX9983`) to assign them now — "
+                f"no need to re-upload — or reply *SKIP* to leave them as is."
+            )
+
         # ── DEBUG: show why each NO_LORRY item couldn't be assigned ──────────
         _debug_lines = []
         for _dbg_it in _no_lorry_items:
@@ -6546,6 +6562,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 f"⏭ *{_nt_count} of your DO(s) are not on today's route schedule* and were left blank.\n"
                 f"Do you want to assign them anyway? Reply *YES* to assign, or *NO* to leave them blank.",
             ]
+
+        if _unassigned_followup:
+            result_msgs.append(_unassigned_followup)
 
         return result_msgs
 
@@ -6690,6 +6709,143 @@ def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
     return [
         "Please reply *YES* to assign the off-schedule DOs, or *NO* to leave them blank."
     ]
+
+
+def _parse_plate_tokens(text: str, known_plates: set) -> list[str]:
+    """Extract plate tokens from free text (comma/space separated,
+    case-insensitive), keeping only ones that match a known plate."""
+    raw = re.split(r'[,\s]+', text.strip().upper())
+    seen = set()
+    out = []
+    for t in raw:
+        if t in known_plates and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _handle_unassigned_lorry_reply(phone, sess, text: str) -> list[str]:
+    """Handle the reply to the post-assignment 'which lorries are available
+    for the unassigned DOs?' prompt (sess["state"] == AWAIT_UNASSIGNED_LORRY_REPLY).
+
+    Assigns as many still-unassigned (NO_LORRY) DOs as fit onto the plate(s)
+    the user names — best-fit-decreasing bin pack, heaviest DO first, tightest
+    remaining-capacity plate wins — while still enforcing the same hard rules
+    as normal assignment: owner/eligible fleet, outstation minimum tonnage,
+    REMARKS/SHIP_DETAIL size cap, forbidden-plate remarks, and destination
+    state compatibility across DOs sharing a plate. No re-upload needed —
+    the unassigned items are already sitting in sess["items"].
+    """
+    reply = text.strip().upper()
+    sess["state"] = "CONFIRMING"
+
+    if reply in ("SKIP", "NO", "TIDAK", "N", "CANCEL"):
+        return _build_summary(sess)
+
+    engine = sess.get("engine")
+    if engine is None:
+        return ["⚠️ Session expired — please upload the DO file again."]
+
+    items = sess.get("items", [])
+    no_lorry_items = [it for it in items if it.get("LORRY") == "NO_LORRY"]
+    if not no_lorry_items:
+        _summ0 = _build_summary(sess)
+        return ["Nothing left to assign — all DOs are already placed."] + (
+            _summ0 if isinstance(_summ0, list) else [_summ0]
+        )
+
+    known_plates = set(engine.eligible_lorries["LORRY"].astype(str).str.upper())
+    given_plates = _parse_plate_tokens(reply, known_plates)
+    if not given_plates:
+        sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"   # let them try again
+        return [
+            f"⚠️ I didn't recognise any lorry plate in that reply.\n"
+            f"Your fleet: {', '.join(sorted(known_plates))}\n"
+            f"Reply with the plate(s) to use, or *SKIP*."
+        ]
+
+    _lorry_cap_map = {row["LORRY"]: float(row["TON"]) for _, row in engine.eligible_lorries.iterrows()}
+    _hard_excl = sess.get("unavailable", set()) | get_assigned_today()
+    _avail_plates = [p for p in given_plates if p not in _hard_excl]
+    _skipped_plates = [p for p in given_plates if p in _hard_excl]
+
+    if not _avail_plates:
+        sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"
+        return [
+            f"⚠️ {', '.join(_skipped_plates)} — already committed/unavailable today. "
+            f"Give a different plate, or *SKIP*."
+        ]
+
+    _plate_load: dict[str, float] = {p: 0.0 for p in _avail_plates}
+    _plate_states: dict[str, set] = {p: set() for p in _avail_plates}
+    _unassigned_reasons = sess.setdefault("unassigned_reasons", {})
+    _assigned_now: list[dict] = []
+    _still_unassigned: list[dict] = []
+
+    for it in sorted(no_lorry_items, key=lambda x: -x["WEIGHT"]):
+        _w = it["WEIGHT"]
+        _route = it.get("ROUTE", "")
+        _state = it.get("STATE", "").strip().upper()
+        _dest = _classify_dest_group(_route, _state)
+        _strict_excl = _strict_route_excl(_route)
+        _forbid = it.get("FORBID_PLATES") or set()
+        _cands = []
+        for p in _avail_plates:
+            if p in _strict_excl or p in _forbid:
+                continue
+            _cap = _lorry_cap_map.get(p, 0)
+            _remain = _cap * NAIK_FACTOR - _plate_load[p]
+            if _remain < _w:
+                continue
+            _min_t = _eff_dest_min_ton(_route, _dest, _plate_load[p] + _w)
+            if _cap < _min_t:
+                continue
+            if it.get("MAX_TON") is not None and _cap > it["MAX_TON"]:
+                continue
+            if _state and _plate_states[p] and not any(
+                    _states_compatible(_state, s) for s in _plate_states[p]):
+                continue
+            _cands.append((_remain, p))
+        if not _cands:
+            _still_unassigned.append(it)
+            _unassigned_reasons[it["DO NUMBER"]] = "NO_FIT_ON_GIVEN_PLATES"
+            continue
+        _cands.sort()   # smallest remaining capacity that still fits = tightest fit
+        _chosen = _cands[0][1]
+        it["LORRY"] = _chosen
+        _plate_load[_chosen] += _w
+        if _state:
+            _plate_states[_chosen].add(_state)
+        sess["assigned"][it["DO NUMBER"]] = _chosen
+        _unassigned_reasons.pop(it["DO NUMBER"], None)
+        _assigned_now.append(it)
+
+    # Recompute display totals for affected DOs (items already mutated in place).
+    for do in sess.get("pending_dos", []):
+        do["TOTAL_TON"] = round(sum(it["WEIGHT"] for it in do["ITEMS"]), 3)
+
+    msg = []
+    if _assigned_now:
+        _used_plates = sorted({it["LORRY"] for it in _assigned_now})
+        msg.append(
+            f"✅ Assigned {len(_assigned_now)} of {len(no_lorry_items)} previously-unassigned "
+            f"DO(s) to {', '.join(_used_plates)}."
+        )
+    else:
+        msg.append("❌ None of the unassigned DOs fit on that plate(s).")
+    if _skipped_plates:
+        msg.append(f"⚠️ Ignored (already committed today): {', '.join(_skipped_plates)}")
+    if _still_unassigned:
+        _still_w = round(sum(x["WEIGHT"] for x in _still_unassigned), 3)
+        msg.append(
+            f"❌ {len(_still_unassigned)} DO(s) totalling {_still_w}T still don't fit "
+            f"those plate(s) (size/route/state rules). Reply with another plate to try again, "
+            f"or *SKIP* to leave them unassigned."
+        )
+        sess["state"] = "AWAIT_UNASSIGNED_LORRY_REPLY"
+
+    _summ = _build_summary(sess)
+    return msg + (_summ if isinstance(_summ, list) else [_summ])
 
 
 def _suggest_current(sess) -> list[str]:
