@@ -779,8 +779,88 @@ def _classify_dest_group(route: str, state: str = "") -> str:
 
 # _DEST_SORT_PRI, _LORRY_STRICT_ROUTE, _ROUTE_CORRIDOR_GROUPS imported from assignment_config
 
-def _same_corridor_group(route1: str, route2: str) -> bool:
-    """Return True when both routes belong to the same delivery corridor group."""
+# Actual destination STATE → outstation corridor. Used to group routes by their
+# REAL geography instead of a possibly-misleading route code. e.g. some
+# "NS04-->Port Dickson" DOs are actually delivered to Kuala Lipis, PAHANG — their
+# state (PAHANG) puts them with the Pahang run (PH03/PH04), not the Seremban run.
+_STATE_TO_CORRIDOR = {
+    "PAHANG":           "PH_INT",
+    "NEGERI SEMBILAN":  "NS",
+    "PERAK":            "PERAK",
+}
+
+
+def _norm_cust(c: str) -> str:
+    return re.sub(r'[^A-Z0-9 ]', '', str(c).upper()).strip()
+
+# Exception to Kuantan-independence: these specific customers' Kuantan (PH09)
+# DOs may ride with the TR02 / Kemaman run (Kuantan & Kemaman are adjacent on
+# the east coast). Treated as the Kemaman corridor, not independent Kuantan.
+_KUANTAN_TR02_MIX_CUSTOMERS = {
+    _norm_cust("GOLDEN HP AGENCY SDN BHD"),
+    _norm_cust("HASIL LAUTAN JUN KEE SDN. BHD."),
+}
+
+
+def _kemaman_ph09(route: str, customer: str) -> bool:
+    """True if this is a PH09/Kuantan DO for one of the special customers that
+    may mix with TR02/Kemaman."""
+    r = str(route).strip().upper()
+    return (r.startswith("PH09") or "KUANTAN" in r) \
+        and _norm_cust(customer) in _KUANTAN_TR02_MIX_CUSTOMERS
+
+
+def _is_kuantan(route: str, customer: str = "") -> bool:
+    """Kuantan (PH09) is a far east-coast run that must ALWAYS be independent —
+    it never shares a lorry with any non-Kuantan route. EXCEPTION: the two
+    special customers ride with TR02/Kemaman, so they are NOT flagged Kuantan."""
+    r = str(route).strip().upper()
+    if not (r.startswith("PH09") or "KUANTAN" in r):
+        return False
+    return not _kemaman_ph09(route, customer)
+
+
+def _state_corridor(state: str, route: str = "") -> str:
+    # KV (Klang Valley) routes are handled by city/urban bucketing — never let a
+    # border state (e.g. KV01A touching Perak at Tanjung Malim) reclassify them
+    # into a deep-outstation corridor. Only genuine outstation route codes use
+    # the state override.
+    if str(route).strip().upper().startswith("KV"):
+        return ""
+    return _STATE_TO_CORRIDOR.get(str(state).strip().upper(), "")
+
+
+def _prefix_corridor(route: str) -> str:
+    r = str(route).strip().upper()
+    for _name, _pfxs in _ROUTE_CORRIDOR_GROUPS.items():
+        if any(r.startswith(p) for p in _pfxs):
+            return _name
+    return ""
+
+
+def _same_corridor_group(route1: str, route2: str,
+                         state1: str = "", state2: str = "",
+                         cust1: str = "", cust2: str = "") -> bool:
+    """Return True when both routes belong to the same delivery corridor group.
+
+    When BOTH actual states are known outstation states, group purely by state
+    (so a mislabeled route rides the truck for its real geography). Otherwise
+    fall back to route-code corridor groups.
+    """
+    # Kuantan only ever groups with Kuantan — never with any other route
+    # (except the two special customers, handled as the KEMAMAN corridor below).
+    k1, k2 = _is_kuantan(route1, cust1), _is_kuantan(route2, cust2)
+    if k1 or k2:
+        return k1 and k2
+    # Special-customer PH09 rides with TR02 (both map to the KEMAMAN direction).
+    d1 = _direction_key(route1, state1, cust1)
+    d2 = _direction_key(route2, state2, cust2)
+    if d1 == "KEMAMAN" and d2 == "KEMAMAN":
+        return True
+    c1 = _state_corridor(state1, route1)
+    c2 = _state_corridor(state2, route2)
+    if c1 and c2:
+        return c1 == c2
     r1 = route1.strip().upper()
     r2 = route2.strip().upper()
     for pfxs in _ROUTE_CORRIDOR_GROUPS.values():
@@ -789,16 +869,29 @@ def _same_corridor_group(route1: str, route2: str) -> bool:
             return True
     return False
 
-def _direction_key(route: str) -> str:
+def _direction_key(route: str, state: str = "", customer: str = "") -> str:
     """Coarse outstation 'direction' for a route: the corridor-group name if the
     route belongs to one (PH_INT, KV_NORTH, NS, …), else the route code. Used to
     reserve one lorry per distinct outstation direction so the biggest direction
     (e.g. Pahang/Kuantan) does not consume every lorry and starve a smaller one
-    (e.g. the KV01A/KV02A northern run)."""
+    (e.g. the KV01A/KV02A northern run).
+
+    If the DO's actual state maps to a known outstation corridor, that wins over
+    the route-code prefix — so NS04-in-Pahang is directed with the Pahang run."""
     r = str(route).strip().upper()
-    for _name, _pfxs in _ROUTE_CORRIDOR_GROUPS.items():
-        if any(r.startswith(p) for p in _pfxs):
-            return _name
+    # Special-customer PH09 and any TR02 share the KEMAMAN direction (they may
+    # ride one east-coast lorry together).
+    if r.startswith("TR02") or _kemaman_ph09(route, customer):
+        return "KEMAMAN"
+    if _is_kuantan(route, customer):
+        return "KUANTAN"                 # its own reserved direction, always
+    sc = _state_corridor(state, route)
+    if sc:
+        return sc
+    r = str(route).strip().upper()
+    cg = _prefix_corridor(r)
+    if cg:
+        return cg
     _m = re.match(r"([A-Z]+\d+[A-Z]?)", r)
     return _m.group(1) if _m else r[:6]
 
@@ -2523,6 +2616,311 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
     ]
 
 
+# Slight-overload allowance for the rescue pass: a lorry may be filled up to
+# this fraction of its rated TON when the only alternative is leaving a DO
+# unassigned. 1.15 = up to 15% over. Mirrors the manual planner, who slightly
+# overloads small lorries rather than dropping urban DOs.
+SLIGHT_OVERLOAD = 1.20
+
+
+def _is_urban_do(it) -> bool:
+    """True if a DO is an urban delivery (Kuala Lumpur / Selangor).
+
+    Uses the engine's own destination classifier so it matches the rest of the
+    assignment logic: KV Klang-Valley routes count as urban (KL/SELANGOR),
+    while semi-outstation KV codes (e.g. KV01A Tanjung Malim → MEDIUM_LONG) and
+    all PH/NS/JH/PK routes count as outstation — regardless of a border row's
+    raw STATE value.
+    """
+    try:
+        grp = _classify_dest_group(str(it.get("ROUTE", "")),
+                                   str(it.get("STATE", "")))
+        return grp in _DEST_URBAN_GROUPS
+    except Exception:
+        st = str(it.get("STATE", "")).strip().upper()
+        return ("KUALA LUMPUR" in st) or ("SELANGOR" in st)
+
+
+def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
+    """Final safety net for URBAN DOs only.
+
+    Slight overload is allowed strictly for Kuala Lumpur / Selangor routes, and
+    only onto lorries that carry urban DOs (or are empty) — an urban DO is
+    NEVER added to a lorry that already carries an outstation route, so urban
+    and outstation are never mixed. Outstation DOs are left exactly as the main
+    assignment placed them (no overload, no reshuffling). Per-DO size caps
+    (MAX_TON) and forbidden plates are always respected. Only ever REDUCES the
+    unassigned count.
+    """
+    import re as _re
+    eng = sess.get("engine")
+    if eng is None:
+        return
+    try:
+        caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
+                for _, r in eng.eligible_lorries.iterrows()}
+    except Exception:
+        return
+    if not caps:
+        return
+    items = sess.get("items", []) or []
+
+    def _pfx(it):
+        m = _re.match(r'\s*([A-Z]{1,3}\d+[A-Z]?)', str(it.get("ROUTE", "")))
+        return m.group(1) if m else ""
+
+    load = {l: 0.0 for l in caps}
+    has_outstation = {l: False for l in caps}   # lorry carries a non-urban DO
+    lpts = {l: [] for l in caps}                 # urban (lat, lon, code) per lorry
+    for it in items:
+        l = it.get("LORRY")
+        if l in caps:
+            load[l] += it.get("WEIGHT", 0.0) or 0.0
+            if not _is_urban_do(it):
+                has_outstation[l] = True
+            _la, _lo = it.get("GPS_LAT"), it.get("GPS_LON")
+            if _la is not None and _lo is not None:
+                lpts[l].append((_la, _lo, _pfx(it)))
+
+    def _allowed(it, l):
+        mt = it.get("MAX_TON")
+        if mt is not None and caps[l] > mt + 1e-9:
+            return False
+        fp = it.get("FORBID_PLATES")
+        if fp and l in fp:
+            return False
+        return True
+
+    def _near_ok(it, l):
+        # Don't add an urban DO to a lorry that already carries a DIFFERENT
+        # urban route code more than _URBAN_MERGE_SPREAD away — no far mixing.
+        _la, _lo = it.get("GPS_LAT"), it.get("GPS_LON")
+        if _la is None or _lo is None:
+            return True
+        _c = _pfx(it)
+        for _pla, _plo, _pc in lpts[l]:
+            if _pc != _c and ((_la - _pla) ** 2 + (_lo - _plo) ** 2) ** 0.5 > _URBAN_MERGE_SPREAD:
+                return False
+        return True
+
+    def _place(it, l):
+        it["LORRY"] = l
+        sess["assigned"][it["DO NUMBER"]] = l
+        load[l] += it.get("WEIGHT", 0.0) or 0.0
+        _la, _lo = it.get("GPS_LAT"), it.get("GPS_LON")
+        if _la is not None and _lo is not None:
+            lpts[l].append((_la, _lo, _pfx(it)))
+
+    # Only urban DOs are eligible for the slight-overload rescue.
+    unplaced = [it for it in items
+                if it.get("LORRY") in ("NO_LORRY", "NO_ELIGIBLE_LORRY")
+                and _is_urban_do(it)]
+    unplaced.sort(key=lambda i: -(i.get("WEIGHT", 0.0) or 0.0))
+
+    rescued = 0
+    for it in unplaced:
+        w = it.get("WEIGHT", 0.0) or 0.0
+        # Target only lorries that carry NO outstation route (urban-only or
+        # empty) AND are geographically near this DO (no far urban mixing).
+        cands = [l for l in caps
+                 if _allowed(it, l) and not has_outstation[l] and _near_ok(it, l)]
+        # Tier 1 — fits within capacity (tightest fit first).
+        fit = [l for l in cands if load[l] + w <= caps[l] + 1e-9]
+        if fit:
+            _place(it, max(fit, key=lambda l: (load[l] + w) / caps[l]))
+            rescued += 1
+            continue
+        # Tier 2 — slight overload of an urban lorry (smallest resulting ratio).
+        ov = [l for l in cands if load[l] + w <= caps[l] * max_over + 1e-9]
+        if ov:
+            _place(it, min(ov, key=lambda l: (load[l] + w) / caps[l]))
+            rescued += 1
+            continue
+        # No urban lorry can take it (even slightly overloaded). Leave it
+        # unassigned rather than mix it onto an outstation lorry.
+
+    if rescued:
+        import logging as _rlog
+        _rlog.info("[OVERLOAD-RESCUE] placed %d urban DO(s) via slight overload.", rescued)
+
+
+def _urban_rebalance(sess, max_over: float = SLIGHT_OVERLOAD):
+    """Free a big lorry stuck with a lone small URBAN load by repacking all the
+    small-urban loads (plus that orphan) tightly onto the smaller lorries — like
+    a human planner putting KV10A+KV11A+KV12A on one small van instead of
+    leaving KV12A on a 15T truck.
+
+    Fully atomic: the repack is applied ONLY if EVERY pooled DO places on the
+    smaller lorries (within slight overload, size caps, forbidden plates, and
+    the urban distance rule, keeping each route code whole). So it can never
+    unassign a DO or create a far mix. One big lorry freed per call.
+    """
+    import math as _math
+    import re as _re
+    eng = sess.get("engine")
+    if eng is None:
+        return
+    try:
+        caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
+                for _, r in eng.eligible_lorries.iterrows()}
+    except Exception:
+        return
+    if not caps:
+        return
+    items = sess.get("items", []) or []
+
+    def _pfx(it):
+        m = _re.match(r'\s*([A-Z]{1,3}\d+[A-Z]?)', str(it.get("ROUTE", "")))
+        return m.group(1) if m else ""
+
+    from collections import defaultdict as _dd
+
+    def _state():
+        on = _dd(list); load = _dd(float); has_out = _dd(bool)
+        for it in items:
+            l = it.get("LORRY")
+            if l in caps:
+                on[l].append(it)
+                load[l] += it.get("WEIGHT", 0.0) or 0.0
+                if not _is_urban_do(it):
+                    has_out[l] = True
+        return on, load, has_out
+
+    def _centroid(_its):
+        la = [x.get("GPS_LAT") for x in _its if x.get("GPS_LAT") is not None]
+        lo = [x.get("GPS_LON") for x in _its if x.get("GPS_LON") is not None]
+        return (sum(la) / len(la), sum(lo) / len(lo)) if la else None
+
+    on, load, has_out = _state()
+    for L in sorted(caps, key=lambda x: -caps[x]):
+        if load.get(L, 0.0) <= 1e-9 or has_out[L]:
+            continue                                   # empty or outstation
+        if load[L] > caps[L] * 0.5:
+            continue                                   # not under-used
+        L_items = list(on[L])
+        L_w = load[L]
+        L_cent = _centroid(L_items)
+        L_codes = {_pfx(x) for x in L_items}
+        L_mt = min((x["MAX_TON"] for x in L_items if x.get("MAX_TON") is not None), default=None)
+        L_fb = set()
+        for x in L_items:
+            if x.get("FORBID_PLATES"):
+                L_fb |= x["FORBID_PLATES"]
+        # Move the whole small load onto a NEAR urban lorry that has room, so the
+        # big lorry is freed. Prefer the tightest such target.
+        cand = []
+        for m in caps:
+            if m == L or has_out[m] or load.get(m, 0.0) <= 1e-9:
+                continue                               # only onto a used urban lorry
+            if m in L_fb:
+                continue
+            if L_mt is not None and caps[m] > L_mt + 1e-9:
+                continue
+            if load[m] + L_w > caps[m] * max_over + 1e-9:
+                continue                               # no room even overloaded
+            # No far mix: the MAX pairwise distance between any two different
+            # urban route codes on the COMBINED lorry must stay within the
+            # guard (centroid-to-centroid is too loose for a wide cluster).
+            comb = [(x.get("GPS_LAT"), x.get("GPS_LON"), _pfx(x))
+                    for x in (on[m] + L_items)
+                    if x.get("GPS_LAT") is not None and _is_urban_do(x)]
+            _far_mix = False
+            for _a in range(len(comb)):
+                for _b in range(_a + 1, len(comb)):
+                    if comb[_a][2] != comb[_b][2] and _math.hypot(
+                            comb[_a][0] - comb[_b][0], comb[_a][1] - comb[_b][1]) > _URBAN_MERGE_SPREAD:
+                        _far_mix = True
+                        break
+                if _far_mix:
+                    break
+            if _far_mix:
+                continue
+            cand.append(m)
+        if not cand:
+            continue
+        tgt = min(cand, key=lambda m: caps[m])         # tightest fit
+        for x in L_items:
+            x["LORRY"] = tgt
+            sess["assigned"][x["DO NUMBER"]] = tgt
+        import logging as _rlog
+        _rlog.info("[URBAN-REBALANCE] moved %s's load to %s (freed the big lorry).", L, tgt)
+        return                                         # one per call
+
+
+def _downsize_lorries(sess):
+    """Reduce wasted capacity: if a used lorry's whole load would fit on a
+    SMALLER idle lorry, move it there and free the bigger one — so e.g. a lone
+    10T load stops rolling out on a 22T truck when an ~11T truck is idle.
+
+    Moves a lorry's entire DO group intact to an empty lorry, so directions are
+    never mixed and nothing becomes unassigned. Per-DO size caps and forbidden
+    plates are respected. Purely cosmetic w.r.t. what gets delivered — it only
+    right-sizes the truck used.
+    """
+    eng = sess.get("engine")
+    if eng is None:
+        return
+    try:
+        caps = {str(r["LORRY"]).strip().upper(): float(r["TON"])
+                for _, r in eng.eligible_lorries.iterrows()}
+    except Exception:
+        return
+    if not caps:
+        return
+    items = sess.get("items", []) or []
+
+    from collections import defaultdict as _dd
+    on = _dd(list)
+    for it in items:
+        l = it.get("LORRY")
+        if l in caps:
+            on[l].append(it)
+    load = {l: sum((x.get("WEIGHT", 0.0) or 0.0) for x in v) for l, v in on.items()}
+    used = set(on.keys())
+
+    def _fits_all(dos, l):
+        for x in dos:
+            mt = x.get("MAX_TON")
+            if mt is not None and caps[l] > mt + 1e-9:
+                return False
+            fp = x.get("FORBID_PLATES")
+            if fp and l in fp:
+                return False
+        return True
+
+    moved = 0
+    # Tackle the biggest (most wasteful) lorries first.
+    for l in sorted(list(used), key=lambda x: -caps[x]):
+        dos = on.get(l)
+        if not dos:
+            continue
+        L = load[l]
+        # Smallest idle lorry that (a) still holds the load within capacity and
+        # (b) is genuinely smaller than the current lorry.
+        idle = [m for m in caps
+                if m not in used
+                and caps[m] + 1e-9 >= L
+                and caps[m] < caps[l] - 1e-9
+                and _fits_all(dos, m)]
+        if not idle:
+            continue
+        tgt = min(idle, key=lambda m: caps[m])
+        for x in dos:
+            x["LORRY"] = tgt
+            sess["assigned"][x["DO NUMBER"]] = tgt
+        used.discard(l)
+        used.add(tgt)
+        on[tgt] = dos
+        on[l] = []
+        load[tgt] = L
+        load[l] = 0.0
+        moved += 1
+
+    if moved:
+        import logging as _rlog
+        _rlog.info("[DOWNSIZE] right-sized %d lorry load(s) onto smaller trucks.", moved)
+
+
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         # Keep the raw upload so "assign off-schedule DOs" (YES) can re-run the
@@ -2867,7 +3265,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 return "9999-99-99"
             raw_d = str(it.get("DATE", "")).strip()
             try:
-                _ts = pd.to_datetime(raw_d, dayfirst=True, errors="coerce")
+                _ts = pd.to_datetime(raw_d, dayfirst=True, errors="coerce", format="mixed")
                 if pd.notna(_ts):
                     return _ts.strftime("%Y-%m-%d")
             except Exception:
@@ -3004,9 +3402,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if lorry and lorry not in (None,) and re.match(r'^[A-Z]{1,3}\d', lorry.strip().upper()):
                 continue
             _rt_key = it["ROUTE"].strip().upper()
+            # Special-customer PH09 rides the Kemaman run — bucket it apart from
+            # ordinary Kuantan so it can group with TR02 instead.
+            if _kemaman_ph09(it.get("ROUTE", ""), it.get("CUSTOMER NAME", "")):
+                _rt_key = _rt_key + "@KMN"
             _st_key = it.get("STATE", "")
             _ct_key = it.get("CITY", "").strip().upper()
-            dest_grp = _classify_dest_group(_rt_key, _st_key)
+            dest_grp = _classify_dest_group(it["ROUTE"].strip().upper(), _st_key)
 
             # Geographic sub-bucketing — applies to ALL routes.
             # Primary key: state (identifies destination region).
@@ -3054,6 +3456,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
         for _bk in list(route_buckets.keys()):
             _bare_rt = _bk.split("||")[0]
             _pfx = _extract_route_prefix(_bare_rt)
+            # Keep special-customer PH09 (@KMN) in its own prefix group so it is
+            # never re-merged with ordinary Kuantan.
+            if "@KMN" in _bare_rt:
+                _pfx = (_pfx or "") + "@KMN"
             if _pfx:
                 _pfx_to_keys.setdefault(_pfx, []).append(_bk)
         for _pfx, _bkeys in _pfx_to_keys.items():
@@ -3247,7 +3653,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 <= _MAX_CITY_MERGE_KM_OUTSTATION
                             )
 
-                _corridor_merge = _same_corridor_group(base_route, cand_route)
+                _corridor_merge = _same_corridor_group(
+                    base_route, cand_route, _st_base, _st_cand,
+                    base_bucket[0].get("CUSTOMER NAME", ""),
+                    cand_bucket[0].get("CUSTOMER NAME", ""))
                 _urban_prox_merge = _geo_close
 
                 # ── Priority-ordered merge rules (per user request) ───────────
@@ -3620,7 +4029,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _dg = _classify_dest_group(_it.get("ROUTE", ""), _it.get("STATE", ""))
             if _dg in _DEST_URBAN_GROUPS:
                 continue                            # urban → no reservation
-            _dir_weight[_direction_key(_it.get("ROUTE", ""))] += _it["WEIGHT"]
+            _dir_weight[_direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""), _it.get("CUSTOMER NAME", ""))] += _it["WEIGHT"]
         if len(_dir_weight) > 1:                     # only when directions compete
             _res_excl = sess["unavailable"] | get_assigned_today()
             _res_avail = sorted(
@@ -3754,25 +4163,44 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _route_code_of,
                         lambda _it: (_it.get("GPS_LAT"), _it.get("GPS_LON")),
                         lambda _it: _it.get("CODE", ""))
-                    _hs_comps.sort(key=lambda c: (
-                        _route_code_of(c[0]),
-                        -sum(x["WEIGHT"] for x in c)))
+                    # Keep each ROUTE CODE whole across the split (operator rule:
+                    # same route code → same lorry) — but ONLY when the whole code
+                    # fits a lorry. A route code heavier than one lorry is split
+                    # back into its atomic components so the fill always makes
+                    # progress (otherwise recursing on an oversized whole chunk
+                    # would never terminate).
+                    _cap_lim = _cap1 * NAIK_FACTOR
+                    _by_code: dict = {}
+                    for _cl in _hs_comps:
+                        _by_code.setdefault(_route_code_of(_cl[0]), []).append(_cl)
+                    _units: list = []               # each unit = list of items
+                    for _code, _comps in _by_code.items():
+                        _flat = [x for c in _comps for x in c]
+                        if sum(x["WEIGHT"] for x in _flat) <= _cap_lim:
+                            _units.append(_flat)    # whole route code, kept together
+                        else:
+                            _units.extend(_comps)   # too big — split into components
+                    _units.sort(key=lambda u: -sum(x["WEIGHT"] for x in u))
                     half_a, half_b = [], []
                     _fill_w = 0.0
-                    for _cl in _hs_comps:
-                        _cw = sum(x["WEIGHT"] for x in _cl)
-                        if _fill_w + _cw <= _cap1 * NAIK_FACTOR or not half_a:
-                            half_a.extend(_cl)
-                            _fill_w += _cw
+                    for _u in _units:
+                        _uw = sum(x["WEIGHT"] for x in _u)
+                        if _fill_w + _uw <= _cap_lim or not half_a:
+                            half_a.extend(_u)
+                            _fill_w += _uw
                         else:
-                            half_b.extend(_cl)
-                    _assign_group(half_a)
-                    _assign_group(half_b)
-                    # Propagate back to _all_group items that were pre-filtered NO_LORRY
-                    for it in _all_group:
-                        if it.get("LORRY") == "NO_LORRY":
-                            sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
-                    return
+                            half_b.extend(_u)
+                    # Only recurse when BOTH halves are non-empty (a real split);
+                    # otherwise the split made no progress — fall through to the
+                    # normal single-lorry / multi-lorry path to avoid infinite
+                    # recursion on an indivisible oversized unit.
+                    if half_a and half_b:
+                        _assign_group(half_a)
+                        _assign_group(half_b)
+                        for it in _all_group:
+                            if it.get("LORRY") == "NO_LORRY":
+                                sess["assigned"][it["DO NUMBER"]] = "NO_LORRY"
+                        return
                 # else: weight fits one lorry — fall through to normal single-lorry path
 
             total_w  = sum(it["WEIGHT"] for it in group_items)
@@ -3942,7 +4370,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
             # for ITS OWN direction, or any unreserved lorry.
             _reserve_excl: set = set()
             if _reserved_lorry:
-                _grp_dir = _direction_key(route)
+                _grp_dir = _direction_key(route,
+                    group_items[0].get("STATE", "") if group_items else "",
+                    group_items[0].get("CUSTOMER NAME", "") if group_items else "")
                 _reserve_excl = {p for p, dk in _reserved_lorry.items()
                                  if dk != _grp_dir}
                 if _reserve_excl:
@@ -5864,7 +6294,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if (_it.get("LORRY") in _lorry_cap_map
                     and _classify_dest_group(_it.get("ROUTE", ""),
                                              _it.get("STATE", "")) not in _DEST_URBAN_GROUPS):
-                _out_routes.setdefault(_direction_key(_it.get("ROUTE", "")), []).append(_it)
+                _out_routes.setdefault(_direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""), _it.get("CUSTOMER NAME", "")), []).append(_it)
         for _dir, _rits in _out_routes.items():
             _lset = {x["LORRY"] for x in _rits}
             if len(_lset) < 2:
@@ -5899,7 +6329,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 # must be in the SAME direction and form one geo cluster with it.
                 _other_items = [y for y in items
                                 if y.get("LORRY") == _cand and id(y) not in _rits_ids]
-                if any(_direction_key(y.get("ROUTE", "")) != _dir for y in _other_items):
+                if any(_direction_key(y.get("ROUTE", ""), y.get("STATE", ""), y.get("CUSTOMER NAME", "")) != _dir for y in _other_items):
                     return False
                 _other = [_pt_of(y) for y in _other_items if _pt_of(y)]
                 _add = [_pt_of(x) for x in _rits if _pt_of(x)]
@@ -5958,7 +6388,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     return False
                 # empty lorry, or one already holding ONLY this corridor — never
                 # mix a different direction (urban, or another outstation corridor).
-                _cand_dirs = {_direction_key(y.get("ROUTE", "")) for y in items
+                _cand_dirs = {_direction_key(y.get("ROUTE", ""), y.get("STATE", ""), y.get("CUSTOMER NAME", "")) for y in items
                               if y.get("LORRY") == _cand and id(y) not in _cids_all}
                 if _cand_dirs and _cand_dirs != {_dir}:
                     return False
@@ -6256,7 +6686,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _classify_dest_group(_it.get("ROUTE", ""),
                                     _it.get("STATE", "")) not in _DEST_URBAN_GROUPS:
                 return None
-            _dk = _direction_key(_it.get("ROUTE", ""))
+            _dk = _direction_key(_it.get("ROUTE", ""), _it.get("STATE", ""), _it.get("CUSTOMER NAME", ""))
             return _dk if _dk in _corridor_names else None
 
         _tc_phys: dict[str, float] = defaultdict(float)
@@ -6314,6 +6744,47 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 if _free <= 0.05:
                     break
 
+        # ── Final geo-cleanup — no far urban mixing ───────────────────────────
+        # After every top-up/spillover, enforce the urban spread rule one last
+        # time so nothing slips a far drop onto the wrong lorry: on any lorry,
+        # two DIFFERENT urban route codes may not sit more than
+        # _URBAN_MERGE_SPREAD apart. Detach the lighter offending route code to
+        # NO_LORRY (the overload-rescue that runs next re-homes it on a NEAR
+        # lorry, or it stays unassigned rather than ride a far-away truck).
+        # A single route code spanning several towns is never split (only
+        # DIFFERENT codes are compared).
+        def _cleanup_far_urban():
+            for _l in list(_lorry_cap_map):
+                for _guard in range(20):                 # bounded refinement
+                    _lit = [x for x in items if x.get("LORRY") == _l]
+                    _upts = [(x, _pt_of(x)) for x in _lit if _pt_of(x)]
+                    _upts = [(x, p) for x, p in _upts
+                             if p[3] in _URBAN_COMPATIBLE_STATES]
+                    _worst, _pair = 0.0, None
+                    for _a in range(len(_upts)):
+                        for _b in range(_a + 1, len(_upts)):
+                            _pa, _pb = _upts[_a][1], _upts[_b][1]
+                            if _pa[2] != _pb[2]:
+                                _dd = _geo_deg(_pa[:2], _pb[:2])
+                                if _dd > _worst:
+                                    _worst, _pair = _dd, (_pa[2], _pb[2])
+                    if _pair is None or _worst <= _URBAN_MERGE_SPREAD:
+                        break
+                    _ra, _rb = _pair
+                    _wa = sum(x["WEIGHT"] for x in _lit if _route_code_of(x) == _ra)
+                    _wb = sum(x["WEIGHT"] for x in _lit if _route_code_of(x) == _rb)
+                    _drop = _ra if _wa <= _wb else _rb
+                    for x in _lit:
+                        if _route_code_of(x) == _drop:
+                            x["LORRY"] = "NO_LORRY"
+                            sess["assigned"][x["DO NUMBER"]] = "NO_LORRY"
+                            _unassigned_reasons[x["DO NUMBER"]] = "GEO_FAR_URBAN"
+        try:
+            _cleanup_far_urban()
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[GEO-CLEANUP] skipped: %s", _e)
+
         # ── RULES-COMPLIANCE GATE (ASSIGNMENT_RULES.md / DO_BOT_SKILL.md §A) ───
         # Final deterministic audit: every assigned DO must obey the HARD rules.
         # Any violation is corrected (the DO is unassigned → NO_LORRY) and logged,
@@ -6362,6 +6833,42 @@ def _handle_excel_upload(phone, sess, file_bytes):
                           len(_audit_viol), "; ".join(_audit_viol[:20]))
         else:
             print(f"[RULES-AUDIT] OK — all assignments comply with the hard rules.")
+
+        # ── Slight-overload rescue: place any capacity-stranded DOs the way a
+        # human planner does (slight overload of small lorries, and reserving a
+        # big lorry for a big DO) rather than leaving them unassigned. ────────
+        try:
+            _overload_rescue(sess)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[OVERLOAD-RESCUE] skipped: %s", _e)
+
+        # ── Right-size trucks: move a light load off a big lorry onto a
+        # smaller idle one so big trucks don't roll out half-empty. ──────────
+        try:
+            _downsize_lorries(sess)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[DOWNSIZE] skipped: %s", _e)
+
+        # ── Urban rebalance: free a big lorry stuck with a lone small urban
+        # load by repacking small-urban loads onto the smaller lorries. ──────
+        try:
+            _urban_rebalance(sess)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[URBAN-REBALANCE] skipped: %s", _e)
+
+        # ── Global optimizer (OFF by default; OPTIMIZER_ENABLED=1 to try) ─────
+        # When enabled it replaces the greedy result with the CP-SAT plan; on
+        # any problem it returns False and the greedy result above stands.
+        try:
+            import optimizer_bridge as _optb
+            if _optb.optimizer_enabled():
+                _optb.run_optimizer(sess, _is_urban_do, _is_kuantan)
+        except Exception as _e:
+            import logging as _rlog
+            _rlog.warning("[OPTIMIZER] skipped, keeping greedy result: %s", _e)
 
         # ── (legacy for-loop removed — replaced by _assign_one above) ────────
         # The block below was the old heaviest-first loop.  Keep a dummy

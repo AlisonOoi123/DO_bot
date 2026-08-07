@@ -24,3 +24,4 @@ Thumbs.db
 
 # Log files (keep the directory via logs/.gitkeep)
 logs/*.log
+data/credentials.xlsx

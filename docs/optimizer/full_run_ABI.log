@@ -1,0 +1,7 @@
+=== ABI: 215 days (202 single-trip-feasible) ===
+rule violations total: 2
+on feasible days: opt fully-assigned = 135/202
+  avg lorries: manual 11.0 vs optim 9.4
+  avg util:    manual 101% vs optim 81%
+days needing >single-trip capacity (manual used 2nd trips): 13
+wrote docs/optimizer/shadow_ABI.json
