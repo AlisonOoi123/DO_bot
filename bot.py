@@ -2917,6 +2917,97 @@ def _downsize_lorries(sess):
         _rlog.info("[DOWNSIZE] right-sized %d lorry load(s) onto smaller trucks.", moved)
 
 
+def reassign_unassigned(sess, plates: list) -> dict:
+    """Assign still-unassigned (NO_LORRY) DOs onto the given available lorry
+    plates — best-fit-decreasing (heaviest DO first, tightest-fitting plate
+    wins) — WITHOUT re-uploading, since the items are already in sess["items"].
+    Enforces the same hard rules as normal assignment: eligible fleet, strict
+    route exclusions, forbidden plates, capacity (+naik), outstation minimum
+    tonnage, REMARKS/SHIP size cap, and destination-state compatibility.
+
+    Returns a summary dict for the caller (web/whatsapp) to display.
+    """
+    engine = sess.get("engine")
+    if engine is None:
+        return {"error": "no_engine", "assigned": 0}
+    items = sess.get("items", []) or []
+    no_lorry = [it for it in items
+                if it.get("LORRY") in ("NO_LORRY", "NO_ELIGIBLE_LORRY")]
+    total = len(no_lorry)
+    if not no_lorry:
+        return {"assigned": 0, "total": 0, "still": [], "used": [], "skipped": []}
+
+    # The user is telling us which lorries are NOW free — so accept ANY of their
+    # own lorries (owner + SPARE), including ones that were Blocked at upload
+    # time (they're overriding that). Only reject a lorry genuinely taken by
+    # ANOTHER user today.
+    _me = str(sess.get("user_id", "")).strip().upper()
+    _fleet_df = getattr(engine, "all_lorries", engine.eligible_lorries)
+    cap_map = {}
+    for _, r in _fleet_df.iterrows():
+        _u = str(r.get("USER", "")).strip().upper()
+        if _u in (_me, "SPARE"):
+            cap_map[str(r["LORRY"]).strip().upper()] = float(r["TON"])
+    known = set(cap_map)
+    given = [str(p).strip().upper() for p in (plates or []) if str(p).strip()]
+    _taken_by_other = {p for p, u in get_assigned_by().items() if u != _me}
+    avail = [p for p in given if p in known and p not in _taken_by_other]
+    skipped = [p for p in given if p not in known or p in _taken_by_other]
+    if not avail:
+        return {"assigned": 0, "total": total, "still": [], "used": [],
+                "skipped": skipped, "error": "no_available_plates"}
+
+    load = {p: 0.0 for p in avail}
+    states = {p: set() for p in avail}
+    reasons = sess.setdefault("unassigned_reasons", {})
+    done, still = [], []
+    for it in sorted(no_lorry, key=lambda x: -(x.get("WEIGHT", 0.0) or 0.0)):
+        w = it.get("WEIGHT", 0.0) or 0.0
+        route = it.get("ROUTE", "")
+        st = str(it.get("STATE", "")).strip().upper()
+        dest = _classify_dest_group(route, st)
+        strict = _strict_route_excl(route)
+        forbid = it.get("FORBID_PLATES") or set()
+        cands = []
+        for p in avail:
+            if p in strict or p in forbid:
+                continue
+            cap = cap_map.get(p, 0.0)
+            if cap * NAIK_FACTOR - load[p] < w:
+                continue
+            if cap < _eff_dest_min_ton(route, dest, load[p] + w):
+                continue
+            if it.get("MAX_TON") is not None and cap > it["MAX_TON"]:
+                continue
+            if st and states[p] and not any(_states_compatible(st, s) for s in states[p]):
+                continue
+            cands.append((cap * NAIK_FACTOR - load[p], p))
+        if not cands:
+            still.append(it)
+            reasons[it["DO NUMBER"]] = "NO_FIT_ON_GIVEN_PLATES"
+            continue
+        cands.sort()                      # tightest remaining fit first
+        chosen = cands[0][1]
+        it["LORRY"] = chosen
+        load[chosen] += w
+        if st:
+            states[chosen].add(st)
+        sess["assigned"][it["DO NUMBER"]] = chosen
+        reasons.pop(it["DO NUMBER"], None)
+        done.append(it)
+
+    for do in sess.get("pending_dos", []):
+        do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
+
+    return {
+        "assigned": len(done), "total": total,
+        "used": sorted({it["LORRY"] for it in done}),
+        "skipped": skipped,
+        "still": [{"do": str(x["DO NUMBER"]), "route": x.get("ROUTE", ""),
+                   "weight": round(x.get("WEIGHT", 0.0) or 0.0, 3)} for x in still],
+    }
+
+
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
         # Keep the raw upload so "assign off-schedule DOs" (YES) can re-run the
