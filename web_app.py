@@ -185,7 +185,10 @@ def _result_json(sess) -> dict:
             continue
         grp = lorries.setdefault(lorry, {
             "lorry": lorry,
-            "capacity": caps.get(str(lorry).strip().upper()),
+            # full_caps (not caps) so a cross-owner plate assigned via the
+            # manual box (assign_specific_dos) still shows its true capacity/
+            # utilisation instead of "—" just because it's not this user's own.
+            "capacity": full_caps.get(str(lorry).strip().upper()),
             "load": 0.0,
             "dos": [],
         })
@@ -262,12 +265,16 @@ def logout():
 
 @app.route("/api/state")
 def api_state():
+    """Current session snapshot — also used to restore the Result screen
+    after a real browser refresh (or an explicit Refresh button click),
+    since the assignment itself lives in the server session, not the page."""
     sid = _sid()
     sess = bot.get_session(sid)
     return _with_cookie({
         "state": sess.get("state", "IDLE"),
         "user": sess.get("user_id"),
         "email": sess.get("_email"),
+        "result": _result_json(sess) if sess.get("items") else None,
     }, sid)
 
 
@@ -788,7 +795,10 @@ _PAGE = r"""<!doctype html>
       </div>
     </div>
 
-    <button class="btn secondary" id="btn-restart" style="margin-top:14px">Start over</button>
+    <div class="row" style="margin-top:14px">
+      <button class="btn secondary" id="btn-refresh">🔄 Refresh</button>
+      <button class="btn secondary" id="btn-restart">Start over</button>
+    </div>
   </div>
 
   <div class="foot">Same assignment engine as the WhatsApp bot · works on phone &amp; desktop</div>
@@ -1031,9 +1041,23 @@ $('#manual-plate').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preve
 
 $('#btn-restart').onclick=()=>goTo('login');
 
-// Show who is logged in (from the auth session).
+async function doRefresh(){
+  const d=await (await fetch('/api/state')).json();
+  if(d && d.result){ renderResult(d.result); }
+}
+$('#btn-refresh').onclick=doRefresh;
+
+// Show who is logged in, and — if this session already has an active
+// assignment (e.g. after a real browser refresh, not just our own
+// Refresh button) — restore the Result screen instead of dumping the
+// user back to Step 1 and losing sight of what was just assigned.
 fetch('/api/state').then(r=>r.json()).then(d=>{
   if(d && d.email){ document.getElementById('who').textContent = d.email; }
+  if(d && d.result){
+    hideAll();
+    renderResult(d.result);
+    show('#card-result', true);
+  }
 }).catch(()=>{});
 
 wireBackButtons();
