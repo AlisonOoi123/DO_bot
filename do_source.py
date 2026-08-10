@@ -29,9 +29,6 @@ import urllib.parse
 
 import pandas as pd
 from sqlalchemy import create_engine
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
 CONFIG_PATH = os.environ.get(
     "DO_DB_CONFIG_PATH",
@@ -255,74 +252,10 @@ def fetch_delivery_report(config_path: str = None) -> pd.DataFrame:
 
 
 def report_to_xlsx_bytes(report_df: pd.DataFrame) -> bytes:
-    """Render report_df to styled .xlsx bytes — same formatting as
-    generate_script.py's Delivery_Report.xlsx, minus the on-disk save."""
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Delivery Report"
-    ws.views.sheetView[0].showGridLines = True
-
-    header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    data_font = Font(name="Segoe UI", size=9)
-    total_font = Font(name="Segoe UI", size=10, bold=True, color="000000")
-
-    thin_border = Border(
-        left=Side(style='thin', color='D9D9D9'),
-        right=Side(style='thin', color='D9D9D9'),
-        top=Side(style='thin', color='D9D9D9'),
-        bottom=Side(style='thin', color='D9D9D9'),
-    )
-    double_bottom_border = Border(
-        top=Side(style='thin', color='000000'),
-        bottom=Side(style='double', color='000000'),
-    )
-
-    headers = list(report_df.columns)
-    ws.append(headers)
-    for col_num, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_num)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for row in report_df.itertuples(index=False):
-        ws.append(list(row))
-
-    for row_num in range(2, len(report_df) + 2):
-        for col_num in range(1, len(headers) + 1):
-            cell = ws.cell(row=row_num, column=col_num)
-            cell.font = data_font
-            cell.border = thin_border
-            header_name = headers[col_num - 1]
-            if header_name in ('GROSS WEIGHT', 'DISTANCE', 'LONGITUD'):
-                cell.number_format = '#,##0.00'
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            elif header_name in ('NO', 'SITE', 'POSTCODE', 'VALIDATED', 'DATE', 'ETD'):
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            else:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-
-    total_row_idx = len(report_df) + 2
-    ws.cell(row=total_row_idx, column=7, value="TOTAL:").font = total_font
-    ws.cell(row=total_row_idx, column=7).alignment = Alignment(horizontal="right")
-
-    gross_weight_col_idx = headers.index('GROSS WEIGHT') + 1
-    gross_weight_col_letter = get_column_letter(gross_weight_col_idx)
-    total_cell = ws.cell(row=total_row_idx, column=gross_weight_col_idx)
-    total_cell.value = f"=SUM({gross_weight_col_letter}2:{gross_weight_col_letter}{total_row_idx - 1})"
-    total_cell.font = total_font
-    total_cell.number_format = '#,##0.00'
-    total_cell.border = double_bottom_border
-
-    for col in ws.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            if cell.value:
-                max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
-
+    """Render report_df to plain .xlsx bytes — no styling, no TOTAL row, just
+    the data with a header row and default column widths. Matches the plain
+    look of the file this replaces (no custom formatting applied)."""
     buf = io.BytesIO()
-    wb.save(buf)
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        report_df.to_excel(writer, index=False, sheet_name="Delivery Report")
     return buf.getvalue()
