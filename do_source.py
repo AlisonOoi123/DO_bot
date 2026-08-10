@@ -17,9 +17,8 @@ both deliberate:
 Configuration: a JSON file with {server, database, username, password,
 driver} — see configrd.json. NEVER commit this file; it holds a real
 production DB password (already gitignored). Path is read from the
-DO_DB_CONFIG_PATH env var, defaulting to the same path generate_script.py
-already uses (C:\\py01\\lori\\configrd.json), so an existing setup needs
-no extra configuration.
+DO_DB_CONFIG_PATH env var; if unset, defaults to configrd.json sitting
+right next to this file (i.e. in the DO_bot folder itself).
 """
 from __future__ import annotations
 
@@ -34,7 +33,9 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-CONFIG_PATH = os.environ.get("DO_DB_CONFIG_PATH", r"C:\py01\lori\configrd.json")
+CONFIG_PATH = os.environ.get(
+    "DO_DB_CONFIG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "configrd.json"))
 SCHEMA_NAME = "ENGSHENG"
 
 # SQL's ISNULL(d.ZETD_0, '1753-01-01') fallback for a DO with no real ETD

@@ -845,6 +845,25 @@ _PAGE = r"""<!doctype html>
         <tbody id="master-grid-rows"></tbody>
       </table>
     </div>
+
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+      <p style="font-size:13px;color:var(--muted);margin:0 0 8px">+ Add a lorry not on this list (today only):</p>
+      <div class="row">
+        <input id="new-lorry-plate" type="text" placeholder="Plate (e.g. ABC1234)"
+               style="flex:1 1 130px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--ink)">
+        <input id="new-lorry-ton" type="number" step="0.001" placeholder="Ton"
+               style="flex:1 1 90px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--ink)">
+        <input id="new-lorry-oriuser" type="text" placeholder="Ori. User"
+               style="flex:1 1 110px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--ink)">
+        <select id="new-lorry-user" style="flex:1 1 110px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--ink)"></select>
+        <select id="new-lorry-status" style="flex:1 1 110px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--ink)">
+          <option value="AVAILABLE">AVAILABLE</option><option value="BLOCK">BLOCK</option>
+        </select>
+        <button class="btn secondary" id="btn-add-lorry" style="flex:0 0 auto;width:auto">+ Add</button>
+      </div>
+      <div class="msg hidden" id="add-lorry-msg"></div>
+    </div>
+
     <div class="row" style="margin-top:14px">
       <button class="btn back" data-back="login">← Back</button>
       <button class="btn" id="btn-master-next" style="flex:0 0 auto;width:auto">Next →</button>
@@ -1022,26 +1041,47 @@ function wireDrop(dropId,inputId,onFile){
 
 // ---- Step 2: master lorry grid (editable, no upload) ----
 const STATUS_OPTS=['AVAILABLE','BLOCK'];
+function masterUserOpts(){ return validUsers.length ? validUsers : [selUser]; }
+function masterRowHtml(r){
+  const userOpts=masterUserOpts();
+  const userSelect = userOpts.map(u=>`<option value="${esc(u)}" ${u===r.user?'selected':''}>${esc(u)}</option>`).join('');
+  const statusSelect = STATUS_OPTS.map(s=>`<option value="${esc(s)}" ${s===r.status?'selected':''}>${esc(s)}</option>`).join('');
+  return `<tr data-lorry="${esc(r.lorry)}" data-ton="${r.ton!=null?r.ton:''}">`+
+         `<td>${esc(r.lorry)}</td>`+
+         `<td class="w">${r.ton!=null?Number(r.ton).toFixed(2):'—'}</td>`+
+         `<td>${esc(r.ori_user||'')}</td>`+
+         `<td><select class="mg-user">${userSelect}</select></td>`+
+         `<td><select class="mg-status">${statusSelect}</select></td>`+
+         `</tr>`;
+}
 async function loadMasterGrid(){
   setMsg('#master-msg','Loading today\'s lorries… ',false);
   const d=await (await fetch('/api/master-default')).json();
   if(d.error){ setMsg('#master-msg', d.error, true); return; }
   setMsg('#master-msg', null);
-  const userOpts = validUsers.length ? validUsers : [selUser];
-  let html='';
-  (d.rows||[]).forEach((r,i)=>{
-    const userSelect = userOpts.map(u=>`<option value="${esc(u)}" ${u===r.user?'selected':''}>${esc(u)}</option>`).join('');
-    const statusSelect = STATUS_OPTS.map(s=>`<option value="${esc(s)}" ${s===r.status?'selected':''}>${esc(s)}</option>`).join('');
-    html+=`<tr data-lorry="${esc(r.lorry)}" data-ton="${r.ton!=null?r.ton:''}">`+
-          `<td>${esc(r.lorry)}</td>`+
-          `<td class="w">${r.ton!=null?r.ton.toFixed(2):'—'}</td>`+
-          `<td>${esc(r.ori_user)}</td>`+
-          `<td><select class="mg-user">${userSelect}</select></td>`+
-          `<td><select class="mg-status">${statusSelect}</select></td>`+
-          `</tr>`;
-  });
-  $('#master-grid-rows').innerHTML=html;
+  $('#master-grid-rows').innerHTML=(d.rows||[]).map(masterRowHtml).join('');
+  const userOpts=masterUserOpts();
+  $('#new-lorry-user').innerHTML=userOpts.map(u=>`<option value="${esc(u)}">${esc(u)}</option>`).join('');
 }
+
+function addLorryRow(){
+  const plate=($('#new-lorry-plate').value||'').trim().toUpperCase();
+  const tonRaw=$('#new-lorry-ton').value;
+  const ton=tonRaw!=='' ? parseFloat(tonRaw) : NaN;
+  if(!plate){ setMsg('#add-lorry-msg','Enter a plate number.',true); return; }
+  if(isNaN(ton) || ton<=0){ setMsg('#add-lorry-msg','Enter a valid Ton (> 0).',true); return; }
+  const existing=[...document.querySelectorAll('#master-grid-rows tr')].map(tr=>tr.dataset.lorry);
+  if(existing.includes(plate)){ setMsg('#add-lorry-msg',`${plate} is already in the list above.`,true); return; }
+  setMsg('#add-lorry-msg', null);
+  $('#master-grid-rows').insertAdjacentHTML('beforeend', masterRowHtml({
+    lorry: plate, ton: ton,
+    ori_user: ($('#new-lorry-oriuser').value||'').trim().toUpperCase(),
+    user: $('#new-lorry-user').value,
+    status: $('#new-lorry-status').value,
+  }));
+  $('#new-lorry-plate').value=''; $('#new-lorry-ton').value=''; $('#new-lorry-oriuser').value='';
+}
+$('#btn-add-lorry').onclick=addLorryRow;
 
 async function submitMasterGrid(){
   const rows=[...document.querySelectorAll('#master-grid-rows tr')].map(tr=>({
