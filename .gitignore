@@ -2,6 +2,7 @@
 config.txt
 .env
 ngrok_do_bot.yml
+configrd.json
 # .env.example is safe to commit (no real values)
 
 # Python cache

@@ -34,6 +34,7 @@ from flask import (
 )
 
 import bot   # the existing engine — reused as-is
+import do_source   # live DO fetch from the ERP DB — see do_source.py
 
 app = Flask(__name__)
 
@@ -322,6 +323,78 @@ def api_master():
     }, sid)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Master lorry — inline-editable grid instead of a file upload.
+# Loads the committed default (data/master_lorry.xlsx) as today's starting
+# point; edits made in the portal apply to THIS session only (never written
+# back to the default file — tomorrow always starts from the same baseline,
+# matching the existing daily-reset behaviour). Columns: LORRY, TON,
+# DESCRIPTION (kg), Ori_User (reference only, not read by the bot), USER,
+# Status — only USER and Status are meant to be edited.
+# ─────────────────────────────────────────────────────────────────────────────
+_MASTER_LORRY_DEFAULT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "master_lorry.xlsx")
+
+
+@app.route("/api/master-default")
+def api_master_default():
+    """Return today's starting master-lorry grid (from the committed default
+    file) as JSON rows for the portal's editable table."""
+    sid = _sid()
+    try:
+        df = pd.read_excel(_MASTER_LORRY_DEFAULT_PATH)
+    except Exception as e:
+        return _with_cookie({"error": f"Could not read the default master lorry file: {e}"}, sid, 500)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    rows = []
+    for _, r in df.iterrows():
+        plate = str(r.get("LORRY", "")).strip().upper()
+        if not plate or plate in ("NAN", "NONE"):
+            continue
+        try:
+            ton = round(float(r.get("DESCRIPTION")) / 1000.0, 4)
+        except Exception:
+            try:
+                ton = float(r.get("TON"))
+            except Exception:
+                ton = None
+        rows.append({
+            "lorry": plate,
+            "ton": ton,
+            "ori_user": str(r.get("ORI_USER", "")).strip().upper(),
+            "user": str(r.get("USER", "")).strip().upper(),
+            "status": str(r.get("STATUS", "")).strip().upper() or "AVAILABLE",
+        })
+    return _with_cookie({"rows": rows}, sid)
+
+
+@app.route("/api/master-grid", methods=["POST"])
+def api_master_grid():
+    """Accept the (possibly edited) master-lorry grid from the portal and
+    feed it through the exact same validation/parsing as a file upload —
+    built in-memory, never written to disk, so this stays session-only."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    rows = (request.json or {}).get("rows", []) or []
+    if not rows:
+        return _with_cookie({"error": "No rows submitted."}, sid, 400)
+    df = pd.DataFrame([{
+        "LORRY": str(r.get("lorry", "")).strip().upper(),
+        "TON": r.get("ton"),
+        "DESCRIPTION": (float(r["ton"]) * 1000.0) if r.get("ton") is not None else None,
+        "USER": str(r.get("user", "")).strip().upper(),
+        "Status": str(r.get("status", "")).strip().upper(),
+    } for r in rows])
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False)
+    msgs = bot._handle_master_upload(sid, sess, buf.getvalue())
+    return _with_cookie({
+        "messages": msgs,
+        "state": sess.get("state"),
+        "ok": sess.get("state") == "AWAIT_TRIP_DAY",
+    }, sid)
+
+
 @app.route("/api/day", methods=["POST"])
 def api_day():
     sid = _sid()
@@ -338,6 +411,26 @@ def api_day():
     }, sid)
 
 
+def _run_dos_upload(sid: str, sess: dict, fb: bytes) -> dict:
+    """Shared by /api/dos (manual upload) and /api/dos-fetch/use (direct from
+    the live DB fetch) — same engine call, same response shape."""
+    msgs = bot._handle_excel_upload(sid, sess, fb)
+    # If some DOs aren't on the chosen day's route schedule, the engine parks in
+    # AWAIT_OTHER_USER_REPLY and expects a YES/NO. Surface that as a question
+    # instead of the final result.
+    if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
+        return {
+            "messages": msgs,
+            "state": sess.get("state"),
+            "offschedule": {
+                "count": sess.get("not_today_pending_count", 0),
+                "day": sess.get("trip_day", "today"),
+            },
+        }
+    result = _result_json(sess) if sess.get("items") else None
+    return {"messages": msgs, "state": sess.get("state"), "result": result}
+
+
 @app.route("/api/dos", methods=["POST"])
 def api_dos():
     sid = _sid()
@@ -345,25 +438,55 @@ def api_dos():
     fb = _file_bytes()
     if fb is None:
         return _with_cookie({"error": "No file uploaded."}, sid, 400)
-    msgs = bot._handle_excel_upload(sid, sess, fb)
-    # If some DOs aren't on the chosen day's route schedule, the engine parks in
-    # AWAIT_OTHER_USER_REPLY and expects a YES/NO. Surface that as a question
-    # instead of the final result.
-    if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
-        return _with_cookie({
-            "messages": msgs,
-            "state": sess.get("state"),
-            "offschedule": {
-                "count": sess.get("not_today_pending_count", 0),
-                "day": sess.get("trip_day", "today"),
-            },
-        }, sid)
-    result = _result_json(sess) if sess.get("items") else None
+    return _with_cookie(_run_dos_upload(sid, sess, fb), sid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live DO fetch — pull today's Delivery Report straight from the ERP DB
+# (do_source.py) instead of requiring a manual file upload. The fetched
+# bytes are held in the session only (never written to disk) so the user
+# can download them to review/edit, and either re-upload that file through
+# the normal dropzone, or click "Use this" to proceed directly.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/dos-fetch", methods=["POST"])
+def api_dos_fetch():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    try:
+        report_df = do_source.fetch_delivery_report()
+    except Exception as e:
+        return _with_cookie({"error": f"Could not fetch DOs from the system: {e}"}, sid, 500)
+    xbytes = do_source.report_to_xlsx_bytes(report_df)
+    sess["_fetched_do_bytes"] = xbytes
     return _with_cookie({
-        "messages": msgs,
-        "state": sess.get("state"),
-        "result": result,
+        "count": int(len(report_df)),
+        "weight": round(float(pd.to_numeric(report_df["GROSS WEIGHT"], errors="coerce").fillna(0).sum()) / 1000.0, 3),
     }, sid)
+
+
+@app.route("/api/dos-fetch/download")
+def api_dos_fetch_download():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    data = sess.get("_fetched_do_bytes")
+    if not data:
+        return _with_cookie({"error": "Nothing fetched yet — click Fetch DOs first."}, sid, 400)
+    return send_file(
+        io.BytesIO(data),
+        as_attachment=True,
+        download_name="Delivery_Report.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/api/dos-fetch/use", methods=["POST"])
+def api_dos_fetch_use():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    data = sess.get("_fetched_do_bytes")
+    if not data:
+        return _with_cookie({"error": "Nothing fetched yet — click Fetch DOs first."}, sid, 400)
+    return _with_cookie(_run_dos_upload(sid, sess, data), sid)
 
 
 @app.route("/api/offschedule", methods=["POST"])
@@ -708,15 +831,24 @@ _PAGE = r"""<!doctype html>
     <div class="msg hidden" id="login-msg"></div>
   </div>
 
-  <!-- Step 2: master lorry file -->
+  <!-- Step 2: master lorry grid (today's defaults, editable in place) -->
   <div class="card hidden" id="card-master">
-    <p class="step-title">Step 2 · Upload master lorry file</p>
-    <label class="drop" id="drop-master">
-      <div>📄 Tap to choose the <b>master lorry</b> .xlsx<br><small>or drag &amp; drop</small></div>
-      <input type="file" id="file-master" accept=".xlsx">
-    </label>
+    <p class="step-title">Step 2 · Today's lorries — adjust if needed</p>
+    <p style="font-size:13px;color:var(--muted);margin:0 0 12px">
+      Starts from the default fleet list. Change <b>User</b> or <b>Status</b> for
+      today only — nothing here is saved back to the default for tomorrow.
+    </p>
     <div class="msg hidden" id="master-msg"></div>
-    <button class="btn back" data-back="login">← Back</button>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Lorry</th><th class="w">Ton</th><th>Ori. User</th><th>User</th><th>Status</th></tr></thead>
+        <tbody id="master-grid-rows"></tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn back" data-back="login">← Back</button>
+      <button class="btn" id="btn-master-next" style="flex:0 0 auto;width:auto">Next →</button>
+    </div>
   </div>
 
   <!-- Step 3: day -->
@@ -732,9 +864,24 @@ _PAGE = r"""<!doctype html>
 
   <!-- Step 4: DO file -->
   <div class="card hidden" id="card-dos">
-    <p class="step-title">Step 4 · Upload DO file</p>
+    <p class="step-title">Step 4 · Get today's DOs</p>
+
+    <div style="margin-bottom:14px">
+      <button class="btn" id="btn-dos-fetch">📥 Fetch DOs from system</button>
+      <div class="msg hidden" id="dos-fetch-msg"></div>
+      <div id="dos-fetch-result" class="hidden" style="margin-top:10px;font-size:14px">
+        <span id="dos-fetch-summary"></span>
+        <div class="row" style="margin-top:8px">
+          <a class="dl" href="/api/dos-fetch/download"><button class="btn secondary" style="width:auto">⬇️ Download to review</button></a>
+          <button class="btn" id="btn-dos-fetch-use" style="width:auto">Use this directly →</button>
+        </div>
+      </div>
+    </div>
+
+    <p style="font-size:13px;color:var(--muted);text-align:center;margin:4px 0 10px">— or —</p>
+
     <label class="drop" id="drop-dos">
-      <div>📎 Tap to choose the <b>DO</b> .xlsx<br><small>or drag &amp; drop</small></div>
+      <div>📎 Upload a DO .xlsx (e.g. after editing the fetched file)<br><small>or drag &amp; drop</small></div>
       <input type="file" id="file-dos" accept=".xlsx">
     </label>
     <div class="msg hidden" id="dos-msg"></div>
@@ -828,9 +975,9 @@ function clearMsgs(){ ['#login-msg','#master-msg','#day-msg','#dos-msg','#offsch
 async function goTo(step){
   clearMsgs();
   await jpost('/api/back',{target:step});
-  const inpM=document.getElementById('file-master'), inpD=document.getElementById('file-dos');
-  if(step==='login'){ selUser=null; masterFile=null; selDay=null; if(inpM)inpM.value=''; if(inpD)inpD.value=''; }
-  if(step==='master'){ masterFile=null; if(inpM)inpM.value=''; }
+  const inpD=document.getElementById('file-dos');
+  if(step==='login'){ selUser=null; masterFile=null; selDay=null; if(inpD)inpD.value=''; }
+  if(step==='master'){ masterFile=null; loadMasterGrid(); }
   if(step==='day'){ selDay=null; }
   if(step==='dos'){ if(inpD)inpD.value=''; }
   hideAll();
@@ -845,10 +992,12 @@ function wireBackButtons(){
 }
 
 // ---- Step 1: users ----
+let validUsers=[];
 async function loadUsers(){
   const d = await (await fetch('/api/users')).json();
+  validUsers = d.users||[];
   const box=$('#users'); box.innerHTML='';
-  (d.users||[]).forEach(u=>{
+  validUsers.forEach(u=>{
     const b=document.createElement('button'); b.className='userbtn'; b.textContent=u;
     b.onclick=()=>login(u); box.appendChild(b);
   });
@@ -858,7 +1007,7 @@ async function login(user){
   const d = await jpost('/api/login',{user});
   if(d.user){ selUser=d.user; needsMaster=!!d.needs_master;
     $('#who').textContent='Logged in as '+d.user; setMsg('#login-msg',null); show('#card-login',false);
-    if(d.needs_master){ show('#card-master',true); } else { show('#card-day',true); } }
+    if(d.needs_master){ show('#card-master',true); loadMasterGrid(); } else { show('#card-day',true); } }
   else { setMsg('#login-msg',d.messages||'Login failed',true); }
 }
 
@@ -871,13 +1020,45 @@ function wireDrop(dropId,inputId,onFile){
   drop.addEventListener('drop',e=>{ const f=e.dataTransfer.files[0]; if(f) onFile(f); });
 }
 
-// ---- Step 2: master ----
-wireDrop('#drop-master','#file-master',async(f)=>{
-  setMsg('#master-msg','Reading master file… ',false);
-  const d=await fpost('/api/master',f);
-  setMsg('#master-msg',d.messages||d.error,!d.ok);
-  if(d.ok){ masterFile=f; show('#card-master',false); show('#card-day',true); }
-});
+// ---- Step 2: master lorry grid (editable, no upload) ----
+const STATUS_OPTS=['AVAILABLE','BLOCK'];
+async function loadMasterGrid(){
+  setMsg('#master-msg','Loading today\'s lorries… ',false);
+  const d=await (await fetch('/api/master-default')).json();
+  if(d.error){ setMsg('#master-msg', d.error, true); return; }
+  setMsg('#master-msg', null);
+  const userOpts = validUsers.length ? validUsers : [selUser];
+  let html='';
+  (d.rows||[]).forEach((r,i)=>{
+    const userSelect = userOpts.map(u=>`<option value="${esc(u)}" ${u===r.user?'selected':''}>${esc(u)}</option>`).join('');
+    const statusSelect = STATUS_OPTS.map(s=>`<option value="${esc(s)}" ${s===r.status?'selected':''}>${esc(s)}</option>`).join('');
+    html+=`<tr data-lorry="${esc(r.lorry)}" data-ton="${r.ton!=null?r.ton:''}">`+
+          `<td>${esc(r.lorry)}</td>`+
+          `<td class="w">${r.ton!=null?r.ton.toFixed(2):'—'}</td>`+
+          `<td>${esc(r.ori_user)}</td>`+
+          `<td><select class="mg-user">${userSelect}</select></td>`+
+          `<td><select class="mg-status">${statusSelect}</select></td>`+
+          `</tr>`;
+  });
+  $('#master-grid-rows').innerHTML=html;
+}
+
+async function submitMasterGrid(){
+  const rows=[...document.querySelectorAll('#master-grid-rows tr')].map(tr=>({
+    lorry: tr.dataset.lorry,
+    ton: tr.dataset.ton!=='' ? parseFloat(tr.dataset.ton) : null,
+    user: tr.querySelector('.mg-user').value,
+    status: tr.querySelector('.mg-status').value,
+  }));
+  const btn=$('#btn-master-next'); btn.disabled=true;
+  setMsg('#master-msg','Saving… ',false);
+  try{
+    const d=await jpost('/api/master-grid',{rows});
+    setMsg('#master-msg', d.messages||d.error, !d.ok);
+    if(d.ok){ show('#card-master',false); show('#card-day',true); }
+  } finally { btn.disabled=false; }
+}
+$('#btn-master-next').onclick=submitMasterGrid;
 
 // ---- Step 3: day ----
 document.querySelectorAll('[data-day]').forEach(b=>b.onclick=async()=>{
@@ -889,20 +1070,53 @@ document.querySelectorAll('[data-day]').forEach(b=>b.onclick=async()=>{
 });
 
 // ---- Step 4: DOs ----
-wireDrop('#drop-dos','#file-dos',async(f)=>{
-  setMsg('#dos-msg','Assigning lorries… this can take a moment ',false);
-  const d=await fpost('/api/dos',f);
+// Shared by manual upload and "use fetched DOs directly" — same response shape.
+function handleDosResponse(d){
   if(d.offschedule){
     const os=d.offschedule;
     const dayTxt = os.day==='tomorrow' ? 'tomorrow' : 'today';
     setMsg('#offsched-msg',
       `⏭ ${os.count} DO(s) are NOT on ${dayTxt}'s route schedule.\n\n`+
       `Do you still want to assign lorries to them?`);
-    show('#card-dos',false); show('#card-offsched',true); setMsg('#dos-msg',null);
+    show('#card-dos',false); show('#card-offsched',true);
+    return true;
   }
-  else if(d.result){ renderResult(d.result); show('#card-dos',false); show('#card-result',true); setMsg('#dos-msg',null); }
+  if(d.result){ renderResult(d.result); show('#card-dos',false); show('#card-result',true); return true; }
+  return false;
+}
+
+wireDrop('#drop-dos','#file-dos',async(f)=>{
+  setMsg('#dos-msg','Assigning lorries… this can take a moment ',false);
+  const d=await fpost('/api/dos',f);
+  if(handleDosResponse(d)){ setMsg('#dos-msg',null); }
   else { setMsg('#dos-msg',d.messages||d.error||'Could not process file',true); }
 });
+
+// ---- Step 4: fetch DOs from system (do_source.py, live DB) ----
+async function doFetchDos(){
+  const btn=$('#btn-dos-fetch'); btn.disabled=true;
+  setMsg('#dos-fetch-msg','Fetching from system… ',false);
+  show('#dos-fetch-result', false);
+  try{
+    const d=await jpost('/api/dos-fetch',{});
+    if(d.error){ setMsg('#dos-fetch-msg', d.error, true); return; }
+    setMsg('#dos-fetch-msg', null);
+    $('#dos-fetch-summary').textContent = `Found ${d.count} DO(s), ${d.weight}T total.`;
+    show('#dos-fetch-result', true);
+  } finally { btn.disabled=false; }
+}
+$('#btn-dos-fetch').onclick=doFetchDos;
+
+async function useFetchedDos(){
+  const btn=$('#btn-dos-fetch-use'); btn.disabled=true;
+  setMsg('#dos-fetch-msg','Assigning lorries… this can take a moment ',false);
+  try{
+    const d=await jpost('/api/dos-fetch/use',{});
+    if(handleDosResponse(d)){ setMsg('#dos-fetch-msg', null); }
+    else { setMsg('#dos-fetch-msg', d.messages||d.error||'Could not process', true); }
+  } finally { btn.disabled=false; }
+}
+$('#btn-dos-fetch-use').onclick=useFetchedDos;
 
 async function answerOffsched(assign){
   setMsg('#offsched-msg', assign?'Assigning off-schedule DOs… ':'Finalising… ');
