@@ -151,6 +151,11 @@ LEFT JOIN {schema}.BPDLVCUST c
 LEFT JOIN {schema}.BPADDRESS a
     ON d.BPCORD_0 = a.BPANUM_0
    AND d.BPAADD_0 = a.BPAADD_0
+WHERE d.SDHTYP_0 <> 'LOAN'
+  AND d.STOFCY_0 = '1SA'
+  AND (d.SIHNUM_0 IS NULL OR LTRIM(RTRIM(d.SIHNUM_0)) = '')
+  AND c.DRN_0 IN ({drn_list})
+  {etd_clause}
 """
 
 
@@ -198,7 +203,21 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     filter — only the NULL-sentinel exclusion below still applies."""
     config = _load_config(config_path)
     engine = _build_engine(config)
-    query = _QUERY_TEMPLATE.format(schema=SCHEMA_NAME)
+
+    etd_clause = ""
+    if etd_days is not None:
+        etd_days = int(etd_days)
+        if etd_days < 0:
+            raise ValueError("etd_days can't be negative")
+        etd_clause = (
+            f"AND d.ZETD_0 >= CAST(GETDATE() AS DATE) "
+            f"AND d.ZETD_0 <= DATEADD(day, {etd_days}, CAST(GETDATE() AS DATE))"
+        )
+    query = _QUERY_TEMPLATE.format(
+        schema=SCHEMA_NAME,
+        drn_list=", ".join(str(n) for n in DRN_LIST),
+        etd_clause=etd_clause,
+    )
     df = pd.read_sql(query, engine)
 
     df['ROUTE'] = df['DRN_0'].map(ROUTE_MAP).fillna('NA')
