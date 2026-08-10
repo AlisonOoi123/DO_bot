@@ -26,6 +26,7 @@ import io
 import json
 import os
 import urllib.parse
+from datetime import datetime, timedelta
 
 import pandas as pd
 from sqlalchemy import create_engine
@@ -184,12 +185,17 @@ def _build_engine(config: dict):
     return create_engine(connection_string)
 
 
-def fetch_delivery_report(config_path: str = None) -> pd.DataFrame:
+def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.DataFrame:
     """Query the live ERP DB and return today's Delivery Report rows in the
     shape bot.py's DO-file parser expects — see module docstring for the two
     column-name fixes and the ETD-sentinel exclusion versus
     generate_script.py's original output. Raises on any DB/config failure;
-    the caller decides how to surface that to the user."""
+    the caller decides how to surface that to the user.
+
+    etd_days: when given, keep only rows whose ETD falls within
+    [today, today + etd_days] inclusive (e.g. etd_days=2 with today=10/8
+    keeps ETD 10/8 through 12/8). None (default) applies no ETD-range
+    filter — only the NULL-sentinel exclusion below still applies."""
     config = _load_config(config_path)
     engine = _build_engine(config)
     query = _QUERY_TEMPLATE.format(schema=SCHEMA_NAME)
@@ -205,6 +211,12 @@ def fetch_delivery_report(config_path: str = None) -> pd.DataFrame:
         (df['VALIDATED'] == 'NO') &
         (df['DRN_0'].isin(DRN_LIST))
     ].copy()
+
+    if etd_days is not None:
+        _etd_dt = pd.to_datetime(filtered_df['ZETD_0'], errors='coerce')
+        _today = pd.Timestamp(datetime.now().date())
+        _cutoff = _today + timedelta(days=etd_days)
+        filtered_df = filtered_df[(_etd_dt >= _today) & (_etd_dt <= _cutoff)].copy()
 
     filtered_df['DATE_FORMATTED'] = pd.to_datetime(
         filtered_df['DLVDAT_0'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
