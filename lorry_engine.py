@@ -34,6 +34,7 @@ from assignment_config import (
     MAX_CROSS_CLUSTER_KM      as _MAX_CROSS_CLUSTER_KM,
     MAX_CROSS_CLUSTER_BEARING as _MAX_CROSS_CLUSTER_BEARING,
     DEPOT_LAT, DEPOT_LON,
+    ROUTE_CORRIDOR_GROUPS as _ROUTE_CORRIDOR_GROUPS,
 )
 
 
@@ -469,6 +470,16 @@ def _extract_waypoints(route: str) -> frozenset:
     return frozenset(waypoints)
 
 
+def _same_corridor_group_by_code(route1: str, route2: str) -> bool:
+    """True when both routes' codes fall in the same named
+    ROUTE_CORRIDOR_GROUPS entry (e.g. KV19A + KV20A -> KV_SOUTH)."""
+    r1, r2 = str(route1).strip().upper(), str(route2).strip().upper()
+    for pfxs in _ROUTE_CORRIDOR_GROUPS.values():
+        if any(r1.startswith(p) for p in pfxs) and any(r2.startswith(p) for p in pfxs):
+            return True
+    return False
+
+
 def _routes_on_same_way(route1: str, route2: str) -> bool:
     """
     Return True when route1 and route2 can share a lorry because they travel
@@ -489,6 +500,13 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
 
     Cross-cluster merges are never allowed (JH ≠ KV etc.).
     Routes whose cluster is UNKNOWN (bare codes like ZNA) are never merged.
+
+    KL/Selangor urban routes (KV.. / KL..) are a special case: GPS bearing or
+    compass-corridor adjacency (e.g. EAST next to SOUTHEAST) is NOT enough to
+    share a lorry — only membership in the same named ROUTE_CORRIDOR_GROUPS
+    group counts. Without this, e.g. KV11A ("...E 2") and KV19A ("...SE 4")
+    would merge just because EAST and SOUTHEAST are adjacent compass
+    directions, even though they're unrelated urban corridors.
     """
     ia = _extract_route_intelligence(route1)
     ib = _extract_route_intelligence(route2)
@@ -497,6 +515,8 @@ def _routes_on_same_way(route1: str, route2: str) -> bool:
         return False
     if ia["cluster"] == "UNKNOWN":
         return False
+    if ia["cluster"] in ("KL_VALLEY", "KL_CITY"):
+        return _same_corridor_group_by_code(route1, route2)
 
     # Path A: both have a named directional corridor — must be same or adjacent
     if ia["corridor"] != "GENERAL" and ib["corridor"] != "GENERAL":
