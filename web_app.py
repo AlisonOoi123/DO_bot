@@ -875,6 +875,13 @@ _PAGE = r"""<!doctype html>
       <button class="btn back" data-back="login">← Back</button>
       <button class="btn" id="btn-master-next" style="flex:0 0 auto;width:auto">Next →</button>
     </div>
+
+    <p style="font-size:13px;color:var(--muted);text-align:center;margin:14px 0 10px">— or —</p>
+
+    <label class="drop" id="drop-master">
+      <div>📄 Upload a master lorry .xlsx instead<br><small>or drag &amp; drop</small></div>
+      <input type="file" id="file-master" accept=".xlsx">
+    </label>
   </div>
 
   <!-- Step 3: day -->
@@ -1008,8 +1015,9 @@ async function goTo(step){
   clearMsgs();
   await jpost('/api/back',{target:step});
   const inpD=document.getElementById('file-dos');
-  if(step==='login'){ selUser=null; masterFile=null; selDay=null; if(inpD)inpD.value=''; }
-  if(step==='master'){ masterFile=null; loadMasterGrid(); }
+  const inpM=document.getElementById('file-master');
+  if(step==='login'){ selUser=null; masterFile=null; selDay=null; if(inpD)inpD.value=''; if(inpM)inpM.value=''; }
+  if(step==='master'){ masterFile=null; if(inpM)inpM.value=''; loadMasterGrid(); }
   if(step==='day'){ selDay=null; }
   if(step==='dos'){ if(inpD)inpD.value=''; }
   hideAll();
@@ -1112,6 +1120,14 @@ async function submitMasterGrid(){
   } finally { btn.disabled=false; }
 }
 $('#btn-master-next').onclick=submitMasterGrid;
+
+// ---- Step 2b: master lorry file upload (alternative to the grid) ----
+wireDrop('#drop-master','#file-master',async(f)=>{
+  setMsg('#master-msg','Reading master file… ',false);
+  const d=await fpost('/api/master',f);
+  setMsg('#master-msg',d.messages||d.error,!d.ok);
+  if(d.ok){ masterFile=f; show('#card-master',false); show('#card-day',true); }
+});
 
 // ---- Step 3: day ----
 document.querySelectorAll('[data-day]').forEach(b=>b.onclick=async()=>{
