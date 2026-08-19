@@ -2955,6 +2955,14 @@ def _downsize_lorries(sess):
         dos = on.get(l)
         if not dos:
             continue
+        # BQY7823 priority (explicit request): never downsize it away from a
+        # route it's the FIT IN LORRY-preferred pick for — it should keep
+        # serving that outstation route rather than get bumped to a smaller
+        # idle lorry for a cosmetic capacity-fit gain.
+        if l == "BQY7823" and any(
+                "BQY7823" in _preferred_lorries_for_route(x.get("ROUTE", ""), eng)
+                for x in dos):
+            continue
         L = load[l]
         # Smallest idle lorry that (a) still holds the load within capacity and
         # (b) is genuinely smaller than the current lorry.
@@ -4686,6 +4694,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # preferred lorries are full, unavailable, or size-capped
                     # (i.e. _pref_avail is empty — handled below).
                     _pref_avail.sort(key=lambda p: _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)))
+                    # BQY7823 priority (explicit request): claim it ahead of
+                    # tightest-fit ordering whenever it's a valid candidate for
+                    # this route (i.e. the route is one it's listed for in
+                    # LORRY DAILY PLANNING.xlsx's FIT IN LORRY sheet — that's
+                    # what populated _preferred/_pref_avail here). This lets it
+                    # serve those outstation routes first; it only falls
+                    # through to urban work on days those routes don't need it.
+                    if "BQY7823" in _pref_avail:
+                        _pref_avail.remove("BQY7823")
+                        _pref_avail.insert(0, "BQY7823")
                     _chosen = _pref_avail[0]
                     for it in group_items:
                         it["LORRY"] = _chosen
