@@ -267,7 +267,12 @@ ROUTE_CORRIDOR_GROUPS: dict[str, list[str]] = {
 # one is needed; otherwise it is free to serve urban routes.  The ONLY hard
 # rule is the outstation minimum tonnage (OUTSTATION_MIN_TON): lorries ≤5T can
 # never run an outstation route, only KL/Selangor urban routes.
-LORRY_STRICT_ROUTE: dict[str, set[str]] = {}
+#
+# Exception: BQU3875 is reserved for Kuantan (PH09) only, by explicit request
+# — it must never serve any other route even if idle/under-utilised that day.
+LORRY_STRICT_ROUTE: dict[str, set[str]] = {
+    "BQU3875": {"PH09"},
+}
 
 # ── Preferred lorry per route ─────────────────────────────────────────────────
 # Ordered list: first plate is primary, remainder are backups.

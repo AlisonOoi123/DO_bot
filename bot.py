@@ -81,6 +81,7 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 
 PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY DAILY PLANNING.xlsx")         # lorry naik + route codes
 MASTER_PATH    = PLANNING_PATH   # alias kept for backwards compat inside engine calls
+MASTER_LORRY_PATH = os.path.join(_DATA_DIR, "master_lorry.xlsx")              # capacity lookup for simple lorry lists
 # History path — single source of truth (manual-assignment history, new format
 # with LONGITUD GPS column).  Use the .xlsx everywhere; the old .xls duplicate is
 # no longer referenced so it can be deleted.
@@ -2245,6 +2246,60 @@ def _start(phone, sess):
 _MASTER_FILE_USERS = {"ABI", "VIVIAN"}
 
 
+def _convert_simple_available_list(file_bytes, user: str):
+    """Convert a simple 'today's available lorries' file — just a LORRY
+    column (e.g. the daily delivery-performance report format: NO, LORRY,
+    DRIVER, MUATAN(KG), ..., AREA, ...) — into the LORRY/USER/DESCRIPTION/
+    Status shape _parse_master_lorry expects.
+
+    Every plate listed becomes Available for the current user; every plate
+    NOT listed is simply absent, so it won't be in that user's eligible
+    fleet today (equivalent to Blocked). Capacity always comes from the
+    current master_lorry.xlsx, not from this file — even if the upload has
+    its own capacity-looking column (e.g. MUATAN(KG)), using it would let a
+    stale figure silently override the maintained default.
+
+    Returns None if this doesn't look like that format (caller falls back
+    to the standard master_lorry.xlsx-shaped parse).
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    except Exception:
+        return None
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    if "LORRY" not in df.columns or "USER" in df.columns or "STATUS" in df.columns:
+        return None
+
+    plates = []
+    seen = set()
+    for v in df["LORRY"]:
+        plate = str(v).strip().upper()
+        if plate and plate not in ("NAN", "NONE") and plate not in seen:
+            seen.add(plate)
+            plates.append(plate)
+    if not plates:
+        return None
+
+    cap_by_plate = {}
+    try:
+        _m = pd.read_excel(MASTER_LORRY_PATH)
+        _m.columns = [str(c).strip().upper() for c in _m.columns]
+        for _, r in _m.iterrows():
+            _plate = str(r.get("LORRY", "")).strip().upper()
+            if _plate:
+                cap_by_plate[_plate] = r.get("DESCRIPTION")
+    except Exception:
+        pass
+
+    out = pd.DataFrame([{
+        "LORRY": p, "USER": user, "Status": "Available",
+        "DESCRIPTION": cap_by_plate.get(p),
+    } for p in plates])
+    buf = io.BytesIO()
+    out.to_excel(buf, index=False)
+    return buf.getvalue()
+
+
 def _parse_master_lorry(file_bytes):
     """Parse the daily master lorry file.
 
@@ -2345,6 +2400,9 @@ def _handle_master_upload(phone, sess, file_bytes):
     """Step 2 of the flow: the logged-in user uploads the daily master lorry
     file. Validate it (no plate Available under two users) and build this
     user's available fleet from it, then move on to the trip-day question."""
+    _simple = _convert_simple_available_list(file_bytes, sess.get("user_id", ""))
+    if _simple is not None:
+        file_bytes = _simple
     per_user, conflicts, err = _parse_master_lorry(file_bytes)
     if err:
         return [f"❌ Master lorry file: {err}.\nPlease upload the correct master "
@@ -2685,6 +2743,8 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
         fp = it.get("FORBID_PLATES")
         if fp and l in fp:
             return False
+        if l in _strict_route_excl(it.get("ROUTE", "")):
+            return False
         return True
 
     def _near_ok(it, l):
@@ -2804,11 +2864,16 @@ def _urban_rebalance(sess, max_over: float = SLIGHT_OVERLOAD):
                 L_fb |= x["FORBID_PLATES"]
         # Move the whole small load onto a NEAR urban lorry that has room, so the
         # big lorry is freed. Prefer the tightest such target.
+        L_strict_excl: set = set()
+        for x in L_items:
+            L_strict_excl |= _strict_route_excl(x.get("ROUTE", ""))
         cand = []
         for m in caps:
             if m == L or has_out[m] or load.get(m, 0.0) <= 1e-9:
                 continue                               # only onto a used urban lorry
             if m in L_fb:
+                continue
+            if m in L_strict_excl:
                 continue
             if L_mt is not None and caps[m] > L_mt + 1e-9:
                 continue
@@ -4815,7 +4880,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < remain
                     }
-                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid | _reserve_excl
+                    excl = sess["unavailable"] | get_assigned_today() | _excl_session_full | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid | _reserve_excl | _strict_excl
                     # Tightest-fit pass: find smallest lorry that handles remain
                     sug = engine.suggest(route=route, total_ton=remain,
                                          unavailable=excl, top_n=20,
@@ -4922,7 +4987,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                                 if float(_lorry_cap_map.get(p, 0))
                                    - float(_session_loads.get(p, 0)) < it["WEIGHT"]
                             }
-                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid | _reserve_excl
+                            excl_retry = sess["unavailable"] | get_assigned_today() | _excl_retry_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _bp_picked | _grp_forbid | _reserve_excl | _strict_excl
                             extra_sug  = engine.suggest(
                                 route=route, total_ton=it["WEIGHT"],
                                 unavailable=excl_retry, top_n=1,
@@ -4968,7 +5033,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         if float(_lorry_cap_map.get(p, 0))
                            - float(_session_loads.get(p, 0)) < total_w
                     }
-                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _grp_forbid | _reserve_excl
+                    excl_final = sess["unavailable"] | get_assigned_today() | _excl_lr_sf | _state_excl | _bp_cap_excl | _bp_dest_excl | _grp_forbid | _reserve_excl | _strict_excl
                     last_resort = engine.suggest_largest_available(
                         route, excl_final, _today(), total_ton=total_w)
                     if last_resort:
