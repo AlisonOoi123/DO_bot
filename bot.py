@@ -2963,6 +2963,13 @@ def _downsize_lorries(sess):
                 "BQY7823" in _preferred_lorries_for_route(x.get("ROUTE", ""), eng)
                 for x in dos):
             continue
+        # VJN9910 priority (explicit request): never downsize it away from a
+        # Kuantan (PH09) load — same reasoning as BQY7823 above, scoped to
+        # Kuantan only.
+        if l == "VJN9910" and any(
+                _is_kuantan(x.get("ROUTE", ""), x.get("CUSTOMER NAME", ""))
+                for x in dos):
+            continue
         L = load[l]
         # Smallest idle lorry that (a) still holds the load within capacity and
         # (b) is genuinely smaller than the current lorry.
@@ -4704,6 +4711,14 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if "BQY7823" in _pref_avail:
                         _pref_avail.remove("BQY7823")
                         _pref_avail.insert(0, "BQY7823")
+                    # VJN9910 priority (explicit request): on a day with
+                    # Kuantan (PH09) DOs, claim VJN9910 for Kuantan first —
+                    # same "front of the candidate list" treatment as BQY7823,
+                    # scoped to Kuantan only (VJN9910 still competes normally
+                    # on its other FIT IN LORRY routes).
+                    if _is_kuantan(_dominant_route, customer) and "VJN9910" in _pref_avail:
+                        _pref_avail.remove("VJN9910")
+                        _pref_avail.insert(0, "VJN9910")
                     _chosen = _pref_avail[0]
                     for it in group_items:
                         it["LORRY"] = _chosen
