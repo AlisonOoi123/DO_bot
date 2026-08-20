@@ -2963,10 +2963,13 @@ def _downsize_lorries(sess):
                 "BQY7823" in _preferred_lorries_for_route(x.get("ROUTE", ""), eng)
                 for x in dos):
             continue
-        # VJN9910 priority (explicit request): never downsize it away from a
-        # Kuantan (PH09) load — same reasoning as BQY7823 above, scoped to
-        # Kuantan only.
-        if l == "VJN9910" and any(
+        # Kuantan priority pool (explicit request): never downsize VJN9910 or
+        # BQU3875 away from a Kuantan (PH09) load — Kuantan is restricted to
+        # VJN9910/BQY7823/BQU3875 first (see the preferred-lorry pool logic
+        # above), so bumping one of them to a smaller idle lorry outside that
+        # pool would violate it. BQY7823 is already covered by the check
+        # above (Kuantan is one of its listed FIT IN LORRY routes).
+        if l in ("VJN9910", "BQU3875") and any(
                 _is_kuantan(x.get("ROUTE", ""), x.get("CUSTOMER NAME", ""))
                 for x in dos):
             continue
@@ -4701,24 +4704,33 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     # preferred lorries are full, unavailable, or size-capped
                     # (i.e. _pref_avail is empty — handled below).
                     _pref_avail.sort(key=lambda p: _eff_cap_for(p, _dest_grp) - float(_session_loads.get(p, 0)))
-                    # BQY7823 priority (explicit request): claim it ahead of
-                    # tightest-fit ordering whenever it's a valid candidate for
-                    # this route (i.e. the route is one it's listed for in
-                    # LORRY DAILY PLANNING.xlsx's FIT IN LORRY sheet — that's
-                    # what populated _preferred/_pref_avail here). This lets it
-                    # serve those outstation routes first; it only falls
-                    # through to urban work on days those routes don't need it.
-                    if "BQY7823" in _pref_avail:
-                        _pref_avail.remove("BQY7823")
-                        _pref_avail.insert(0, "BQY7823")
-                    # VJN9910 priority (explicit request): on a day with
-                    # Kuantan (PH09) DOs, claim VJN9910 for Kuantan first —
-                    # same "front of the candidate list" treatment as BQY7823,
-                    # scoped to Kuantan only (VJN9910 still competes normally
-                    # on its other FIT IN LORRY routes).
-                    if _is_kuantan(_dominant_route, customer) and "VJN9910" in _pref_avail:
-                        _pref_avail.remove("VJN9910")
-                        _pref_avail.insert(0, "VJN9910")
+                    if _is_kuantan(_dominant_route, customer):
+                        # Kuantan priority pool (explicit request): try
+                        # VJN9910/BQY7823/BQU3875 first — whichever of these
+                        # three is available fits tightest wins (_pref_avail
+                        # is already tightest-fit sorted, so filtering
+                        # preserves that order within the pool). Only fall
+                        # through to the rest of the FIT IN LORRY list
+                        # (BPE9788, BQX9983, WA6899M, VER2872) when none of
+                        # the three have room that day.
+                        _kuantan_pool = {"VJN9910", "BQY7823", "BQU3875"}
+                        _kp = [p for p in _pref_avail if p in _kuantan_pool]
+                        if _kp:
+                            _pref_avail = _kp + [p for p in _pref_avail if p not in _kuantan_pool]
+                    else:
+                        # BQY7823 priority (explicit request, non-Kuantan
+                        # routes — Kuantan has its own pool rule above):
+                        # claim it ahead of tightest-fit ordering whenever
+                        # it's a valid candidate for this route (i.e. the
+                        # route is one it's listed for in LORRY DAILY
+                        # PLANNING.xlsx's FIT IN LORRY sheet — that's what
+                        # populated _preferred/_pref_avail here). This lets
+                        # it serve those outstation routes first; it only
+                        # falls through to urban work on days those routes
+                        # don't need it.
+                        if "BQY7823" in _pref_avail:
+                            _pref_avail.remove("BQY7823")
+                            _pref_avail.insert(0, "BQY7823")
                     _chosen = _pref_avail[0]
                     for it in group_items:
                         it["LORRY"] = _chosen
