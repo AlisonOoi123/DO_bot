@@ -270,8 +270,20 @@ ROUTE_CORRIDOR_GROUPS: dict[str, list[str]] = {
 #
 # Exception: BQU3875 is reserved for Kuantan (PH09) only, by explicit request
 # — it must never serve any other route even if idle/under-utilised that day.
+#
+# Exception: VJN9910 is restricted to exactly the routes it's listed for in
+# LORRY DAILY PLANNING.xlsx's FIT IN LORRY sheet (all outstation NS/PH codes,
+# TR02, and KV01A/KV02A/KV24/KV19A/KV20A) — by explicit request, since it was
+# turning up on the small-van-only urban cluster (KV04A-KV12A) where it's
+# never listed, including overloaded.
 LORRY_STRICT_ROUTE: dict[str, set[str]] = {
     "BQU3875": {"PH09"},
+    "VJN9910": {
+        "NS04", "NS05", "NS06",
+        "PH01", "PH02", "PH03", "PH04", "PH05", "PH06", "PH07", "PH09", "PH10", "PH11",
+        "TR02",
+        "KV01A", "KV02A", "KV24", "KV19A", "KV20A",
+    },
 }
 
 # ── Preferred lorry per route ─────────────────────────────────────────────────
