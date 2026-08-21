@@ -144,11 +144,25 @@ def _result_json(sess) -> dict:
     """Group the assigned items by lorry and list what couldn't be assigned."""
     items = sess.get("items", []) or []
     engine = sess.get("engine")
+    # NaN (e.g. a lorry with an unresolvable/blank capacity slipping into the
+    # fleet somewhere upstream) is not valid JSON — Python's json.dumps emits
+    # a bare `NaN` token that the browser's JSON.parse() rejects outright,
+    # breaking the whole response. Skip any capacity that isn't a real finite
+    # number rather than letting it corrupt the fleet dicts below.
+    def _finite_ton(r):
+        try:
+            v = float(r["TON"])
+        except (TypeError, ValueError):
+            return None
+        return v if pd.notna(v) and v not in (float("inf"), float("-inf")) else None
+
     caps = {}
     if engine is not None and getattr(engine, "eligible_lorries", None) is not None:
         try:
             for _, r in engine.eligible_lorries.iterrows():
-                caps[str(r["LORRY"]).strip().upper()] = float(r["TON"])
+                v = _finite_ton(r)
+                if v is not None:
+                    caps[str(r["LORRY"]).strip().upper()] = v
         except Exception:
             caps = {}
     # Full cross-owner fleet (for the manual "type a plate" box only — the
@@ -157,7 +171,9 @@ def _result_json(sess) -> dict:
     if engine is not None and getattr(engine, "all_lorries", None) is not None:
         try:
             for _, r in engine.all_lorries.iterrows():
-                full_caps[str(r["LORRY"]).strip().upper()] = float(r["TON"])
+                v = _finite_ton(r)
+                if v is not None:
+                    full_caps[str(r["LORRY"]).strip().upper()] = v
         except Exception:
             full_caps = dict(caps)
     else:
@@ -173,7 +189,7 @@ def _result_json(sess) -> dict:
             "do": str(it.get("DO NUMBER", "")),
             "route": str(it.get("ROUTE", "")),
             "customer": str(it.get("CUSTOMER NAME", "")),
-            "weight": round(float(it.get("WEIGHT", 0) or 0), 3),
+            "weight": round(_w, 3) if pd.notna(_w := (float(it.get("WEIGHT", 0) or 0))) else 0.0,
             "state": str(it.get("STATE", "")),
         }
         if lorry in ("OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP"):

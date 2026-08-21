@@ -2278,16 +2278,21 @@ def _convert_simple_available_list(file_bytes, user: str):
     its own capacity-looking column (e.g. MUATAN(KG)), using it would let a
     stale figure silently override the maintained default.
 
-    Returns None if this doesn't look like that format (caller falls back
-    to the standard master_lorry.xlsx-shaped parse).
+    Returns (file_bytes, skipped_plates). file_bytes is None if this doesn't
+    look like that format at all (caller falls back to the standard
+    master_lorry.xlsx-shaped parse) or if every listed plate is unresolvable.
+    skipped_plates lists any listed plate with no known capacity (typo, or a
+    genuinely new plate not yet in master_lorry.xlsx) — these are dropped
+    rather than passed through with an unknown/NaN capacity, which would
+    otherwise silently corrupt the fleet and break the result JSON.
     """
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
     except Exception:
-        return None
+        return None, []
     df.columns = [str(c).strip().upper() for c in df.columns]
     if "LORRY" not in df.columns or "USER" in df.columns or "STATUS" in df.columns:
-        return None
+        return None, []
 
     plates = []
     seen = set()
@@ -2297,7 +2302,7 @@ def _convert_simple_available_list(file_bytes, user: str):
             seen.add(plate)
             plates.append(plate)
     if not plates:
-        return None
+        return None, []
 
     cap_by_plate = {}
     try:
@@ -2305,18 +2310,24 @@ def _convert_simple_available_list(file_bytes, user: str):
         _m.columns = [str(c).strip().upper() for c in _m.columns]
         for _, r in _m.iterrows():
             _plate = str(r.get("LORRY", "")).strip().upper()
-            if _plate:
-                cap_by_plate[_plate] = r.get("DESCRIPTION")
+            _desc = r.get("DESCRIPTION")
+            if _plate and _desc is not None and pd.notna(_desc):
+                cap_by_plate[_plate] = _desc
     except Exception:
         pass
 
+    resolved = [p for p in plates if p in cap_by_plate]
+    skipped = [p for p in plates if p not in cap_by_plate]
+    if not resolved:
+        return None, skipped
+
     out = pd.DataFrame([{
         "LORRY": p, "USER": user, "Status": "Available",
-        "DESCRIPTION": cap_by_plate.get(p),
-    } for p in plates])
+        "DESCRIPTION": cap_by_plate[p],
+    } for p in resolved])
     buf = io.BytesIO()
     out.to_excel(buf, index=False)
-    return buf.getvalue()
+    return buf.getvalue(), skipped
 
 
 def _parse_master_lorry(file_bytes):
@@ -2419,7 +2430,11 @@ def _handle_master_upload(phone, sess, file_bytes):
     """Step 2 of the flow: the logged-in user uploads the daily master lorry
     file. Validate it (no plate Available under two users) and build this
     user's available fleet from it, then move on to the trip-day question."""
-    _simple = _convert_simple_available_list(file_bytes, sess.get("user_id", ""))
+    _simple, _simple_skipped = _convert_simple_available_list(file_bytes, sess.get("user_id", ""))
+    if _simple is None and _simple_skipped:
+        _lines = "\n".join(f"  • {p}" for p in _simple_skipped[:25])
+        return [f"❌ None of the plate(s) in this file are recognised:\n{_lines}\n\n"
+                "Check for typos against the master lorry list, then upload again."]
     if _simple is not None:
         file_bytes = _simple
     per_user, conflicts, err = _parse_master_lorry(file_bytes)
@@ -2465,6 +2480,10 @@ def _handle_master_upload(phone, sess, file_bytes):
     _msgs = _fleet_and_trip_prompt(sess, user)
     if _cleared_note:
         _msgs[0] = _msgs[0] + _cleared_note
+    if _simple_skipped:
+        _skip_lines = ", ".join(_simple_skipped[:25])
+        _msgs.insert(0, f"⚠️ Not recognised, skipped: {_skip_lines} "
+                         "(check for typos against the master lorry list).")
     return _msgs
 
 
