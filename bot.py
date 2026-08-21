@@ -16,6 +16,7 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import date, datetime, time as dtime
 import pandas as pd
 from lorry_engine import LorryEngine
@@ -275,6 +276,14 @@ REMARKS_LLM_CACHE_PATH = os.path.join(_DATA_DIR, "remarks_day_cache.json")
 _remarks_llm_cache: dict[str, list | None] | None = None
 _remarks_llm_lock = threading.Lock()
 
+# If the local LLM (LM Studio etc.) times out or errors, don't pay that same
+# timeout penalty again on every upload/re-assignment for a while — a stuck
+# or model-less local server previously meant every request in a session
+# (upload, then "assign off-schedule DOs too") each separately waited out
+# the full timeout. Skip local calls for this long after a failure.
+_LOCAL_LLM_COOLDOWN_SEC = 300
+_local_llm_unavailable_until = 0.0
+
 def _load_remarks_llm_cache() -> dict:
     global _remarks_llm_cache
     if _remarks_llm_cache is None:
@@ -313,7 +322,16 @@ _REMARKS_LLM_SYSTEM = (
 )
 
 def _llm_call_local(todo: list[str]) -> dict | None:
-    """Call LM Studio (OpenAI-compatible) local LLM. Returns parsed dict or None."""
+    """Call LM Studio (OpenAI-compatible) local LLM. Returns parsed dict or None.
+
+    Skips the attempt entirely while a prior failure's cooldown is active, so
+    a stuck/model-less local server doesn't make every upload and every
+    off-schedule re-assignment in the same session separately wait out the
+    full timeout."""
+    global _local_llm_unavailable_until
+    now = time.time()
+    if now < _local_llm_unavailable_until:
+        return None
     import requests as _req
     base_url = os.environ.get("LOCAL_LLM_URL", "http://localhost:1234/v1")
     model = os.environ.get("LOCAL_LLM_MODEL", "local-model")
@@ -330,7 +348,7 @@ def _llm_call_local(todo: list[str]) -> dict | None:
                 "temperature": 0,
                 "max_tokens": 2048,
             },
-            timeout=60,
+            timeout=10,
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
@@ -342,6 +360,7 @@ def _llm_call_local(todo: list[str]) -> dict | None:
             return json.loads(m.group())
     except Exception as e:
         print(f"⚠️ Local LLM call failed: {e}")
+        _local_llm_unavailable_until = now + _LOCAL_LLM_COOLDOWN_SEC
     return None
 
 
