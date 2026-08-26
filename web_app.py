@@ -1596,6 +1596,15 @@ async function fetchAndAssign(){
     setMsg('#login-msg', 'Fetching DOs from system… ', false);
     const df = await jpost('/api/dos-fetch', {etd_days: etdDays});
     if(df.error){ showBoardWithError(df.error); return; }
+    if(!df.count){
+      showBoardWithError(
+        `The system returned 0 DOs for ${selUser}` +
+        (etdDays!=null?` with the ETD window set to ±${etdDays} day(s)`:'') +
+        `. Double-check the ETD window (0 or blank = all), the Today/Tomorrow ` +
+        `pick, and that today's DOs are actually in the system for ${selUser}'s routes.`
+      );
+      return;
+    }
 
     setMsg('#login-msg', 'Assigning lorries… ', false);
     const du = await jpost('/api/dos-fetch/use',{});
