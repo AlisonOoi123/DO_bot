@@ -572,6 +572,10 @@ def api_dos_fetch():
             raise ValueError
     except (TypeError, ValueError):
         return _with_cookie({"error": "ETD window must be a whole number of days (0 or more)."}, sid, 400)
+    # 0 or blank both mean "no ETD filter — fetch everything", not "only
+    # today's ETD" — a window of exactly zero days isn't a useful choice.
+    if _etd_days == 0:
+        _etd_days = None
     try:
         report_df = do_source.fetch_delivery_report(etd_days=_etd_days)
     except Exception as e:
@@ -1187,7 +1191,7 @@ _PAGE = r"""<!doctype html>
     <div class="msg hidden" id="login-msg"></div>
     <div class="tp-etd-row hidden" id="tp-etd-row">
       <label for="etd-days-input">1&#41; ETD window: &plusmn;
-        <input type="number" id="etd-days-input" min="0" step="1" value="2"> day(s)
+        <input type="number" id="etd-days-input" min="0" step="1" value="2" placeholder="ALL"> day(s) &mdash; 0 or blank = all
       </label>
     </div>
     <div class="tp-toggle-section hidden" id="tp-toggle-section">
@@ -2093,6 +2097,8 @@ async function toggleLorry(plate, on){
   if(d.board){ BOARD=d.board; }
   if(!on && d.unassigned_count){
     boardToast(`${plate} turned off · ${d.unassigned_count} DO(s) sent back to unassigned.`);
+  } else if(on && d.refilled_count){
+    boardToast(`${plate} turned on · ${d.refilled_count} DO(s) it was carrying put back on.`);
   }
   renderBoard();
 }

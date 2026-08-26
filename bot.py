@@ -1316,9 +1316,15 @@ def set_plate_toggle(plate: str, user: str, on: bool) -> None:
 
 def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
     """Board on/off switch: mark a plate available/unavailable for today for
-    the logged-in planner, update this session's live eligible fleet, and
-    (if switching OFF) send any DOs currently on that plate back to the
-    unassigned pool — an unavailable lorry can't keep carrying a load."""
+    the logged-in planner, update this session's live eligible fleet.
+
+    Switching OFF sends any DOs currently on that plate back to the
+    unassigned pool — an unavailable lorry can't keep carrying a load — and
+    remembers which DOs those were. Switching back ON tries to put those
+    SAME DOs back on the plate (not a fresh assignment run, and not forced —
+    only DOs that still fit cleanly, per the same rule checks a manual drag
+    is spot-checked against, go back; anything that no longer fits stays in
+    the pool for a human to place)."""
     user = sess.get("user_id")
     engine = sess.get("engine")
     if not user or engine is None:
@@ -1328,6 +1334,7 @@ def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
 
     el = engine.eligible_lorries
     unassigned_count = 0
+    refilled_count = 0
     if on:
         if "LORRY" in el.columns and plate not in set(el["LORRY"].str.upper()):
             # Only re-add a plate that actually belongs to this planner's own
@@ -1341,19 +1348,60 @@ def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
                 engine.eligible_lorries = pd.concat([
                     el, pd.DataFrame([{"LORRY": plate, "TON": _ton, "USER": user, "Status": "Available"}])
                 ], ignore_index=True)
+
+        # Try to restore whatever this plate was carrying when it got turned
+        # off — only DOs that are still sitting unassigned AND still fit
+        # capacity-wise. These DOs were already validated as compatible
+        # together (route, size cap, etc.) by the assignment engine that put
+        # them on this exact plate in the first place, so the only thing
+        # that could genuinely have changed since eviction is how much room
+        # is left — that's the "not force" check we re-run here, not the
+        # full manual-drag rule set (which flags same-route DOs against each
+        # other on plate-code technicalities that don't apply when restoring
+        # a group the engine already grouped).
+        _evicted = sess.get("_toggle_evicted", {}).pop(plate, [])
+        if _evicted:
+            _by_do = {str(it.get("DO NUMBER")): it for it in sess.get("items", []) or []}
+            _cap = None
+            _row = engine.eligible_lorries[engine.eligible_lorries["LORRY"] == plate]
+            if not _row.empty:
+                _cap = float(_row.iloc[0]["TON"])
+            if _cap is not None:
+                _load = sum(float(it.get("WEIGHT", 0) or 0) for it in sess.get("items", []) or []
+                            if str(it.get("LORRY", "")).strip().upper() == plate)
+                for _do_num in _evicted:
+                    it = _by_do.get(_do_num)
+                    if it is None or it.get("LORRY") not in (None, "NO_LORRY"):
+                        continue   # already re-placed elsewhere — leave it
+                    _w = float(it.get("WEIGHT", 0) or 0)
+                    if _load + _w > _cap * NAIK_FACTOR + 1e-6:
+                        continue  # doesn't cleanly fit any more — don't force it
+                    it["LORRY"] = plate
+                    sess.setdefault("assigned", {})[it["DO NUMBER"]] = plate
+                    sess.setdefault("unassigned_reasons", {}).pop(it["DO NUMBER"], None)
+                    _load += _w
+                    refilled_count += 1
+            if refilled_count:
+                for do in sess.get("pending_dos", []):
+                    do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
+                sess.pop("export_bytes", None)
     else:
         if "LORRY" in el.columns:
             engine.eligible_lorries = el[el["LORRY"].str.upper() != plate].reset_index(drop=True)
+        _evicted_dos = []
         for it in sess.get("items", []) or []:
             if str(it.get("LORRY", "")).strip().upper() == plate:
                 it["LORRY"] = None
                 sess.setdefault("assigned", {}).pop(it["DO NUMBER"], None)
+                _evicted_dos.append(str(it.get("DO NUMBER")))
                 unassigned_count += 1
         if unassigned_count:
+            sess.setdefault("_toggle_evicted", {})[plate] = _evicted_dos
             for do in sess.get("pending_dos", []):
                 do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
             sess.pop("export_bytes", None)
-    return {"ok": True, "plate": plate, "on": on, "unassigned_count": unassigned_count}
+    return {"ok": True, "plate": plate, "on": on,
+            "unassigned_count": unassigned_count, "refilled_count": refilled_count}
 
 
 def _spare_plates(engine) -> set:
