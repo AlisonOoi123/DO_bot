@@ -301,9 +301,13 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     the caller decides how to surface that to the user.
 
     etd_days: when given, keep only rows whose ETD falls within
-    [today, today + etd_days] inclusive (e.g. etd_days=2 with today=10/8
-    keeps ETD 10/8 through 12/8). None (default) applies no ETD-range
-    filter — only the NULL-sentinel exclusion below still applies."""
+    [today - etd_days, today + etd_days] inclusive — a symmetric window
+    the user picks in the portal (e.g. etd_days=2 with today=26/8 keeps
+    ETD 24/8 through 28/8, catching DOs whose ETD already slipped a
+    couple of days as well as ones coming up). None (default) applies no
+    ETD-range filter at all — every still-pending DO from this year is
+    fetched, matching this file's default behaviour before this window
+    was made user-configurable."""
     config = _load_config(config_path)
     engine = _build_engine(config)
 
@@ -313,7 +317,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         if etd_days < 0:
             raise ValueError("etd_days can't be negative")
         etd_clause = (
-            f"AND d.ZETD_0 >= CAST(GETDATE() AS DATE) "
+            f"AND d.ZETD_0 >= DATEADD(day, -{etd_days}, CAST(GETDATE() AS DATE)) "
             f"AND d.ZETD_0 <= DATEADD(day, {etd_days}, CAST(GETDATE() AS DATE))"
         )
     query = _QUERY_TEMPLATE.format(
@@ -339,8 +343,9 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     if etd_days is not None:
         _etd_dt = pd.to_datetime(filtered_df['ZETD_0'], errors='coerce')
         _today = pd.Timestamp(datetime.now().date())
-        _cutoff = _today + timedelta(days=etd_days)
-        filtered_df = filtered_df[(_etd_dt >= _today) & (_etd_dt <= _cutoff)].copy()
+        _lo = _today - timedelta(days=etd_days)
+        _hi = _today + timedelta(days=etd_days)
+        filtered_df = filtered_df[(_etd_dt >= _lo) & (_etd_dt <= _hi)].copy()
 
     filtered_df['DATE_FORMATTED'] = pd.to_datetime(
         filtered_df['DLVDAT_0'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')

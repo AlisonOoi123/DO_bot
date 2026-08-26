@@ -255,15 +255,29 @@ def _board_json(sess) -> dict:
             return None
         return v if pd.notna(v) and v not in (float("inf"), float("-inf")) else None
 
+    # Board lanes = the logged-in planner's OWN eligible fleet (own lorries +
+    # shared SPARE) only — not the whole company's. A plate that already has
+    # a DO on it from elsewhere (e.g. a manual table-view assignment onto a
+    # BIG/SELAYANG plate) still gets a lane so that assignment stays visible,
+    # even though it's not itself a drop target the planner would pick from.
     caps = {}
-    if engine is not None and getattr(engine, "all_lorries", None) is not None:
+    if engine is not None and getattr(engine, "eligible_lorries", None) is not None:
         try:
-            for _, r in engine.all_lorries.iterrows():
+            for _, r in engine.eligible_lorries.iterrows():
                 v = _finite_ton(r)
                 if v is not None:
                     caps[str(r["LORRY"]).strip().upper()] = v
         except Exception:
             caps = {}
+    _all_caps = {}
+    if engine is not None and getattr(engine, "all_lorries", None) is not None:
+        try:
+            for _, r in engine.all_lorries.iterrows():
+                v = _finite_ton(r)
+                if v is not None:
+                    _all_caps[str(r["LORRY"]).strip().upper()] = v
+        except Exception:
+            _all_caps = {}
 
     orders = []
     routes: dict[str, dict] = {}
@@ -286,6 +300,8 @@ def _board_json(sess) -> dict:
             rt = routes.setdefault(route, {"route": route, "dos": 0, "weight": 0.0})
             rt["dos"] += 1
             rt["weight"] = round(rt["weight"] + weight, 3)
+        elif assigned_plate not in caps and assigned_plate in _all_caps:
+            caps[assigned_plate] = _all_caps[assigned_plate]
 
     return {
         "orders": orders,
@@ -525,8 +541,15 @@ def api_dos():
 def api_dos_fetch():
     sid = _sid()
     sess = bot.get_session(sid)
+    _etd_days = (request.json or {}).get("etd_days")
     try:
-        report_df = do_source.fetch_delivery_report()
+        _etd_days = int(_etd_days) if _etd_days not in (None, "") else None
+        if _etd_days is not None and _etd_days < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return _with_cookie({"error": "ETD window must be a whole number of days (0 or more)."}, sid, 400)
+    try:
+        report_df = do_source.fetch_delivery_report(etd_days=_etd_days)
     except Exception as e:
         return _with_cookie({"error": f"Could not fetch DOs from the system: {e}"}, sid, 500)
     xbytes = do_source.report_to_xlsx_bytes(report_df)
@@ -911,6 +934,11 @@ _PAGE = r"""<!doctype html>
     color:var(--muted)}
   .tp-tab.active{background:var(--warn);color:#241a00;border-color:var(--warn)}
   .tp-tab:disabled{opacity:.6;cursor:wait}
+  .tp-etd-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px;
+    padding-top:14px;border-top:1px solid var(--line)}
+  .tp-etd-row label{font-size:13.5px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .tp-etd-row input[type=number]{width:64px;padding:7px 8px;border-radius:8px;
+    border:1px solid var(--line);background:var(--card2);color:var(--ink);font-size:14px}
   .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;
     box-sizing:border-box;width:100%;min-height:150px;gap:6px;
     border:2px dashed var(--line);border-radius:14px;padding:28px 16px;text-align:center;
@@ -1008,6 +1036,11 @@ _PAGE = r"""<!doctype html>
     color:var(--brand);font-size:12px}
   .board-card .b-kg{margin-left:auto;font-family:ui-monospace,Menlo,monospace;
     font-weight:700;font-size:12px;color:var(--ok);flex-shrink:0}
+  .board-card .b-delete{display:inline-flex;align-items:center;justify-content:center;
+    width:18px;height:18px;border-radius:4px;border:none;background:rgba(239,68,68,.15);
+    color:var(--bad);font-size:14px;font-weight:bold;cursor:pointer;flex-shrink:0;
+    line-height:1;padding:0;transition:background .15s,color .15s}
+  .board-card .b-delete:hover{background:var(--bad);color:#fff}
   .board-card .b-cust{font-size:12px;font-weight:600;margin-top:2px;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
   .board-card .b-meta{color:var(--muted);font-size:10.5px;margin-top:1px;
@@ -1032,18 +1065,24 @@ _PAGE = r"""<!doctype html>
     <a href="/logout" class="logout-btn">⎋ Logout</a>
   </header>
 
-  <!-- Planner bar — always visible; picking a planner fetches DOs live from
-       the system, auto-assigns, and lands directly on the board. No manual
-       wizard steps. -->
+  <!-- Planner bar — always visible. Picking a planner logs in and loads
+       today's lorries automatically; fetching DOs waits for the ETD window
+       below so the user chooses what to pull before anything is assigned. -->
   <div class="card" id="card-login">
     <span class="tp-badge">TRUCK PLANNING</span>
     <h1 class="tp-h1">Loading Board</h1>
-    <p class="tp-sub">Pick a planner — today's DOs are fetched live from the system and
-      auto-assigned. Drag a card onto a lorry, or click AI Assign to re-run the algorithm.
+    <p class="tp-sub">Pick a planner, set the ETD window, then Fetch &amp; Assign.
+      Drag a card onto a lorry, or click AI Assign to re-run the algorithm.
       Bar shows MUATAN capacity — amber means inside the +10% naik allowance, red means
       over the limit.</p>
     <div class="tp-tabs" id="users"><span class="spin"></span></div>
     <div class="msg hidden" id="login-msg"></div>
+    <div class="tp-etd-row hidden" id="tp-etd-row">
+      <label for="etd-days-input">ETD window: &plusmn;
+        <input type="number" id="etd-days-input" min="0" step="1" value="2"> day(s)
+      </label>
+      <button class="btn" id="btn-fetch-assign" style="width:auto">📥 Fetch &amp; Assign</button>
+    </div>
   </div>
 
   <!-- Step 2: master lorry grid (today's defaults, editable in place) -->
@@ -1302,13 +1341,27 @@ function showBoardWithError(msg){
   setMsg('#board-msg', msg, true);
 }
 
-async function autoLoadPlanner(user){
+function _loadSavedEtdDays(){
+  try{
+    const v = localStorage.getItem('etdWindowDays');
+    if(v!==null && v!=='') $('#etd-days-input').value = v;
+  }catch(e){}
+}
+
+// Login + today's lorries + trip day happen automatically — fast, no
+// judgement call involved. Fetching DOs does NOT: the user picks the ETD
+// window first (below) and clicks Fetch & Assign themselves, rather than
+// the AI silently deciding what to pull. autoFetch=true (used by
+// Refetch/Start-over, an explicit click in its own right) skips re-asking
+// and reuses whatever's currently in the ETD-window field.
+async function autoLoadPlanner(user, autoFetch){
   clearMsgs();
   setActiveTab(user);
   document.querySelectorAll('.tp-tab').forEach(b=>b.disabled=true);
   hideAll();
+  show('#tp-etd-row', false);
   try{
-    setMsg('#login-msg', 'Loading '+user+"'s board… ", false);
+    setMsg('#login-msg', 'Loading '+user+"'s lorries… ", false);
     const dl = await jpost('/api/login',{user});
     if(!dl.user){ setMsg('#login-msg', dl.messages||'Could not load '+user, true); return; }
     needsMaster = !!dl.needs_master;
@@ -1332,8 +1385,28 @@ async function autoLoadPlanner(user){
     const dd = await jpost('/api/day',{day:'today'});
     if(!dd.ok){ setMsg('#login-msg', dd.messages||'Could not set trip day', true); return; }
 
+    setMsg('#login-msg', null);
+    _loadSavedEtdDays();
+    show('#tp-etd-row', true);
+    if(autoFetch) await fetchAndAssign();
+  } finally {
+    document.querySelectorAll('.tp-tab').forEach(b=>b.disabled=false);
+  }
+}
+
+async function fetchAndAssign(){
+  const btn = $('#btn-fetch-assign');
+  const raw = $('#etd-days-input').value;
+  const etdDays = raw==='' ? null : parseInt(raw, 10);
+  if(etdDays!==null && (isNaN(etdDays) || etdDays<0)){
+    setMsg('#login-msg', 'ETD window must be a whole number of days (0 or more).', true);
+    return;
+  }
+  try{ localStorage.setItem('etdWindowDays', raw); }catch(e){}
+  btn.disabled = true;
+  try{
     setMsg('#login-msg', 'Fetching DOs from system… ', false);
-    const df = await jpost('/api/dos-fetch',{});
+    const df = await jpost('/api/dos-fetch', {etd_days: etdDays});
     if(df.error){ showBoardWithError(df.error); return; }
 
     setMsg('#login-msg', 'Assigning lorries… ', false);
@@ -1347,16 +1420,17 @@ async function autoLoadPlanner(user){
     setMsg('#login-msg', null);
     showBoard();
   } finally {
-    document.querySelectorAll('.tp-tab').forEach(b=>b.disabled=false);
+    btn.disabled = false;
   }
 }
+$('#btn-fetch-assign').onclick = fetchAndAssign;
 
 async function restartPlanner(){
   document.body.classList.remove('board-active');
   await jpost('/api/back',{target:'login'});
   hideAll();
   const u = selUser || validUsers[0];
-  if(u) autoLoadPlanner(u);
+  if(u) autoLoadPlanner(u, true);
 }
 
 // ---- file drop helper ----
@@ -1623,16 +1697,28 @@ function boardCardEl(o){
   el.className='board-card'+(o._warned?' warned':'');
   el.dataset.do=o.do;
   const color=boardRouteColor(o.route);
+  const deleteBtn = o.lorry
+    ? `<button class="b-delete" title="Remove from ${esc(o.lorry)} and return to unassigned">&times;</button>`
+    : '';
   el.innerHTML=`
     <span class="b-stripe" style="background:${color}"></span>
     <div class="b-body">
-      <div class="b-top"><span class="b-id">${esc(o.do)}</span><span class="b-kg">${fmtT(o.weight)}</span></div>
+      <div class="b-top"><span class="b-id">${esc(o.do)}</span><span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn)">${esc(o.remarks)}</div>`:''}
       ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
     </div>`;
-  el.addEventListener('pointerdown', e=>startBoardDrag(e,o.do));
+  if(o.lorry){
+    el.querySelector('.b-delete').addEventListener('click', e=>{
+      e.stopPropagation();
+      moveBoardCard(o.do, null);
+    });
+  }
+  el.addEventListener('pointerdown', e=>{
+    if(e.target.classList.contains('b-delete')) return;
+    startBoardDrag(e,o.do);
+  });
   if(boardDrag && boardDrag.doId===o.do) el.classList.add('dragging');
   return el;
 }
@@ -1853,8 +1939,8 @@ $('#btn-refresh').onclick=doRefresh;
 
 // On load: render the planner tabs, then either restore an already-active
 // session (e.g. after a real browser refresh) straight onto its board, or
-// auto-run the pipeline for the first planner — no click needed, matching
-// the reference board's own on-load behaviour.
+// log the first planner in and load today's lorries automatically — DOs
+// still wait for the user to set an ETD window and click Fetch & Assign.
 async function boot(){
   await loadUsers();
   const d = await (await fetch('/api/state')).json();
