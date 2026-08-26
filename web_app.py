@@ -279,7 +279,7 @@ def _board_json(sess) -> dict:
             "customer": str(it.get("CUSTOMER NAME", "")),
             "weight": weight,
             "date": str(it.get("DATE", "")),
-            "remarks": str(it.get("REMARKS", "") or ""),
+            "remarks": str(_rm) if pd.notna(_rm := it.get("REMARKS")) else "",
             "lorry": assigned_plate,
         })
         if assigned_plate is None:
@@ -947,6 +947,7 @@ _PAGE = r"""<!doctype html>
   .board-route-head:hover{background:var(--line)}
   .board-route-chev{font-size:10px;color:var(--muted);transition:transform .15s}
   .board-route.open .board-route-chev{transform:rotate(90deg)}
+  .board-route-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
   .board-route-code{font-weight:700;font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
   .board-route-name{font-size:11.5px;color:var(--muted);white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis;min-width:0}
@@ -954,19 +955,28 @@ _PAGE = r"""<!doctype html>
     font-family:ui-monospace,Menlo,monospace}
   .board-route-body{display:none;flex-direction:column;gap:6px;padding:2px 8px 8px}
   .board-route.open .board-route-body{display:flex}
+  .board-lanes-tools{display:flex;gap:8px;margin-bottom:10px}
+  .mini-btn{background:var(--card2);border:1px solid var(--line);color:var(--muted);
+    border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer}
+  .mini-btn:hover{color:var(--ink);border-color:var(--brand)}
   .board-lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
   .board-lane{background:var(--card2);border:1px solid var(--line);border-radius:12px;
     padding:12px;min-height:120px;transition:box-shadow .12s,border-color .12s}
-  .board-lane.collapsed{min-height:0}
-  .board-lane.collapsed .board-lane-body{display:none}
+  .board-lane.collapsed{min-height:0;padding:9px 12px}
+  .board-lane.collapsed .board-cap-track{margin-bottom:0}
+  .board-lane.collapsed .board-lane-body,.board-lane.collapsed .board-lane-naik{display:none}
   .board-lane.zone-active{border-color:var(--brand);box-shadow:0 0 0 2px rgba(56,189,248,.35)}
-  .board-lane-head{display:flex;align-items:baseline;gap:7px;margin-bottom:7px;
+  .board-lane-head{display:flex;align-items:baseline;gap:7px;margin-bottom:2px;
     cursor:pointer;flex-wrap:wrap}
+  .board-lane-chev{font-size:9px;color:var(--muted);transition:transform .15s;align-self:center}
+  .board-lane.collapsed .board-lane-chev{transform:rotate(-90deg)}
   .board-lane-plate{font-weight:700;font-size:14px;font-family:ui-monospace,Menlo,monospace}
   .board-lane-count{font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;
     background:var(--bg);border-radius:10px;padding:1px 7px}
   .board-lane-load{margin-left:auto;font-size:11px;font-weight:700;
     font-family:ui-monospace,Menlo,monospace}
+  .board-lane-naik{font-size:10px;color:var(--muted);width:100%;text-align:right;
+    font-family:ui-monospace,Menlo,monospace;margin-bottom:6px}
   .board-cap-track{height:5px;background:var(--bg);border-radius:3px;overflow:hidden;margin-bottom:9px}
   .board-cap-fill{height:100%;transition:width .2s;background:var(--ok)}
   .board-cap-fill.hi{background:var(--warn)}
@@ -977,6 +987,7 @@ _PAGE = r"""<!doctype html>
     border-radius:8px;padding:7px 9px;cursor:grab;font-size:12.5px;touch-action:none;position:relative}
   .board-card.dragging{opacity:.25}
   .board-card.warned{border-color:var(--warn)}
+  .board-card .b-stripe{width:4px;align-self:stretch;border-radius:2px;flex-shrink:0}
   .board-card .b-body{min-width:0;flex:1}
   .board-card .b-top{display:flex;align-items:center;gap:7px}
   .board-card .b-id{font-family:ui-monospace,Menlo,monospace;font-weight:700;
@@ -1123,6 +1134,10 @@ _PAGE = r"""<!doctype html>
         <div id="board-routes"></div>
       </section>
       <div class="board-lanes-wrap">
+        <div class="board-lanes-tools">
+          <button class="mini-btn" id="board-collapse-all">Collapse all lorries</button>
+          <button class="mini-btn" id="board-expand-all">Expand all</button>
+        </div>
         <div class="board-lanes" id="board-lanes"></div>
       </div>
     </div>
@@ -1495,11 +1510,20 @@ function boardOrdersOnLorry(plate){ return BOARD.orders.filter(o=>o.lorry===plat
 function boardSumKg(list){ return list.reduce((s,o)=>s+o.weight,0); }
 function fmtT(w){ return w.toFixed(3)+'T'; }
 
+const BOARD_ROUTE_COLORS=['#5ab0ff','#c58bff','#ffd166','#7ee8b2','#ff9e7d',
+  '#8fd3ff','#f2a6d8','#b6e37a','#ffc98a','#9fb8ff'];
+function boardRouteColor(route){
+  const idx=(BOARD.routes||[]).findIndex(r=>r.route===route);
+  return BOARD_ROUTE_COLORS[(idx<0?0:idx)%BOARD_ROUTE_COLORS.length];
+}
+
 function boardCardEl(o){
   const el=document.createElement('div');
   el.className='board-card'+(o._warned?' warned':'');
   el.dataset.do=o.do;
+  const color=boardRouteColor(o.route);
   el.innerHTML=`
+    <span class="b-stripe" style="background:${color}"></span>
     <div class="b-body">
       <div class="b-top"><span class="b-id">${esc(o.do)}</span><span class="b-kg">${fmtT(o.weight)}</span></div>
       <div class="b-cust">${esc(o.customer)}</div>
@@ -1525,6 +1549,7 @@ function renderBoard(){
     div.innerHTML=`
       <div class="board-route-head">
         <span class="board-route-chev">&#9654;</span>
+        <span class="board-route-dot" style="background:${boardRouteColor(rt.route)}"></span>
         <span class="board-route-code">${esc(rt.route)}</span>
         <span class="board-route-meta">${list.length} DO &middot; ${fmtT(rt.weight)}</span>
       </div>
@@ -1552,10 +1577,12 @@ function renderBoard(){
     lane.dataset.zone=t.plate;
     lane.innerHTML=`
       <div class="board-lane-head">
+        <span class="board-lane-chev">&#9660;</span>
         <span class="board-lane-plate">${esc(t.plate)}</span>
-        <span class="board-lane-count">${list.length}</span>
+        <span class="board-lane-count">${list.length} DO${list.length===1?'':'s'}</span>
         <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</span>
       </div>
+      <div class="board-lane-naik">naik limit ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</div>
       <div class="board-cap-track"><div class="board-cap-fill ${fillClass}" style="width:${pct}%"></div></div>
       <div class="board-lane-body"></div>`;
     lane.querySelector('.board-lane-head').onclick=()=>{
@@ -1568,6 +1595,11 @@ function renderBoard(){
     lanes.appendChild(lane);
   });
 }
+$('#board-collapse-all').onclick=()=>{
+  if(BOARD) BOARD.lorries.forEach(t=>boardCollapsedLanes.add(t.plate));
+  renderBoard();
+};
+$('#board-expand-all').onclick=()=>{ boardCollapsedLanes.clear(); renderBoard(); };
 
 function startBoardDrag(e,doId){
   e.preventDefault(); e.stopPropagation();

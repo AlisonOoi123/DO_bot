@@ -3548,7 +3548,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _is_today = False
                     _not_today_count += 1
 
-            _remarks_raw = str(row.get("REMARKS", "")).strip()
+            _remarks_cell = row.get("REMARKS", "")
+            _remarks_raw = "" if pd.isna(_remarks_cell) else str(_remarks_cell).strip()
 
             # ── SHIP_DETAIL column (new file format) ──────────────────────────
             # Format: "<days>, [AM|PM], MAX <N> TON".  The SHIP_DETAIL "MAX N TON"
