@@ -346,6 +346,19 @@ _DEPOT = (DEPOT_LAT, DEPOT_LON)
 # Populated by LorryEngine._load_history(); takes priority over waypoint geocoding.
 _HISTORY_CENTROIDS: dict[str, tuple] = {}
 
+# Parsing the history file (ZSDOROUTEWRH.xlsx — every past assignment ever
+# logged) is by far the most expensive part of building a LorryEngine: it's
+# read fresh, from scratch, on every single login (every LorryEngine()
+# construction), and openpyxl parsing a many-thousand-row .xlsx can take
+# several seconds to tens of seconds depending on how large the file has
+# grown. Since a portal session now constructs a fresh LorryEngine on every
+# planner-tab click (not just once at the start of a multi-step wizard), that
+# cost is paid far more often than before. Cache the fully-processed result
+# keyed on (path, mtime, size) per matched file, so repeat loads of the SAME
+# unchanged file reuse the parsed DataFrame instead of re-parsing — a new day
+# appending real rows changes the signature and correctly triggers a re-read.
+_HISTORY_LOAD_CACHE: dict[str, tuple] = {}  # path -> (signature, history_df, centroids)
+
 def _route_centroid(route: str) -> tuple | None:
     """Geographic centroid (lat, lng) of a route's destinations.
 
@@ -736,9 +749,27 @@ class LorryEngine:
         return out
 
     def _load_history(self, path):
+        """Load + process the history file, reusing a cached parse when the
+        underlying file(s) haven't changed since the last load (see
+        _HISTORY_LOAD_CACHE's module-level docstring for why this matters)."""
         import os, glob
         global _HISTORY_CENTROIDS
         paths = [path] if os.path.isfile(path) else (glob.glob(path + "*") or [path])
+        try:
+            signature = tuple(sorted(
+                (p, os.path.getmtime(p), os.path.getsize(p)) for p in paths if os.path.isfile(p)
+            ))
+        except OSError:
+            signature = None
+
+        cached = _HISTORY_LOAD_CACHE.get(path)
+        if signature is not None and cached is not None and cached[0] == signature:
+            _, cached_history, cached_centroids = cached
+            self.history = cached_history.copy()
+            _HISTORY_CENTROIDS.update(cached_centroids)
+            return
+
+        collected_centroids: dict[str, tuple] = {}
         frames = []
         for p in paths:
             try:
@@ -767,6 +798,7 @@ class LorryEngine:
                     # Build GPS centroid cache from LONGITUD column
                     new_centroids = self._parse_longitud_centroids(df)
                     _HISTORY_CENTROIDS.update(new_centroids)
+                    collected_centroids.update(new_centroids)
                 if "DISTANCE" in df.columns:
                     df["DISTANCE_KM"] = df["DISTANCE"].apply(_distance_km)
                 frames.append(df)
@@ -775,6 +807,8 @@ class LorryEngine:
 
         if not frames:
             self.history = pd.DataFrame(columns=["ROUTE", "LICENSE", "CUSTOMER NAME", "CLUSTER", "CORRIDOR"])
+            if signature is not None:
+                _HISTORY_LOAD_CACHE[path] = (signature, self.history.copy(), collected_centroids)
             return
 
         combined = pd.concat(frames, ignore_index=True)
@@ -797,6 +831,9 @@ class LorryEngine:
             self.history["DATE"] = pd.NaT
         else:
             self.history["DATE"] = pd.to_datetime(self.history["DATE"], errors="coerce")
+
+        if signature is not None:
+            _HISTORY_LOAD_CACHE[path] = (signature, self.history.copy(), collected_centroids)
 
     def _build_route_frequency(self):
         """Build 3 frequency tables: route, customer+route, cluster (Rules 4+5)."""

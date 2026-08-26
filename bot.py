@@ -2413,6 +2413,13 @@ def _parse_master_lorry(file_bytes):
     TON is computed from DESCRIPTION / 1000 (the TON column is a spreadsheet
     formula, so we read the kg value in DESCRIPTION).
 
+    A row with USER == 'SPARE' is a shared lorry, not tied to one planner —
+    when Available it's added to BOTH ABI's and VIVIAN's fleet (whichever of
+    them logs in that day can use it), and never counts toward the
+    'Available for >1 user' conflict check below (that check is for a real
+    plate mistakenly double-booked between two named planners; a SPARE row
+    being usable by both is the intended design, not a conflict).
+
     Returns (per_user, conflicts, err):
       per_user  = {USER: [(plate, ton), ...]}  Available plates per user
       conflicts = [(plate, [users]), ...]      plates Available under >1 user
@@ -2446,12 +2453,18 @@ def _parse_master_lorry(file_bytes):
         plate_users.setdefault(plate, {})[user] = (ton, status)
     per_user: dict = {}
     conflicts: list = []
+    _SPARE_SHARED_WITH = ("ABI", "VIVIAN")
     for plate, um in plate_users.items():
-        avail = [u for u, (t, s) in um.items() if s.startswith("AVAIL")]
+        avail = [u for u, (t, s) in um.items() if s.startswith("AVAIL") and u != "SPARE"]
         if len(avail) > 1:
             conflicts.append((plate, sorted(avail)))
         for u, (t, s) in um.items():
-            if s.startswith("AVAIL"):
+            if not s.startswith("AVAIL"):
+                continue
+            if u == "SPARE":
+                for shared_u in _SPARE_SHARED_WITH:
+                    per_user.setdefault(shared_u, []).append((plate, t))
+            else:
                 per_user.setdefault(u, []).append((plate, t))
     return per_user, conflicts, None
 

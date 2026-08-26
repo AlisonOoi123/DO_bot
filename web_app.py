@@ -355,9 +355,13 @@ def api_users():
         users = bot._get_valid_users()
     except Exception:
         users = ["ABI", "VIVIAN"]
-    # Hide non-selectable placeholder users from the web picker.
-    _hidden = {"NAME", "SPARE"}
-    users = [u for u in users if str(u).strip().upper() not in _hidden]
+    # The portal only has planner tabs for ABI and VIVIAN — BIG/SELAYANG have
+    # no tab (so the AI never auto-assigns using their lorries; those plates
+    # stay reachable only via manual plate-number assignment), and SPARE
+    # isn't a planner at all — its lorries are folded into ABI's and
+    # VIVIAN's own fleet automatically (see _parse_master_lorry).
+    _allowed = {"ABI", "VIVIAN"}
+    users = [u for u in users if str(u).strip().upper() in _allowed]
     return _with_cookie({"users": list(users)}, sid)
 
 
@@ -1366,7 +1370,13 @@ function wireDrop(dropId,inputId,onFile){
 
 // ---- Step 2: master lorry grid (editable, no upload) ----
 const STATUS_OPTS=['AVAILABLE','BLOCK'];
-function masterUserOpts(){ return validUsers.length ? validUsers : [selUser]; }
+function masterUserOpts(){
+  // The portal's planner tabs are ABI/VIVIAN only, but a row in this grid
+  // can still legitimately be a shared SPARE lorry — offer that as a third
+  // option here even though it's not a tab.
+  const base = validUsers.length ? validUsers : [selUser];
+  return base.includes('SPARE') ? base : [...base, 'SPARE'];
+}
 function masterRowHtml(r){
   const userOpts=masterUserOpts();
   const userSelect = userOpts.map(u=>`<option value="${esc(u)}" ${u===r.user?'selected':''}>${esc(u)}</option>`).join('');
