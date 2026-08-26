@@ -2,9 +2,15 @@
 Live DO (Delivery Order) source — pulls today's delivery data directly from
 the ERP database (X3), for the web portal's "fetch DOs from system" button.
 
-Mirrors the standalone generate_script.py report (same query, same
-ROUTE_MAP, same SHIP_DETAIL rules, same filters) with two differences,
-both deliberate:
+Query verified directly against the production SQL (shared 2026-08-26,
+see sql_query.docx) — REMARKS and DISTANCE actually live on BPDLVCUST,
+not SDELIVERY, and INVOICE DATE needs a join to SINVOICE.ACCDAT_0; the
+first version of this file selected none of those correctly and always
+sent REMARKS/DISTANCE/INVOICE DATE blank, silently skipping the
+REMARKS-driven size-cap/day-restriction logic on every live fetch.
+
+Mirrors the standalone generate_script.py report (same ROUTE_MAP, same
+SHIP_DETAIL rules, same filters) with differences, all deliberate:
 
   1. Rows whose ETD is the database's NULL sentinel (1753-01-01, from
      `ISNULL(d.ZETD_0, '1753-01-01')` in the SQL) are dropped — those DOs
@@ -13,6 +19,10 @@ both deliberate:
      actually looks for (generate_script.py's names didn't line up, which
      would have silently disabled the affected features on any file from
      this source): 'SHIP DETAIL' -> 'SHIP_DETAIL', 'LONGITUDE' -> 'LONGITUD'.
+  3. UVYDAY1_0-UVYDAY7_0 and ZUVYDAY8_0-ZUVYDAY16_0 are pulled in (matching
+     the production query) but not yet interpreted into anything — their
+     meaning hasn't been confirmed. Only ZUVYDAY17_0-21_0 (the size-cap
+     flags) are used, as before.
 
 Configuration: a JSON file with {server, database, username, password,
 driver} — see configrd.json. NEVER commit this file; it holds a real
@@ -130,7 +140,12 @@ SELECT
     d.SIHNUM_0,
     d.STOFCY_0,
     d.SDHTYP_0,
+    d.CFMFLG_0,
     c.DRN_0,
+    ISNULL(c.ZDOREMARKS_0, '') AS ZDOREMARKS_0,
+    ISNULL(c.ZDISTANCE_0, '') AS ZDISTANCE_0,
+    ISNULL(c.ZLONGITUD_0, '') AS ZLONGITUD_0,
+    i.ACCDAT_0 AS INVOICE_DATE,
     a.POSCOD_0 AS BPDPOSCOD_0,
     a.CTY_0 AS BPDCTY_0,
     a.SAT_0 AS BPDSAT_0,
@@ -139,6 +154,22 @@ SELECT
     ISNULL(d.ZFOLLOWER1_0, '') AS ZFOLLOWER1_0,
     ISNULL(d.ZFOLLOWER2_0, '') AS ZFOLLOWER2_0,
     ISNULL(d.ZETD_0, '1753-01-01') AS ZETD_0,
+    ISNULL(c.UVYDAY1_0, 0) AS UVYDAY1_0,
+    ISNULL(c.UVYDAY2_0, 0) AS UVYDAY2_0,
+    ISNULL(c.UVYDAY3_0, 0) AS UVYDAY3_0,
+    ISNULL(c.UVYDAY4_0, 0) AS UVYDAY4_0,
+    ISNULL(c.UVYDAY5_0, 0) AS UVYDAY5_0,
+    ISNULL(c.UVYDAY6_0, 0) AS UVYDAY6_0,
+    ISNULL(c.UVYDAY7_0, 0) AS UVYDAY7_0,
+    ISNULL(c.ZUVYDAY8_0, 0) AS ZUVYDAY8_0,
+    ISNULL(c.ZUVYDAY9_0, 0) AS ZUVYDAY9_0,
+    ISNULL(c.ZUVYDAY10_0, 0) AS ZUVYDAY10_0,
+    ISNULL(c.ZUVYDAY11_0, 0) AS ZUVYDAY11_0,
+    ISNULL(c.ZUVYDAY12_0, 0) AS ZUVYDAY12_0,
+    ISNULL(c.ZUVYDAY13_0, 0) AS ZUVYDAY13_0,
+    ISNULL(c.ZUVYDAY14_0, 0) AS ZUVYDAY14_0,
+    ISNULL(c.ZUVYDAY15_0, 0) AS ZUVYDAY15_0,
+    ISNULL(c.ZUVYDAY16_0, 0) AS ZUVYDAY16_0,
     ISNULL(c.ZUVYDAY17_0, 0) AS ZUVYDAY17_0,
     ISNULL(c.ZUVYDAY18_0, 0) AS ZUVYDAY18_0,
     ISNULL(c.ZUVYDAY19_0, 0) AS ZUVYDAY19_0,
@@ -146,16 +177,19 @@ SELECT
     ISNULL(c.ZUVYDAY21_0, 0) AS ZUVYDAY21_0
 FROM {schema}.SDELIVERY d
 LEFT JOIN {schema}.BPDLVCUST c
-    ON d.BPCORD_0 = c.BPCNUM_0
-   AND d.BPAADD_0 = c.BPAADD_0
+    ON d.BPAADD_0 = c.BPAADD_0
+   AND d.BPCORD_0 = c.BPCNUM_0
+LEFT JOIN {schema}.SINVOICE i
+    ON d.SIHNUM_0 = i.NUM_0
 LEFT JOIN {schema}.BPADDRESS a
-    ON d.BPCORD_0 = a.BPANUM_0
-   AND d.BPAADD_0 = a.BPAADD_0
+    ON c.BPCNUM_0 = a.BPANUM_0
+   AND c.BPAADD_0 = a.BPAADD_0
 WHERE d.SDHTYP_0 <> 'LOAN'
   AND d.STOFCY_0 = '1SA'
   AND (d.SIHNUM_0 IS NULL OR LTRIM(RTRIM(d.SIHNUM_0)) = '')
   AND c.DRN_0 IN ({drn_list})
   {etd_clause}
+ORDER BY d.DLVDAT_0
 """
 
 
@@ -241,8 +275,10 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         filtered_df['DLVDAT_0'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
     filtered_df['ETD_FORMATTED'] = pd.to_datetime(
         filtered_df['ZETD_0'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
+    filtered_df['INVOICE_DATE_FORMATTED'] = pd.to_datetime(
+        filtered_df['INVOICE_DATE'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
 
-    for col in ['ZDOREMARKS_0', 'ZLONGITUD_0', 'INVOICE_DATE', 'DISTANCE']:
+    for col in ['ZDOREMARKS_0', 'ZLONGITUD_0', 'ZDISTANCE_0']:
         if col not in filtered_df.columns:
             filtered_df[col] = ''
 
@@ -260,13 +296,13 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         'REMARKS': filtered_df['ZDOREMARKS_0'],
         'VALIDATED': filtered_df['VALIDATED'],
         'INVOICE NO': filtered_df['SIHNUM_0'],
-        'INVOICE DATE': filtered_df['INVOICE_DATE'],
+        'INVOICE DATE': filtered_df['INVOICE_DATE_FORMATTED'],
         'SITE': filtered_df['STOFCY_0'],
         'LICENSE': filtered_df['ZLICENSE_0'],
         'DRIVER': filtered_df['ZDRIVER_0'],
         'LORRY ASST 1': filtered_df['ZFOLLOWER1_0'],
         'LORRY ASST 2': filtered_df['ZFOLLOWER2_0'],
-        'DISTANCE': filtered_df['DISTANCE'],
+        'DISTANCE': filtered_df['ZDISTANCE_0'],
         'LONGITUD': filtered_df['ZLONGITUD_0'],          # was 'LONGITUDE' — see docstring
         'POSTCODE': filtered_df['BPDPOSCOD_0'],
         'CITY': filtered_df['BPDCTY_0'],
