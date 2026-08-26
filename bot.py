@@ -1404,6 +1404,32 @@ def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
             "unassigned_count": unassigned_count, "refilled_count": refilled_count}
 
 
+def refresh_eligible_from_toggle(sess) -> None:
+    """Rebuild engine.eligible_lorries from this session's full fleet, applying
+    today's LIVE on/off toggle state fresh.
+
+    A toggle mutates eligible_lorries directly for whichever session actually
+    clicked it, but a shared SPARE plate's other planner may already have a
+    session open with its own (now-stale) eligible_lorries snapshot — e.g.
+    ABI turns WA6899M on right as VIVIAN is mid-setup; VIVIAN's session never
+    saw that write. Calling this right before an assignment run makes the
+    eligible fleet always reflect the current toggle state (including
+    another planner's claim on a shared SPARE) regardless of when either
+    session last touched it, so two planners can't both get handed the same
+    SPARE lorry by assigning at the same time."""
+    engine = sess.get("engine")
+    user = sess.get("user_id")
+    full_fleet = sess.get("_full_fleet")
+    if engine is None or not user or full_fleet is None:
+        return
+    _off = get_unavailable_plates_for(user)
+    _assignable = [(p, t) for p, t in full_fleet if str(p).strip().upper() not in _off]
+    engine.eligible_lorries = pd.DataFrame(
+        [{"LORRY": p, "TON": t, "USER": user, "Status": "Available"}
+         for p, t in sorted(_assignable)]
+    )
+
+
 def _spare_plates(engine) -> set:
     """Plates in this user's fleet that are SPARE (shared)."""
     el = engine.eligible_lorries
@@ -3609,6 +3635,11 @@ def board_move_route(sess, route: str, plate) -> dict:
 
 def _handle_excel_upload(phone, sess, file_bytes):
     try:
+        # Always assign against the LATEST toggle state — not just whatever
+        # this session's eligible_lorries happened to hold last. Covers a
+        # shared SPARE plate the other planner claimed (or released) after
+        # this session was already set up.
+        refresh_eligible_from_toggle(sess)
         # Keep the raw upload so "assign off-schedule DOs" (YES) can re-run the
         # full assignment with the schedule filter off.
         if file_bytes and not sess.get("_ignore_schedule"):
