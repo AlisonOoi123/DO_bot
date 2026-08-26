@@ -255,13 +255,25 @@ def _board_json(sess) -> dict:
             return None
         return v if pd.notna(v) and v not in (float("inf"), float("-inf")) else None
 
-    # Board lanes = the logged-in planner's OWN eligible fleet (own lorries +
-    # shared SPARE) only — not the whole company's. A plate that already has
-    # a DO on it from elsewhere (e.g. a manual table-view assignment onto a
-    # BIG/SELAYANG plate) still gets a lane so that assignment stays visible,
-    # even though it's not itself a drop target the planner would pick from.
+    # Board lanes = the logged-in planner's OWN fleet (own lorries + shared
+    # SPARE) only — not the whole company's. Lanes are sourced from the FULL
+    # fleet (sess["_full_fleet"], captured before toggle-filtering), not from
+    # engine.eligible_lorries, so a plate the planner has toggled OFF still
+    # shows a lane (with a working switch) instead of disappearing. A plate
+    # that already has a DO on it from elsewhere (e.g. a manual table-view
+    # assignment onto a BIG/SELAYANG plate) still gets a lane so that
+    # assignment stays visible, even though it's not itself a drop target.
     caps = {}
-    if engine is not None and getattr(engine, "eligible_lorries", None) is not None:
+    _full_fleet = sess.get("_full_fleet")
+    if _full_fleet:
+        for p, t in _full_fleet:
+            try:
+                v = float(t)
+            except (TypeError, ValueError):
+                continue
+            if pd.notna(v) and v not in (float("inf"), float("-inf")):
+                caps[str(p).strip().upper()] = v
+    elif engine is not None and getattr(engine, "eligible_lorries", None) is not None:
         try:
             for _, r in engine.eligible_lorries.iterrows():
                 v = _finite_ton(r)
@@ -269,6 +281,11 @@ def _board_json(sess) -> dict:
                     caps[str(r["LORRY"]).strip().upper()] = v
         except Exception:
             caps = {}
+    _off_plates = set()
+    try:
+        _off_plates = bot.get_unavailable_plates_for(sess.get("user_id") or "")
+    except Exception:
+        pass
     _all_caps = {}
     if engine is not None and getattr(engine, "all_lorries", None) is not None:
         try:
@@ -306,7 +323,8 @@ def _board_json(sess) -> dict:
     return {
         "orders": orders,
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
-        "lorries": [{"plate": p, "capacity": c} for p, c in sorted(caps.items())],
+        "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates}
+                    for p, c in sorted(caps.items())],
     }
 
 
@@ -666,6 +684,43 @@ def api_board_move():
     return _with_cookie(outcome, sid)
 
 
+@app.route("/api/board/move-route", methods=["POST"])
+def api_board_move_route():
+    """Drag an entire route group (all its currently-unassigned DOs) onto
+    one lorry in a single drop, instead of one card at a time."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    body = request.json or {}
+    route = str(body.get("route", "")).strip()
+    plate = body.get("lorry")
+    if not route:
+        return _with_cookie({"error": "Missing 'route'."}, sid, 400)
+    outcome = bot.board_move_route(sess, route, plate)
+    if not outcome.get("ok"):
+        return _with_cookie(outcome, sid, 400)
+    outcome["board"] = _board_json(sess)
+    return _with_cookie(outcome, sid)
+
+
+@app.route("/api/board/toggle-lorry", methods=["POST"])
+def api_board_toggle_lorry():
+    """Flip a lorry's on/off availability for today. Off means it's not
+    available for AI assignment (and any DOs on it get unassigned); a SPARE
+    plate turned on for one planner is forced off for the other."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    body = request.json or {}
+    plate = str(body.get("plate", "")).strip()
+    on = bool(body.get("on"))
+    if not plate:
+        return _with_cookie({"error": "Missing 'plate'."}, sid, 400)
+    outcome = bot.toggle_lorry_availability(sess, plate, on)
+    if not outcome.get("ok"):
+        return _with_cookie(outcome, sid, 400)
+    outcome["board"] = _board_json(sess)
+    return _with_cookie(outcome, sid)
+
+
 @app.route("/api/board/ai-assign", methods=["POST"])
 def api_board_ai_assign():
     """Re-run the real auto-assignment engine from scratch over the originally
@@ -1017,6 +1072,14 @@ _PAGE = r"""<!doctype html>
     background:var(--bg);border-radius:10px;padding:1px 7px}
   .board-lane-load{margin-left:auto;font-size:11px;font-weight:700;
     font-family:ui-monospace,Menlo,monospace}
+  .board-lane.lane-off{opacity:.5}
+  .board-lane.lane-off .board-lane-body{pointer-events:none}
+  .lane-toggle{position:relative;width:30px;height:17px;border-radius:9px;background:var(--ok);
+    flex-shrink:0;cursor:pointer;transition:background .15s;border:none;padding:0}
+  .lane-toggle.off{background:var(--line)}
+  .lane-toggle::after{content:'';position:absolute;top:2px;left:2px;width:13px;height:13px;
+    border-radius:50%;background:#fff;transition:left .15s}
+  .lane-toggle.off::after{left:15px}
   .board-lane-naik{font-size:10px;color:var(--muted);width:100%;text-align:right;
     font-family:ui-monospace,Menlo,monospace;margin-bottom:6px}
   .board-cap-track{height:5px;background:var(--bg);border-radius:3px;overflow:hidden;margin-bottom:9px}
@@ -1643,6 +1706,7 @@ function renderResult(r){
 let BOARD=null;
 let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set();
 let boardDrag=null, boardGhost=null;
+let routeDragCandidate=null, routeDrag=null, routeGhost=null, routeDragJustHappened=false;
 
 function showBoard(){
   hideAll(); show('#card-board',true);
@@ -1741,10 +1805,16 @@ function renderBoard(){
         <span class="board-route-meta">${list.length} DO &middot; ${fmtT(rt.weight)}</span>
       </div>
       <div class="board-route-body"></div>`;
-    div.querySelector('.board-route-head').onclick=()=>{
+    const _head=div.querySelector('.board-route-head');
+    _head.onclick=()=>{
+      if(routeDragJustHappened){ routeDragJustHappened=false; return; }
       boardOpenRoutes.has(rt.route)?boardOpenRoutes.delete(rt.route):boardOpenRoutes.add(rt.route);
       renderBoard();
     };
+    _head.addEventListener('pointerdown', e=>{
+      if(e.target.closest('.board-route-chev')) return;
+      routeDragCandidate={route:rt.route, startX:e.clientX, startY:e.clientY, count:list.length, weight:rt.weight};
+    });
     const body=div.querySelector('.board-route-body');
     list.forEach(o=>body.appendChild(boardCardEl(o)));
     wrap.appendChild(div);
@@ -1759,22 +1829,29 @@ function renderBoard(){
     const over=t.capacity && load>t.capacity;
     const fillClass= over?'over': pct>=85?'hi':'';
     const collapsed=boardCollapsedLanes.has(t.plate);
+    const isOn=t.on!==false;
     const lane=document.createElement('section');
-    lane.className='board-lane'+(collapsed?' collapsed':'');
-    lane.dataset.zone=t.plate;
+    lane.className='board-lane'+(collapsed?' collapsed':'')+(isOn?'':' lane-off');
+    if(isOn) lane.dataset.zone=t.plate;
     lane.innerHTML=`
       <div class="board-lane-head">
         <span class="board-lane-chev">&#9660;</span>
         <span class="board-lane-plate">${esc(t.plate)}</span>
+        <button class="lane-toggle${isOn?'':' off'}" title="${isOn?'Available today — click to turn off':'Not available today — click to turn on'}"></button>
         <span class="board-lane-count">${list.length} DO${list.length===1?'':'s'}</span>
         <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</span>
       </div>
       <div class="board-lane-naik">naik limit ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</div>
       <div class="board-cap-track"><div class="board-cap-fill ${fillClass}" style="width:${pct}%"></div></div>
       <div class="board-lane-body"></div>`;
-    lane.querySelector('.board-lane-head').onclick=()=>{
+    lane.querySelector('.board-lane-head').onclick=(e)=>{
+      if(e.target.closest('.lane-toggle')) return;
       collapsed?boardCollapsedLanes.delete(t.plate):boardCollapsedLanes.add(t.plate);
       renderBoard();
+    };
+    lane.querySelector('.lane-toggle').onclick=async(e)=>{
+      e.stopPropagation();
+      await toggleLorry(t.plate, !isOn);
     };
     const body=lane.querySelector('.board-lane-body');
     if(!list.length) body.innerHTML='<div class="board-empty">Drop DOs here</div>';
@@ -1801,7 +1878,7 @@ function startBoardDrag(e,doId){
   moveBoardGhost(e.clientX,e.clientY);
   renderBoard();
 }
-function moveBoardGhost(x,y){ if(boardGhost){ boardGhost.style.left=x+'px'; boardGhost.style.top=y+'px'; } }
+function moveBoardGhost(x,y,ghost){ ghost=ghost||boardGhost; if(ghost){ ghost.style.left=x+'px'; ghost.style.top=y+'px'; } }
 function boardZoneAt(x,y){
   for(const el of document.elementsFromPoint(x,y)){
     const z=el.closest?.('[data-zone]');
@@ -1810,13 +1887,46 @@ function boardZoneAt(x,y){
   return null;
 }
 document.addEventListener('pointermove', e=>{
+  if(routeDragCandidate && !routeDrag){
+    const dx=e.clientX-routeDragCandidate.startX, dy=e.clientY-routeDragCandidate.startY;
+    if(Math.hypot(dx,dy) > 6){
+      routeDrag={route:routeDragCandidate.route};
+      routeGhost=document.createElement('div');
+      routeGhost.className='board-ghost';
+      routeGhost.innerHTML=`<span style="color:var(--brand);font-weight:700;font-family:ui-monospace,Menlo,monospace">${esc(routeDrag.route)}</span>`+
+        `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">whole route</span>`+
+        `<span style="color:var(--muted);flex-shrink:0">${routeDragCandidate.count} DO &middot; ${fmtT(routeDragCandidate.weight)}</span>`;
+      document.body.appendChild(routeGhost);
+    }
+  }
+  if(routeDrag){
+    moveBoardGhost(e.clientX,e.clientY,routeGhost);
+    document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
+    const z=boardZoneAt(e.clientX,e.clientY);
+    if(z && z.dataset.zone) z.classList.add('zone-active');   // lorry lanes only, not the pool
+    return;
+  }
   if(!boardDrag) return;
-  moveBoardGhost(e.clientX,e.clientY);
+  moveBoardGhost(e.clientX,e.clientY,boardGhost);
   document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
   const z=boardZoneAt(e.clientX,e.clientY);
   if(z) z.classList.add('zone-active');
 });
 document.addEventListener('pointerup', async e=>{
+  if(routeDragCandidate || routeDrag){
+    const wasDragging=!!routeDrag;
+    const z=wasDragging?boardZoneAt(e.clientX,e.clientY):null;
+    const route=routeDrag?routeDrag.route:null;
+    routeDragCandidate=null; routeDrag=null;
+    if(routeGhost){ routeGhost.remove(); routeGhost=null; }
+    document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
+    if(wasDragging){
+      routeDragJustHappened=true;
+      if(z && z.dataset.zone){ await moveBoardRoute(route, z.dataset.zone); }
+      else { renderBoard(); }
+    }
+    return;
+  }
   if(!boardDrag) return;
   const z=boardZoneAt(e.clientX,e.clientY);
   const doId=boardDrag.doId;
@@ -1828,6 +1938,18 @@ document.addEventListener('pointerup', async e=>{
   await moveBoardCard(doId, zone || null);
 });
 
+async function moveBoardRoute(route, plate){
+  const d=await jpost('/api/board/move-route',{route, lorry:plate});
+  if(!d.ok){ boardToast(d.message||d.error||'Move failed'); await loadBoard(); return; }
+  if(d.warnings && d.warnings.length){
+    boardToast(`${route}: ${d.moved}/${d.total} moved · ${d.warnings.slice(0,2).join(' · ')}`);
+  } else {
+    boardToast(`${route}: ${d.moved} DO(s) moved to ${plate}.`);
+  }
+  if(d.board){ BOARD=d.board; }
+  renderBoard();
+}
+
 async function moveBoardCard(doId, plate){
   const d=await jpost('/api/board/move',{do:doId, lorry:plate});
   if(!d.ok){ boardToast(d.message||d.error||'Move failed'); await loadBoard(); return; }
@@ -1837,6 +1959,16 @@ async function moveBoardCard(doId, plate){
       const o=BOARD.orders.find(x=>x.do===doId);
       if(o) o._warned = (d.warnings&&d.warnings.length) ? d.warnings[0] : null;
     }
+  }
+  renderBoard();
+}
+
+async function toggleLorry(plate, on){
+  const d=await jpost('/api/board/toggle-lorry',{plate, on});
+  if(!d.ok){ boardToast(d.message||d.error||'Toggle failed'); await loadBoard(); return; }
+  if(d.board){ BOARD=d.board; }
+  if(!on && d.unassigned_count){
+    boardToast(`${plate} turned off · ${d.unassigned_count} DO(s) sent back to unassigned.`);
   }
   renderBoard();
 }

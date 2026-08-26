@@ -1223,6 +1223,123 @@ def clear_daily_log_for_user(engine) -> list[str]:
     return sorted(my_plates)
 
 
+LORRY_TOGGLE_PATH = os.path.join(_DATA_DIR, "lorry_toggle.json")
+
+
+def _muatan_spare_plates() -> set:
+    """Plates tagged SPARE in LORRY DAILY PLANNING.xlsx's MUATAN sheet — the
+    ones shared between ABI and VIVIAN, subject to the board's on/off switch
+    enforcing that only one of them has a given SPARE plate available at a
+    time. Reads the sheet directly rather than a session's engine (unlike
+    the older _spare_plates(engine) below) since the toggle state must be
+    resolvable before any particular session's eligible_lorries exists."""
+    try:
+        df = pd.read_excel(PLANNING_PATH, sheet_name="MUATAN", header=None)
+        if len(df) == 0 or str(df.iloc[0, 0]).strip().upper() != "NAME":
+            return set()
+        out = set()
+        for _, r in df.iloc[1:].iterrows():
+            user_val  = str(r.iloc[0]).strip().upper() if pd.notna(r.iloc[0]) else ""
+            plate_val = str(r.iloc[1]).strip().upper() if pd.notna(r.iloc[1]) else ""
+            if user_val == "SPARE" and plate_val:
+                out.add(plate_val)
+        return out
+    except Exception:
+        return set()
+
+
+def _load_lorry_toggle() -> dict:
+    """Returns {"date": "YYYY-MM-DD", "off_for": {"PLATE": ["ABI", ...]}} —
+    which planners have switched each plate OFF (not available) today.
+    Resets automatically at the start of a new day, same as the daily log."""
+    if os.path.exists(LORRY_TOGGLE_PATH):
+        try:
+            with open(LORRY_TOGGLE_PATH, "r") as f:
+                data = json.load(f)
+            if data.get("date") == _today():
+                return data
+        except Exception:
+            pass
+    return {"date": _today(), "off_for": {}}
+
+
+def _save_lorry_toggle(state: dict):
+    state["off_for"] = {p: sorted(set(us)) for p, us in state.get("off_for", {}).items() if us}
+    with open(LORRY_TOGGLE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def get_unavailable_plates_for(user: str) -> set:
+    """Plates this planner has switched OFF today — excluded from their
+    eligible fleet when it's (re)built at login."""
+    user = user.strip().upper()
+    state = _load_lorry_toggle()
+    return {p for p, us in state.get("off_for", {}).items() if user in us}
+
+
+def set_plate_toggle(plate: str, user: str, on: bool) -> None:
+    """Turn a plate ON/OFF for this planner today. Turning a SPARE plate ON
+    for one planner forces it OFF for the other(s) that share it — only one
+    of ABI/VIVIAN can actually take a shared lorry out on a given day."""
+    plate = plate.strip().upper()
+    user = user.strip().upper()
+    state = _load_lorry_toggle()
+    off_for = state.setdefault("off_for", {})
+    plate_off = set(off_for.get(plate, []))
+    if on:
+        plate_off.discard(user)
+        if plate in _muatan_spare_plates():
+            for other in _MASTER_FILE_USERS:
+                if other != user:
+                    plate_off.add(other)
+    else:
+        plate_off.add(user)
+    off_for[plate] = sorted(plate_off)
+    _save_lorry_toggle(state)
+
+
+def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
+    """Board on/off switch: mark a plate available/unavailable for today for
+    the logged-in planner, update this session's live eligible fleet, and
+    (if switching OFF) send any DOs currently on that plate back to the
+    unassigned pool — an unavailable lorry can't keep carrying a load."""
+    user = sess.get("user_id")
+    engine = sess.get("engine")
+    if not user or engine is None:
+        return {"error": "not_logged_in", "message": "Please pick a planner first."}
+    plate = plate.strip().upper()
+    set_plate_toggle(plate, user, on)
+
+    el = engine.eligible_lorries
+    unassigned_count = 0
+    if on:
+        if "LORRY" in el.columns and plate not in set(el["LORRY"].str.upper()):
+            # Only re-add a plate that actually belongs to this planner's own
+            # fleet (own lorries + shared SPARE) — captured in _full_fleet
+            # before any toggle-filtering. A plate outside that fleet (e.g.
+            # BIG/SELAYANG, or the other planner's own lorry) is never a valid
+            # drop target for this user, toggle or not.
+            _fleet_tons = {str(p).strip().upper(): t for p, t in sess.get("_full_fleet") or []}
+            _ton = _fleet_tons.get(plate)
+            if _ton is not None:
+                engine.eligible_lorries = pd.concat([
+                    el, pd.DataFrame([{"LORRY": plate, "TON": _ton, "USER": user, "Status": "Available"}])
+                ], ignore_index=True)
+    else:
+        if "LORRY" in el.columns:
+            engine.eligible_lorries = el[el["LORRY"].str.upper() != plate].reset_index(drop=True)
+        for it in sess.get("items", []) or []:
+            if str(it.get("LORRY", "")).strip().upper() == plate:
+                it["LORRY"] = None
+                sess.setdefault("assigned", {}).pop(it["DO NUMBER"], None)
+                unassigned_count += 1
+        if unassigned_count:
+            for do in sess.get("pending_dos", []):
+                do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
+            sess.pop("export_bytes", None)
+    return {"ok": True, "plate": plate, "on": on, "unassigned_count": unassigned_count}
+
+
 def _spare_plates(engine) -> set:
     """Plates in this user's fleet that are SPARE (shared)."""
     el = engine.eligible_lorries
@@ -2554,10 +2671,23 @@ def _handle_master_upload(phone, sess, file_bytes):
         clear_specific_plates_from_log(_mine_in_log)
     sess["unavailable"] = set(get_assigned_today()) | set(get_broken_lorries())
 
+    # Keep the FULL per-user fleet (before toggle-filtering) so the board can
+    # still render a lane — with a working switch — for a plate the user has
+    # toggled OFF. Only `eligible_lorries` (used for actual AI assignment)
+    # gets toggle-filtered below.
+    sess["_full_fleet"] = list(my_fleet)
+
+    # A lorry this planner has toggled OFF today (board's on/off switch) is
+    # excluded from the ASSIGNABLE fleet — for a SPARE plate, turning it ON
+    # for the OTHER planner already forces it into this set (see
+    # set_plate_toggle), so it drops out here too.
+    _toggled_off = get_unavailable_plates_for(user)
+    _assignable_fleet = [(p, t) for p, t in my_fleet if p.upper() not in _toggled_off] if _toggled_off else my_fleet
+
     # Replace the engine's eligible fleet with TODAY's availability for this user.
     sess["engine"].eligible_lorries = pd.DataFrame(
         [{"LORRY": p, "TON": t, "USER": user, "Status": "Available"}
-         for p, t in sorted(my_fleet)]
+         for p, t in sorted(_assignable_fleet)]
     )
     sess["_master_uploaded"] = True
     sess["state"] = "AWAIT_TRIP_DAY"
@@ -3335,7 +3465,12 @@ def board_move(sess, do_number: str, plate) -> dict:
     unassigned pool (plate falsy). Never blocks on a rule violation — the
     human stays in control — but returns human-readable warnings from
     _check_manual_placement() for the UI to flag on the card. Keeps
-    pending_dos totals and the export in sync, same as assign_specific_dos."""
+    pending_dos totals in sync; the export file itself is rebuilt lazily
+    at download time (see below) rather than on every move — _export_result
+    re-reads and rewrites the entire multi-MB history file, which made every
+    single drag or cancel on the board take 20-30 seconds for no benefit to
+    the board itself (nothing in this session reads the history file again
+    until the NEXT login)."""
     engine = sess.get("engine")
     items = sess.get("items", []) or []
     by_do = {str(it.get("DO NUMBER")): it for it in items}
@@ -3354,19 +3489,58 @@ def board_move(sess, do_number: str, plate) -> dict:
             return {"error": "unknown_plate",
                     "message": f"{plate} is not a known lorry. Check the spelling."}
         warnings = _check_manual_placement(it, plate, engine, sess)
+        _user = sess.get("user_id")
+        if _user and plate in get_unavailable_plates_for(_user):
+            warnings.append(f"{plate} is toggled OFF today — placed anyway, but it's not available.")
         it["LORRY"] = plate
         sess.setdefault("assigned", {})[it["DO NUMBER"]] = plate
         sess.setdefault("unassigned_reasons", {}).pop(it["DO NUMBER"], None)
 
     for do in sess.get("pending_dos", []):
         do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
-    if sess.get("raw_df") is not None:
-        try:
-            _export_result(sess)
-        except Exception:
-            pass
+    # Mark the export stale rather than rebuilding it now — /api/download
+    # already rebuilds on demand when export_bytes is missing.
+    sess.pop("export_bytes", None)
 
     return {"ok": True, "do": it["DO NUMBER"], "lorry": it["LORRY"], "warnings": warnings}
+
+
+def board_move_route(sess, route: str, plate) -> dict:
+    """Board UI: drag an entire route group (every one of its currently
+    UNASSIGNED DOs — same set the pool panel shows under that route) onto
+    one lorry in a single action, instead of dragging each card one at a
+    time. Reuses board_move() per item so the same validation/warning
+    behaviour applies to each — never blocks, just flags."""
+    engine = sess.get("engine")
+    items = sess.get("items", []) or []
+    plate = str(plate).strip().upper() if plate else ""
+    if not plate:
+        return {"error": "missing_plate", "message": "Pick a lorry to drop the route onto."}
+
+    _fleet_df = getattr(engine, "all_lorries", None) if engine is not None else None
+    if _fleet_df is None or _fleet_df[_fleet_df["LORRY"] == plate].empty:
+        return {"error": "unknown_plate",
+                "message": f"{plate} is not a known lorry. Check the spelling."}
+
+    _known_plates = set()
+    if _fleet_df is not None:
+        _known_plates = {str(p).strip().upper() for p in _fleet_df["LORRY"]}
+    _do_numbers = [
+        it["DO NUMBER"] for it in items
+        if str(it.get("ROUTE", "")) == route
+        and str(it.get("LORRY") or "").strip().upper() not in _known_plates
+    ]
+    if not _do_numbers:
+        return {"error": "nothing_to_move", "message": f"No unassigned DOs found for route {route}."}
+
+    moved = 0
+    all_warnings: list[str] = []
+    for do_num in _do_numbers:
+        outcome = board_move(sess, do_num, plate)
+        if outcome.get("ok"):
+            moved += 1
+            all_warnings.extend(outcome.get("warnings", []))
+    return {"ok": True, "moved": moved, "total": len(_do_numbers), "warnings": all_warnings}
 
 
 def _handle_excel_upload(phone, sess, file_bytes):
