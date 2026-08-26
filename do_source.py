@@ -12,17 +12,22 @@ REMARKS-driven size-cap/day-restriction logic on every live fetch.
 Mirrors the standalone generate_script.py report (same ROUTE_MAP, same
 SHIP_DETAIL rules, same filters) with differences, all deliberate:
 
-  1. Rows whose ETD is the database's NULL sentinel (1753-01-01, from
-     `ISNULL(d.ZETD_0, '1753-01-01')` in the SQL) are dropped — those DOs
-     have no real ETD set and shouldn't appear in the working file.
-  2. Two output columns are renamed to match what bot.py's upload parser
+  1. Two output columns are renamed to match what bot.py's upload parser
      actually looks for (generate_script.py's names didn't line up, which
      would have silently disabled the affected features on any file from
      this source): 'SHIP DETAIL' -> 'SHIP_DETAIL', 'LONGITUDE' -> 'LONGITUD'.
-  3. UVYDAY1_0-UVYDAY7_0 and ZUVYDAY8_0-ZUVYDAY16_0 are pulled in (matching
+  2. UVYDAY1_0-UVYDAY7_0 and ZUVYDAY8_0-ZUVYDAY16_0 are pulled in (matching
      the production query) but not yet interpreted into anything — their
      meaning hasn't been confirmed. Only ZUVYDAY17_0-21_0 (the size-cap
      flags) are used, as before.
+
+Rows are NOT filtered on ETD (2026-08-26 fix — see fetch_delivery_report's
+docstring): an earlier version of this file dropped every DO whose ETD was
+the DB's NULL-sentinel default (1753-01-01, meaning "no ETD set"), which
+silently removed a large share of real DOs from every live fetch, since
+most DOs never get an ETD populated in the ERP at all. bot.py never reads
+ETD, so there was no correctness reason to filter on it — DATE (DLVDAT_0)
+is what drives scheduling/priority.
 
 Configuration: a JSON file with {server, database, username, password,
 driver} — see configrd.json. NEVER commit this file; it holds a real
@@ -45,10 +50,6 @@ CONFIG_PATH = os.environ.get(
     "DO_DB_CONFIG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "configrd.json"))
 SCHEMA_NAME = "ENGSHENG"
-
-# SQL's ISNULL(d.ZETD_0, '1753-01-01') fallback for a DO with no real ETD
-# set, formatted the same way as DATE ('%d-%m-%Y') further down.
-_ETD_NULL_SENTINEL = "01-01-1753"
 
 # Route Mapping Dictionary — identical to generate_script.py.
 ROUTE_MAP = {
@@ -347,8 +348,12 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         'ETD': filtered_df['ETD_FORMATTED'],
     })
 
-    # Drop rows with no real ETD set (the DB's NULL-sentinel default).
-    report_df = report_df[report_df['ETD'] != _ETD_NULL_SENTINEL].reset_index(drop=True)
+    # NOTE: rows are intentionally NOT dropped just because ETD is unset (the
+    # DB's NULL-sentinel default, 1753-01-01). ETD isn't used anywhere in the
+    # assignment logic (bot.py never reads it) and most real DOs never get an
+    # ETD populated in the ERP at all, so filtering on it was silently
+    # dropping legitimate DOs from every live fetch. ETD is kept as a display
+    # column only; DATE (DLVDAT_0) drives scheduling/priority.
     report_df['NO'] = range(1, len(report_df) + 1)
 
     return report_df

@@ -897,6 +897,16 @@ _PAGE = r"""<!doctype html>
     padding:16px 28px;min-width:120px;font-size:16px;font-weight:700;cursor:pointer;
     color:var(--ink);text-align:center;flex:0 0 auto}
   .userbtn:active{border-color:var(--brand)}
+  .tp-badge{display:inline-block;font-size:11px;letter-spacing:.25em;font-weight:700;
+    color:#241a00;background:var(--warn);padding:3px 10px;border-radius:3px}
+  .tp-h1{margin:10px 0 4px;font-size:24px}
+  .tp-sub{color:var(--muted);font-size:13.5px;margin:0 0 16px}
+  .tp-tabs{display:flex;flex-wrap:wrap;gap:8px}
+  .tp-tab{padding:8px 20px;border-radius:8px;border:1px solid var(--line);
+    background:var(--card2);font-weight:800;cursor:pointer;font-size:14px;
+    color:var(--muted)}
+  .tp-tab.active{background:var(--warn);color:#241a00;border-color:var(--warn)}
+  .tp-tab:disabled{opacity:.6;cursor:wait}
   .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;
     box-sizing:border-box;width:100%;min-height:150px;gap:6px;
     border:2px dashed var(--line);border-radius:14px;padding:28px 16px;text-align:center;
@@ -1018,10 +1028,17 @@ _PAGE = r"""<!doctype html>
     <a href="/logout" class="logout-btn">⎋ Logout</a>
   </header>
 
-  <!-- Step 1: login -->
+  <!-- Planner bar — always visible; picking a planner fetches DOs live from
+       the system, auto-assigns, and lands directly on the board. No manual
+       wizard steps. -->
   <div class="card" id="card-login">
-    <p class="step-title">Step 1 · Who are you?</p>
-    <div class="grid-users" id="users"><span class="spin"></span></div>
+    <span class="tp-badge">TRUCK PLANNING</span>
+    <h1 class="tp-h1">Loading Board</h1>
+    <p class="tp-sub">Pick a planner — today's DOs are fetched live from the system and
+      auto-assigned. Drag a card onto a lorry, or click AI Assign to re-run the algorithm.
+      Bar shows MUATAN capacity — amber means inside the +10% naik allowance, red means
+      over the limit.</p>
+    <div class="tp-tabs" id="users"><span class="spin"></span></div>
     <div class="msg hidden" id="login-msg"></div>
   </div>
 
@@ -1142,7 +1159,7 @@ _PAGE = r"""<!doctype html>
       </div>
     </div>
     <div class="row" style="margin-top:14px">
-      <button class="btn secondary" id="btn-board-back">← Back</button>
+      <button class="btn secondary" id="btn-board-back">🔄 Refetch DOs</button>
       <button class="btn secondary" id="btn-board-restart">Start over</button>
     </div>
   </div>
@@ -1216,13 +1233,15 @@ async function fpost(url,file){ const fd=new FormData(); fd.append('file',file);
 
 // ---- Wizard state (so Back can rewind the engine and replay prior steps) ----
 let selUser=null, masterFile=null, selDay=null, needsMaster=false;
-const ALL_CARDS=['#card-login','#card-master','#card-day','#card-dos','#card-offsched','#card-board','#card-result'];
+// #card-login is now the always-visible planner-tabs bar, not a wizard step —
+// it's deliberately left out of ALL_CARDS so hideAll()/goTo() never hide it.
+const ALL_CARDS=['#card-master','#card-day','#card-dos','#card-offsched','#card-board','#card-result'];
 function hideAll(){ ALL_CARDS.forEach(id=>show(id,false)); }
 function clearMsgs(){ ['#login-msg','#master-msg','#day-msg','#dos-msg','#offsched-msg','#board-msg'].forEach(id=>setMsg(id,null)); }
 
-// Rewind to an earlier step. This only moves the engine's state pointer back
-// (server keeps the loaded master), so it's instant — no re-upload, no blank
-// screen. We switch the visible card only after the quick request returns.
+// Rewind to an earlier step (used by the master-grid card's own "← Back",
+// a rare fallback path — see autoLoadPlanner). Only moves the engine's state
+// pointer back (server keeps the loaded master), so it's instant.
 async function goTo(step){
   clearMsgs();
   document.body.classList.remove('board-active');
@@ -1234,7 +1253,7 @@ async function goTo(step){
   if(step==='day'){ selDay=null; }
   if(step==='dos'){ if(inpD)inpD.value=''; }
   hideAll();
-  show('#card-'+(step==='login'?'login':step), true);
+  if(step!=='login'){ show('#card-'+step, true); }
 }
 function wireBackButtons(){
   document.querySelectorAll('[data-back]').forEach(b=>b.onclick=()=>{
@@ -1244,24 +1263,96 @@ function wireBackButtons(){
   });
 }
 
-// ---- Step 1: users ----
+// ---- Planner tabs (always visible). Picking one runs the whole pipeline —
+// login, default lorries, today, live DO fetch from the system, auto-assign —
+// and lands straight on the board. No manual wizard steps in the normal path;
+// the master/day/dos cards only resurface as a fallback if something needs
+// a human's attention (e.g. a lorry double-booked between two planners). ----
 let validUsers=[];
 async function loadUsers(){
   const d = await (await fetch('/api/users')).json();
   validUsers = d.users||[];
+  renderPlannerTabs();
+}
+function renderPlannerTabs(){
   const box=$('#users'); box.innerHTML='';
   validUsers.forEach(u=>{
-    const b=document.createElement('button'); b.className='userbtn'; b.textContent=u;
-    b.onclick=()=>login(u); box.appendChild(b);
+    const b=document.createElement('button');
+    b.className='tp-tab'+(u===selUser?' active':'');
+    b.textContent=u;
+    b.onclick=()=>autoLoadPlanner(u);
+    box.appendChild(b);
   });
 }
-async function login(user){
-  setMsg('#login-msg','Logging in… ',false);
-  const d = await jpost('/api/login',{user});
-  if(d.user){ selUser=d.user; needsMaster=!!d.needs_master;
-    $('#who').textContent='Logged in as '+d.user; setMsg('#login-msg',null); show('#card-login',false);
-    if(d.needs_master){ show('#card-master',true); loadMasterGrid(); } else { show('#card-day',true); } }
-  else { setMsg('#login-msg',d.messages||'Login failed',true); }
+function setActiveTab(user){ selUser=user; renderPlannerTabs(); }
+
+function clearBoardPanels(){
+  BOARD=null;
+  const routes=$('#board-routes'), lanes=$('#board-lanes');
+  if(routes) routes.innerHTML=''; if(lanes) lanes.innerHTML='';
+}
+function showBoardWithError(msg){
+  hideAll(); show('#card-board',true);
+  document.body.classList.add('board-active');
+  clearBoardPanels();
+  setMsg('#board-msg', msg, true);
+}
+
+async function autoLoadPlanner(user){
+  clearMsgs();
+  setActiveTab(user);
+  document.querySelectorAll('.tp-tab').forEach(b=>b.disabled=true);
+  hideAll();
+  try{
+    setMsg('#login-msg', 'Loading '+user+"'s board… ", false);
+    const dl = await jpost('/api/login',{user});
+    if(!dl.user){ setMsg('#login-msg', dl.messages||'Could not load '+user, true); return; }
+    needsMaster = !!dl.needs_master;
+    $('#who').textContent = 'Logged in as '+dl.user;
+
+    if(needsMaster){
+      const dm = await (await fetch('/api/master-default')).json();
+      if(dm.error){ setMsg('#login-msg', dm.error, true); return; }
+      const dg = await jpost('/api/master-grid',{rows: dm.rows||[]});
+      if(!dg.ok){
+        // Rare: e.g. the same plate marked Available for two planners today.
+        // Needs a human to fix — drop into the editable grid instead of
+        // guessing which planner should keep it.
+        setMsg('#login-msg', null);
+        show('#card-master', true); loadMasterGrid();
+        setMsg('#master-msg', dg.messages||dg.error||'Please review and continue.', true);
+        return;
+      }
+    }
+
+    const dd = await jpost('/api/day',{day:'today'});
+    if(!dd.ok){ setMsg('#login-msg', dd.messages||'Could not set trip day', true); return; }
+
+    setMsg('#login-msg', 'Fetching DOs from system… ', false);
+    const df = await jpost('/api/dos-fetch',{});
+    if(df.error){ showBoardWithError(df.error); return; }
+
+    setMsg('#login-msg', 'Assigning lorries… ', false);
+    const du = await jpost('/api/dos-fetch/use',{});
+    if(du.offschedule){
+      await jpost('/api/offschedule',{assign:true});
+    } else if(du.error){
+      showBoardWithError(du.messages||du.error||'Could not assign lorries.');
+      return;
+    }
+    setMsg('#login-msg', null);
+    showBoard();
+  } finally {
+    document.querySelectorAll('.tp-tab').forEach(b=>b.disabled=false);
+  }
+}
+
+async function restartPlanner(){
+  document.body.classList.remove('board-active');
+  await jpost('/api/back',{target:'login'});
+  hideAll();
+  const u = selUser || validUsers[0];
+  if(u) autoLoadPlanner(u);
 }
 
 // ---- file drop helper ----
@@ -1485,8 +1576,8 @@ $('#btn-board-table').onclick=async()=>{
   showResultTable(d && d.result ? d.result : null);
 };
 $('#btn-result-board').onclick=showBoard;
-$('#btn-board-back').onclick=()=>{ document.body.classList.remove('board-active'); goTo('dos'); };
-$('#btn-board-restart').onclick=()=>{ document.body.classList.remove('board-active'); goTo('login'); };
+$('#btn-board-back').onclick=restartPlanner;
+$('#btn-board-restart').onclick=restartPlanner;
 
 function boardToast(msg){
   const t=document.createElement('div');
@@ -1742,7 +1833,7 @@ $('#btn-manual-lookup').onclick=manualLookup;
 $('#btn-manual-assign').onclick=manualAssign;
 $('#manual-plate').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); manualLookup(); } });
 
-$('#btn-restart').onclick=()=>goTo('login');
+$('#btn-restart').onclick=restartPlanner;
 
 async function doRefresh(){
   const d=await (await fetch('/api/state')).json();
@@ -1750,17 +1841,19 @@ async function doRefresh(){
 }
 $('#btn-refresh').onclick=doRefresh;
 
-// Show who is logged in, and — if this session already has an active
-// assignment (e.g. after a real browser refresh, not just our own
-// Refresh button) — restore the Result screen instead of dumping the
-// user back to Step 1 and losing sight of what was just assigned.
-fetch('/api/state').then(r=>r.json()).then(d=>{
-  if(d && d.email){ document.getElementById('who').textContent = d.email; }
-  if(d && d.result){ showBoard(); }
-}).catch(()=>{});
-
+// On load: render the planner tabs, then either restore an already-active
+// session (e.g. after a real browser refresh) straight onto its board, or
+// auto-run the pipeline for the first planner — no click needed, matching
+// the reference board's own on-load behaviour.
+async function boot(){
+  await loadUsers();
+  const d = await (await fetch('/api/state')).json();
+  if(d && d.email){ $('#who').textContent = d.email; }
+  if(d && d.user && d.result){ setActiveTab(d.user); showBoard(); return; }
+  if(validUsers.length){ autoLoadPlanner(validUsers[0]); }
+}
 wireBackButtons();
-loadUsers();
+boot();
 </script>
 </body>
 </html>"""
