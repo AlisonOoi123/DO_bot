@@ -137,7 +137,7 @@ def _file_bytes():
 # ─────────────────────────────────────────────────────────────────────────────
 _SENTINELS = {"NO_LORRY", "NO_ELIGIBLE_LORRY", "SPLIT", "SKIPPED",
               "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE",
-              "", None}
+              "WRONG_TRIP", "", None}
 
 
 def _result_json(sess) -> dict:
@@ -192,7 +192,7 @@ def _result_json(sess) -> dict:
             "weight": round(_w, 3) if pd.notna(_w := (float(it.get("WEIGHT", 0) or 0))) else 0.0,
             "state": str(it.get("STATE", "")),
         }
-        if lorry in ("OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP"):
+        if lorry in ("OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP"):
             skipped_other += 1
             continue
         if lorry in _SENTINELS:
@@ -662,6 +662,20 @@ def api_assign_specific():
 # Same engine, same session state (sess["items"]) as the rest of the wizard;
 # these just expose it in a shape suited to a board UI instead of a report.
 # ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/trip-session", methods=["POST"])
+def api_trip_session():
+    """Which half of the day to assign for. "any" (default) applies no
+    filter; "morning"/"afternoon" excludes DOs whose REMARKS explicitly say
+    the other trip (a REMARKS with no trip-timing note is unaffected)."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    session = str((request.json or {}).get("session", "any")).strip().lower()
+    if session not in ("any", "morning", "afternoon"):
+        return _with_cookie({"ok": False, "error": "Invalid session."}, sid, 400)
+    sess["trip_session"] = None if session == "any" else session.upper()
+    return _with_cookie({"ok": True, "session": session}, sid)
+
+
 @app.route("/api/lorry-toggles")
 def api_lorry_toggles():
     """This planner's own fleet with today's on/off state — used by the setup
@@ -1018,10 +1032,10 @@ _PAGE = r"""<!doctype html>
   .tp-toggle-chip{display:flex;align-items:center;gap:7px;padding:7px 10px;border-radius:8px;
     border:1px solid var(--line);background:var(--card2);font-size:12.5px;
     font-family:ui-monospace,Menlo,monospace}
-  .tp-day-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;
+  .tp-day-row{display:flex;align-items:center;gap:24px;flex-wrap:wrap;margin-top:14px;
     padding-top:14px;border-top:1px solid var(--line)}
-  .tp-day-btn{opacity:.55}
-  .tp-day-btn.active{opacity:1}
+  .tp-day-btn,.tp-trip-btn{opacity:.55}
+  .tp-day-btn.active,.tp-trip-btn.active{opacity:1}
   .tp-fetch-row{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
   .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;
     box-sizing:border-box;width:100%;min-height:150px;gap:6px;
@@ -1181,9 +1195,17 @@ _PAGE = r"""<!doctype html>
       <div class="tp-toggle-grid" id="tp-toggle-grid"></div>
     </div>
     <div class="tp-day-row hidden" id="tp-day-row">
-      <p class="tp-section-label" style="margin-bottom:6px">3&#41; Assign for:</p>
-      <button class="btn tp-day-btn active" id="tp-day-today" style="width:auto" data-tpday="today">Today</button>
-      <button class="btn secondary tp-day-btn" id="tp-day-tomorrow" style="width:auto" data-tpday="tomorrow">Tomorrow</button>
+      <div>
+        <p class="tp-section-label" style="margin-bottom:6px">3&#41; Assign for:</p>
+        <button class="btn tp-day-btn active" id="tp-day-today" style="width:auto" data-tpday="today">Today</button>
+        <button class="btn secondary tp-day-btn" id="tp-day-tomorrow" style="width:auto" data-tpday="tomorrow">Tomorrow</button>
+      </div>
+      <div>
+        <p class="tp-section-label" style="margin-bottom:6px">Trip:</p>
+        <button class="btn tp-trip-btn active" id="tp-trip-any" style="width:auto" data-tptrip="any">Any</button>
+        <button class="btn secondary tp-trip-btn" id="tp-trip-morning" style="width:auto" data-tptrip="morning">Morning</button>
+        <button class="btn secondary tp-trip-btn" id="tp-trip-afternoon" style="width:auto" data-tptrip="afternoon">Afternoon</button>
+      </div>
     </div>
     <div class="tp-fetch-row hidden" id="tp-fetch-row">
       <button class="btn" id="btn-fetch-assign" style="width:auto">📥 Fetch &amp; Assign</button>
@@ -1490,11 +1512,13 @@ async function autoLoadPlanner(user, autoFetch){
       }
     }
 
-    // Default to Today (matches prior behaviour) — the day row below lets
-    // the user switch to Tomorrow explicitly before fetching.
+    // Default to Today / Any trip (matches prior behaviour) — the row below
+    // lets the user switch explicitly before fetching.
     setDayActive('today');
     const dd = await jpost('/api/day',{day:'today'});
     if(!dd.ok){ setMsg('#login-msg', dd.messages||'Could not set trip day', true); return; }
+    setTripActive('any');
+    await jpost('/api/trip-session',{session:'any'});
 
     setMsg('#login-msg', null);
     _loadSavedEtdDays();
@@ -1537,6 +1561,18 @@ document.querySelectorAll('.tp-day-btn').forEach(b=>{
   b.onclick = async()=>{
     setDayActive(b.dataset.tpday);
     await jpost('/api/day', {day: b.dataset.tpday});
+  };
+});
+
+function setTripActive(session){
+  ['any','morning','afternoon'].forEach(s=>{
+    $('#tp-trip-'+s).classList.toggle('active', s===session);
+  });
+}
+document.querySelectorAll('.tp-trip-btn').forEach(b=>{
+  b.onclick = async()=>{
+    setTripActive(b.dataset.tptrip);
+    await jpost('/api/trip-session', {session: b.dataset.tptrip});
   };
 });
 
