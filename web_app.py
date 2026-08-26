@@ -521,15 +521,8 @@ def api_dos():
 def api_dos_fetch():
     sid = _sid()
     sess = bot.get_session(sid)
-    etd_days = (request.json or {}).get("etd_days")
     try:
-        etd_days = int(etd_days) if etd_days not in (None, "") else None
-    except (TypeError, ValueError):
-        return _with_cookie({"error": "ETD days must be a whole number."}, sid, 400)
-    if etd_days is not None and etd_days < 0:
-        return _with_cookie({"error": "ETD days can't be negative."}, sid, 400)
-    try:
-        report_df = do_source.fetch_delivery_report(etd_days=etd_days)
+        report_df = do_source.fetch_delivery_report()
     except Exception as e:
         return _with_cookie({"error": f"Could not fetch DOs from the system: {e}"}, sid, 500)
     xbytes = do_source.report_to_xlsx_bytes(report_df)
@@ -1083,12 +1076,6 @@ _PAGE = r"""<!doctype html>
     <p class="step-title">Step 4 · Get today's DOs</p>
 
     <div style="margin-bottom:14px">
-      <div class="row" style="margin-bottom:10px;align-items:center">
-        <label for="dos-fetch-etd" style="font-size:13px;color:var(--muted);flex:0 0 auto">ETD within</label>
-        <input id="dos-fetch-etd" type="number" min="0" step="1" placeholder="e.g. 2"
-               style="flex:0 0 80px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--ink)">
-        <label for="dos-fetch-etd" style="font-size:13px;color:var(--muted);flex:0 0 auto">day(s) from today (blank = all)</label>
-      </div>
       <button class="btn" id="btn-dos-fetch">📥 Fetch DOs from system</button>
       <div class="msg hidden" id="dos-fetch-msg"></div>
       <div id="dos-fetch-result" class="hidden" style="margin-top:10px;font-size:14px">
@@ -1377,14 +1364,11 @@ async function doFetchDos(){
   const btn=$('#btn-dos-fetch'); btn.disabled=true;
   setMsg('#dos-fetch-msg','Fetching from system… ',false);
   show('#dos-fetch-result', false);
-  const etdRaw=$('#dos-fetch-etd').value;
-  const etd_days = etdRaw!=='' ? parseInt(etdRaw,10) : null;
   try{
-    const d=await jpost('/api/dos-fetch',{etd_days});
+    const d=await jpost('/api/dos-fetch',{});
     if(d.error){ setMsg('#dos-fetch-msg', d.error, true); return; }
     setMsg('#dos-fetch-msg', null);
-    const rangeTxt = etd_days!=null ? ` (ETD within ${etd_days} day(s))` : '';
-    $('#dos-fetch-summary').textContent = `Found ${d.count} DO(s), ${d.weight}T total${rangeTxt}.`;
+    $('#dos-fetch-summary').textContent = `Found ${d.count} DO(s), ${d.weight}T total.`;
     show('#dos-fetch-result', true);
   } finally { btn.disabled=false; }
 }
