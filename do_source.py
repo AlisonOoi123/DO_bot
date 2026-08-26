@@ -193,13 +193,42 @@ ORDER BY d.DLVDAT_0
 """
 
 
+_ACTIVE = ('2', '2.0')  # BPDLVCUST's UVYDAY-style flags: '2' = active, confirmed
+                        # via the ZUVYDAY17-21 size-cap fields (matches
+                        # generate_script.py) and the Crystal Report's REMARKS
+                        # formula field, which checks each named sub-formula for
+                        # a non-blank/non-"0" result the same way.
+
+# UVYDAY1_0..UVYDAY7_0 -> the single-weekday tags in the Crystal Report's
+# REMARKS formula (MONDAY..SUNDAY), in field-number order — confirmed from
+# the formula's own MONDAY-first, SUNDAY-last evaluation order.
+_WEEKDAY_FIELDS = [
+    ('UVYDAY1_0', 'MONDAY'), ('UVYDAY2_0', 'TUESDAY'), ('UVYDAY3_0', 'WEDNESDAY'),
+    ('UVYDAY4_0', 'THURSDAY'), ('UVYDAY5_0', 'FRIDAY'), ('UVYDAY6_0', 'SATURDAY'),
+    ('UVYDAY7_0', 'SUNDAY'),
+]
+
+# NOT YET IMPLEMENTED: the Crystal Report's REMARKS formula also has 9 more
+# tags — EVERYDAY, MON TO FRIDAY, MON,THUR, MON,WED,FRI, TUES,FRI,
+# TUES,THUR,SAT, WED,FRI, AM, PM — presumably each backed by one of
+# ZUVYDAY8_0..ZUVYDAY16_0 (9 fields, 9 tags), but the .docx only showed the
+# combining formula, not each sub-formula's own field mapping, so which
+# ZUVYDAY8-16 field maps to which tag is NOT confirmed. Guessing here would
+# risk mislabeling a real day-restriction (e.g. showing "WED,FRI" when the
+# DB flag actually means "MON,THUR"), so these are left out until confirmed
+# — ask for each @-formula's definition (or just the field-to-tag mapping)
+# to fill this in correctly.
+
 def _calculate_ship_detail(row) -> str:
     tags = []
-    if str(row.get('ZUVYDAY17_0', '')).strip() in ['2', '2.0']: tags.append("MAX 2 TON")
-    if str(row.get('ZUVYDAY18_0', '')).strip() in ['2', '2.0']: tags.append("MAX 5 TON")
-    if str(row.get('ZUVYDAY19_0', '')).strip() in ['2', '2.0']: tags.append("MAX 11 TON")
-    if str(row.get('ZUVYDAY20_0', '')).strip() in ['2', '2.0']: tags.append("MAX 15 TON")
-    if str(row.get('ZUVYDAY21_0', '')).strip() in ['2', '2.0']: tags.append("MAX 21 TON")
+    for field, label in _WEEKDAY_FIELDS:
+        if str(row.get(field, '')).strip() in _ACTIVE:
+            tags.append(label)
+    if str(row.get('ZUVYDAY17_0', '')).strip() in _ACTIVE: tags.append("MAX 2 TON")
+    if str(row.get('ZUVYDAY18_0', '')).strip() in _ACTIVE: tags.append("MAX 5 TON")
+    if str(row.get('ZUVYDAY19_0', '')).strip() in _ACTIVE: tags.append("MAX 11 TON")
+    if str(row.get('ZUVYDAY20_0', '')).strip() in _ACTIVE: tags.append("MAX 15 TON")
+    if str(row.get('ZUVYDAY21_0', '')).strip() in _ACTIVE: tags.append("MAX 21 TON")
     return ", ".join(tags)
 
 
@@ -282,6 +311,13 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         if col not in filtered_df.columns:
             filtered_df[col] = ''
 
+    # Matches the Crystal Report's own Distance formula:
+    # {BPDLVCUST.ZDISTANCE_0}+"KM" — bot.py's distance parser (_distance_km)
+    # extracts the leading number regardless of a trailing unit, so this is
+    # purely for display fidelity with what the report already shows.
+    filtered_df['DISTANCE_FORMATTED'] = filtered_df['ZDISTANCE_0'].apply(
+        lambda v: f"{v}KM" if str(v).strip() not in ('', 'nan', 'None') else '')
+
     filtered_df['no'] = range(1, len(filtered_df) + 1)
 
     report_df = pd.DataFrame({
@@ -302,7 +338,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         'DRIVER': filtered_df['ZDRIVER_0'],
         'LORRY ASST 1': filtered_df['ZFOLLOWER1_0'],
         'LORRY ASST 2': filtered_df['ZFOLLOWER2_0'],
-        'DISTANCE': filtered_df['ZDISTANCE_0'],
+        'DISTANCE': filtered_df['DISTANCE_FORMATTED'],
         'LONGITUD': filtered_df['ZLONGITUD_0'],          # was 'LONGITUDE' — see docstring
         'POSTCODE': filtered_df['BPDPOSCOD_0'],
         'CITY': filtered_df['BPDCTY_0'],
