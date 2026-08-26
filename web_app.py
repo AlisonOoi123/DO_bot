@@ -212,7 +212,13 @@ def _result_json(sess) -> dict:
         grp["load"] = round(grp["load"] + do["weight"], 3)
         grp["dos"].append(do)
 
+    _past_date_grp = lorries.pop("PAST_DATE", None)
     lorry_list = sorted(lorries.values(), key=lambda g: g["lorry"])
+    # PAST_DATE isn't a real lorry — it's DOs the AI deliberately left alone
+    # because their DATE is before today. Keep it out of the alphabetical
+    # plate ordering and tack it on at the very end, right before Unassigned.
+    if _past_date_grp is not None:
+        lorry_list.append(_past_date_grp)
     for g in lorry_list:
         cap = g["capacity"]
         g["util"] = round(100.0 * g["load"] / cap, 1) if cap else None
@@ -656,6 +662,18 @@ def api_assign_specific():
 # Same engine, same session state (sess["items"]) as the rest of the wizard;
 # these just expose it in a shape suited to a board UI instead of a report.
 # ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/lorry-toggles")
+def api_lorry_toggles():
+    """This planner's own fleet with today's on/off state — used by the setup
+    screen so lorries can be turned off BEFORE fetching/assigning, not just
+    from the board afterwards. Works even before any DOs are loaded."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    if not sess.get("engine"):
+        return _with_cookie({"lorries": []}, sid)
+    return _with_cookie({"lorries": _board_json(sess)["lorries"]}, sid)
+
+
 @app.route("/api/board")
 def api_board():
     sid = _sid()
@@ -994,6 +1012,17 @@ _PAGE = r"""<!doctype html>
   .tp-etd-row label{font-size:13.5px;color:var(--muted);display:flex;align-items:center;gap:6px}
   .tp-etd-row input[type=number]{width:64px;padding:7px 8px;border-radius:8px;
     border:1px solid var(--line);background:var(--card2);color:var(--ink);font-size:14px}
+  .tp-section-label{font-size:13.5px;color:var(--muted);margin:0 0 8px}
+  .tp-toggle-section{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+  .tp-toggle-grid{display:flex;flex-wrap:wrap;gap:8px}
+  .tp-toggle-chip{display:flex;align-items:center;gap:7px;padding:7px 10px;border-radius:8px;
+    border:1px solid var(--line);background:var(--card2);font-size:12.5px;
+    font-family:ui-monospace,Menlo,monospace}
+  .tp-day-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;
+    padding-top:14px;border-top:1px solid var(--line)}
+  .tp-day-btn{opacity:.55}
+  .tp-day-btn.active{opacity:1}
+  .tp-fetch-row{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
   .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;
     box-sizing:border-box;width:100%;min-height:150px;gap:6px;
     border:2px dashed var(--line);border-radius:14px;padding:28px 16px;text-align:center;
@@ -1021,6 +1050,8 @@ _PAGE = r"""<!doctype html>
   th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
   td.w{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
   .scroll{overflow-x:auto}
+  .lorry.collapsed .scroll{display:none}
+  .lorry h3.collapsible{cursor:pointer}
   .unassigned h3{color:var(--bad)}
   .foot{color:var(--muted);font-size:12px;text-align:center;padding:8px 0 24px}
   .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--line);
@@ -1141,9 +1172,20 @@ _PAGE = r"""<!doctype html>
     <div class="tp-tabs" id="users"><span class="spin"></span></div>
     <div class="msg hidden" id="login-msg"></div>
     <div class="tp-etd-row hidden" id="tp-etd-row">
-      <label for="etd-days-input">ETD window: &plusmn;
+      <label for="etd-days-input">1&#41; ETD window: &plusmn;
         <input type="number" id="etd-days-input" min="0" step="1" value="2"> day(s)
       </label>
+    </div>
+    <div class="tp-toggle-section hidden" id="tp-toggle-section">
+      <p class="tp-section-label">2&#41; Lorries available today &mdash; turn off any not running:</p>
+      <div class="tp-toggle-grid" id="tp-toggle-grid"></div>
+    </div>
+    <div class="tp-day-row hidden" id="tp-day-row">
+      <p class="tp-section-label" style="margin-bottom:6px">3&#41; Assign for:</p>
+      <button class="btn tp-day-btn active" id="tp-day-today" style="width:auto" data-tpday="today">Today</button>
+      <button class="btn secondary tp-day-btn" id="tp-day-tomorrow" style="width:auto" data-tpday="tomorrow">Tomorrow</button>
+    </div>
+    <div class="tp-fetch-row hidden" id="tp-fetch-row">
       <button class="btn" id="btn-fetch-assign" style="width:auto">📥 Fetch &amp; Assign</button>
     </div>
   </div>
@@ -1423,6 +1465,9 @@ async function autoLoadPlanner(user, autoFetch){
   document.querySelectorAll('.tp-tab').forEach(b=>b.disabled=true);
   hideAll();
   show('#tp-etd-row', false);
+  show('#tp-toggle-section', false);
+  show('#tp-day-row', false);
+  show('#tp-fetch-row', false);
   try{
     setMsg('#login-msg', 'Loading '+user+"'s lorries… ", false);
     const dl = await jpost('/api/login',{user});
@@ -1445,17 +1490,55 @@ async function autoLoadPlanner(user, autoFetch){
       }
     }
 
+    // Default to Today (matches prior behaviour) — the day row below lets
+    // the user switch to Tomorrow explicitly before fetching.
+    setDayActive('today');
     const dd = await jpost('/api/day',{day:'today'});
     if(!dd.ok){ setMsg('#login-msg', dd.messages||'Could not set trip day', true); return; }
 
     setMsg('#login-msg', null);
     _loadSavedEtdDays();
     show('#tp-etd-row', true);
+    show('#tp-toggle-section', true);
+    show('#tp-day-row', true);
+    show('#tp-fetch-row', true);
+    await loadLorryToggles();
     if(autoFetch) await fetchAndAssign();
   } finally {
     document.querySelectorAll('.tp-tab').forEach(b=>b.disabled=false);
   }
 }
+
+async function loadLorryToggles(){
+  const d = await (await fetch('/api/lorry-toggles', {credentials:'same-origin'})).json();
+  const grid = $('#tp-toggle-grid');
+  if(!d.lorries || !d.lorries.length){ grid.innerHTML = '<span style="color:var(--muted);font-size:12.5px">No lorries loaded yet.</span>'; return; }
+  grid.innerHTML = d.lorries.map(l=>{
+    const on = l.on !== false;
+    return `<span class="tp-toggle-chip" data-plate="${esc(l.plate)}">`+
+      `<button class="lane-toggle${on?'':' off'}" title="${on?'Available — click to turn off':'Not available — click to turn on'}"></button>`+
+      `${esc(l.plate)}</span>`;
+  }).join('');
+  grid.querySelectorAll('.tp-toggle-chip').forEach(chip=>{
+    chip.querySelector('.lane-toggle').onclick = async()=>{
+      const btn = chip.querySelector('.lane-toggle');
+      const turningOn = btn.classList.contains('off');
+      await jpost('/api/board/toggle-lorry', {plate: chip.dataset.plate, on: turningOn});
+      await loadLorryToggles();
+    };
+  });
+}
+
+function setDayActive(day){
+  $('#tp-day-today').classList.toggle('active', day==='today');
+  $('#tp-day-tomorrow').classList.toggle('active', day==='tomorrow');
+}
+document.querySelectorAll('.tp-day-btn').forEach(b=>{
+  b.onclick = async()=>{
+    setDayActive(b.dataset.tpday);
+    await jpost('/api/day', {day: b.dataset.tpday});
+  };
+});
 
 async function fetchAndAssign(){
   const btn = $('#btn-fetch-assign');
@@ -1659,10 +1742,12 @@ function renderResult(r){
     (s.dos_other?`<span class="pill">Other user / skipped <b>${s.dos_other}</b></span>`:'');
   let html='';
   r.lorries.forEach(g=>{
+    const isPastDate = g.lorry === 'PAST_DATE';
     const cap=g.capacity!=null?g.capacity.toFixed(2)+'T':'—';
     const util=g.util!=null?g.util:0;
-    html+=`<div class="lorry"><h3>🚚 ${esc(g.lorry)} <span class="cap">${g.load.toFixed(2)}T / ${cap}${g.util!=null?' · '+g.util+'%':''}</span></h3>`;
-    html+=`<div class="bar"><i class="${util>100?'hi':''}" style="width:${Math.min(util,100)}%"></i></div>`;
+    const label = isPastDate ? `🗓️ PAST_DATE — dated before today, not auto-assigned (${g.dos.length})` : `🚚 ${esc(g.lorry)} <span class="cap">${g.load.toFixed(2)}T / ${cap}${g.util!=null?' · '+g.util+'%':''}</span>`;
+    html+=`<div class="lorry${isPastDate?' collapsed':''}"><h3${isPastDate?' class="collapsible"':''}>${label}</h3>`;
+    if(!isPastDate){ html+=`<div class="bar"><i class="${util>100?'hi':''}" style="width:${Math.min(util,100)}%"></i></div>`; }
     html+=`<div class="scroll"><table><thead><tr><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th></tr></thead><tbody>`;
     g.dos.forEach(d=>{ html+=`<tr><td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td></tr>`; });
     html+=`</tbody></table></div></div>`;
@@ -1674,6 +1759,9 @@ function renderResult(r){
     html+=`</tbody></table></div></div>`;
   }
   $('#result-body').innerHTML=html;
+  $('#result-body').querySelectorAll('.lorry h3.collapsible').forEach(h=>{
+    h.onclick=()=>h.closest('.lorry').classList.toggle('collapsed');
+  });
 
   // ---- Reassign leftover DOs onto now-available lorries ----
   lastFleet=r.fleet||[];
