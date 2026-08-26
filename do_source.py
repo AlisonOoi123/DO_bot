@@ -29,6 +29,41 @@ most DOs never get an ETD populated in the ERP at all. bot.py never reads
 ETD, so there was no correctness reason to filter on it — DATE (DLVDAT_0)
 is what drives scheduling/priority.
 
+Query cross-checked against the actual production SQL text (shared
+2026-08-26, sql_query.txt) and a raw multi-year result dump used to derive
+the correct row count for a known day (164 DOs), NOT hardcoded to that
+number — several real discrepancies were found and fixed:
+  1. Missing a date floor. This file returned every un-invoiced DO ever
+     recorded, including un-invoiced orphan rows years old (2021-2025)
+     that were clearly dead/abandoned records, not real pending work —
+     confirmed by cross-checking the reference dump: every one of those
+     stale rows had a delivery date before the current year, every
+     legitimate row didn't. Added `AND DLVDAT_0 >= <start of the current
+     calendar year>` (SQL: DATEFROMPARTS(YEAR(GETDATE()),1,1); pandas
+     mirror: same, computed at call time) — NOT a hardcoded '2026-01-01'
+     literal, so this keeps working correctly in 2027 and beyond without
+     needing a code change. This alone closed nearly the entire gap
+     between what this file fetched and the real count.
+  2. CUSTOMER NAME was pulled from SDELIVERY.BPDNAM_0; the real query
+     reads BPDLVCUST.BPDNAM_0. POSTCODE/CITY/STATE were pulled from the
+     BPADDRESS join (the customer's current master address), but the real
+     query reads them straight off SDELIVERY (BPDPOSCOD_0/BPDCTY_0/
+     BPDSAT_0 — the delivery's own snapshotted address, which can differ
+     from the master address if it changed since, or if the delivery used
+     a one-off address).
+  3. CODE (customer code) was aliased from SDELIVERY.BPCORD_0; the real
+     query reads BPDLVCUST.BPCNUM_0 directly. Equal for any row that
+     survives the join (that's the join predicate), so not a behavioural
+     bug, but changed to match the source of truth.
+  4. SALESREP was joined in and REPNAM_0 added as a new 'SALES REP' output
+     column — present in the real query, wasn't pulled in at all before.
+     Informational only; bot.py's parser doesn't read it.
+  5. Added SELECT DISTINCT, matching the real query — belt-and-braces
+     against a join fan-out producing duplicate rows for a customer with
+     more than one matching BPDLVCUST/BPADDRESS record; didn't change the
+     row count on the reference dump (no duplicates existed there), but
+     matches the source of truth exactly.
+
 Configuration: a JSON file with {server, database, username, password,
 driver} — see configrd.json. NEVER commit this file; it holds a real
 production DB password (already gitignored). Path is read from the
@@ -131,11 +166,11 @@ DRN_LIST = [25, 26, 27, 28, 29, 30, 31, 32, 37, 39, 40, 41, 45, 60, 61, 66, 67,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 84, 85]
 
 _QUERY_TEMPLATE = """
-SELECT
+SELECT DISTINCT
     d.DLVDAT_0,
     d.SDHNUM_0,
-    d.BPCORD_0 AS BPCNUM_0,
-    d.BPDNAM_0,
+    c.BPCNUM_0,
+    c.BPDNAM_0,
     a.BPADES_0,
     d.GROWEI_0,
     d.SIHNUM_0,
@@ -147,9 +182,10 @@ SELECT
     ISNULL(c.ZDISTANCE_0, '') AS ZDISTANCE_0,
     ISNULL(c.ZLONGITUD_0, '') AS ZLONGITUD_0,
     i.ACCDAT_0 AS INVOICE_DATE,
-    a.POSCOD_0 AS BPDPOSCOD_0,
-    a.CTY_0 AS BPDCTY_0,
-    a.SAT_0 AS BPDSAT_0,
+    d.BPDPOSCOD_0,
+    d.BPDCTY_0,
+    d.BPDSAT_0,
+    ISNULL(r.REPNAM_0, '') AS REPNAM_0,
     ISNULL(d.ZLICENSE_0, '') AS ZLICENSE_0,
     ISNULL(d.ZDRIVER_0, '') AS ZDRIVER_0,
     ISNULL(d.ZFOLLOWER1_0, '') AS ZFOLLOWER1_0,
@@ -182,12 +218,15 @@ LEFT JOIN {schema}.BPDLVCUST c
    AND d.BPCORD_0 = c.BPCNUM_0
 LEFT JOIN {schema}.SINVOICE i
     ON d.SIHNUM_0 = i.NUM_0
+LEFT JOIN {schema}.SALESREP r
+    ON d.REP_0 = r.REPNUM_0
 LEFT JOIN {schema}.BPADDRESS a
     ON c.BPCNUM_0 = a.BPANUM_0
    AND c.BPAADD_0 = a.BPAADD_0
 WHERE d.SDHTYP_0 <> 'LOAN'
   AND d.STOFCY_0 = '1SA'
   AND (d.SIHNUM_0 IS NULL OR LTRIM(RTRIM(d.SIHNUM_0)) = '')
+  AND d.DLVDAT_0 >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
   AND c.DRN_0 IN ({drn_list})
   {etd_clause}
 ORDER BY d.DLVDAT_0
@@ -288,11 +327,13 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     df['SHIP_DETAIL'] = df.apply(_calculate_ship_detail, axis=1)
     df['VALIDATED'] = df['SIHNUM_0'].apply(lambda x: 'YES' if pd.notnull(x) and str(x).strip() != '' else 'NO')
 
+    _year_start = pd.Timestamp(datetime.now().year, 1, 1)
     filtered_df = df[
         (df['SDHTYP_0'] != 'LOAN') &
         (df['STOFCY_0'] == '1SA') &
         (df['VALIDATED'] == 'NO') &
-        (df['DRN_0'].isin(DRN_LIST))
+        (df['DRN_0'].isin(DRN_LIST)) &
+        (pd.to_datetime(df['DLVDAT_0'], errors='coerce') >= _year_start)
     ].copy()
 
     if etd_days is not None:
@@ -346,6 +387,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         'STATE': filtered_df['BPDSAT_0'],
         'SHIP_DETAIL': filtered_df['SHIP_DETAIL'],        # was 'SHIP DETAIL' — see docstring
         'ETD': filtered_df['ETD_FORMATTED'],
+        'SALES REP': filtered_df['REPNAM_0'],
     })
 
     # NOTE: rows are intentionally NOT dropped just because ETD is unset (the
