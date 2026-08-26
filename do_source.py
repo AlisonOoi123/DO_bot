@@ -165,6 +165,11 @@ ROUTE_MAP = {
 DRN_LIST = [25, 26, 27, 28, 29, 30, 31, 32, 37, 39, 40, 41, 45, 60, 61, 66, 67,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 84, 85]
 
+# Set by fetch_delivery_report() on every call — a stage-by-stage row count
+# breakdown, so a 0-row result can be explained (which filter zeroed it out)
+# instead of just reported.
+LAST_FETCH_DIAGNOSTICS: dict = {}
+
 _QUERY_TEMPLATE = """
 SELECT DISTINCT
     d.DLVDAT_0,
@@ -331,14 +336,29 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     df['SHIP_DETAIL'] = df.apply(_calculate_ship_detail, axis=1)
     df['VALIDATED'] = df['SIHNUM_0'].apply(lambda x: 'YES' if pd.notnull(x) and str(x).strip() != '' else 'NO')
 
+    # Diagnostics: when the final result is empty, this shows which single
+    # filter step actually zeroed it out, instead of leaving "0 DOs" to guess
+    # at. Overwritten on every call — read it right after this function
+    # returns if you need to know why.
+    global LAST_FETCH_DIAGNOSTICS
     _year_start = pd.Timestamp(datetime.now().year, 1, 1)
-    filtered_df = df[
-        (df['SDHTYP_0'] != 'LOAN') &
-        (df['STOFCY_0'] == '1SA') &
-        (df['VALIDATED'] == 'NO') &
-        (df['DRN_0'].isin(DRN_LIST)) &
-        (pd.to_datetime(df['DLVDAT_0'], errors='coerce') >= _year_start)
-    ].copy()
+    _not_loan = df['SDHTYP_0'] != 'LOAN'
+    _right_site = df['STOFCY_0'] == '1SA'
+    _not_validated = df['VALIDATED'] == 'NO'
+    _known_route = df['DRN_0'].isin(DRN_LIST)
+    _this_year = pd.to_datetime(df['DLVDAT_0'], errors='coerce') >= _year_start
+    LAST_FETCH_DIAGNOSTICS = {
+        "raw_rows_from_sql": int(len(df)),
+        "after_not_loan": int(_not_loan.sum()),
+        "after_site_1SA": int((_not_loan & _right_site).sum()),
+        "after_not_validated": int((_not_loan & _right_site & _not_validated).sum()),
+        "after_known_route": int((_not_loan & _right_site & _not_validated & _known_route).sum()),
+        "after_this_year": int((_not_loan & _right_site & _not_validated & _known_route & _this_year).sum()),
+        "distinct_stofcy_seen": sorted(str(v) for v in df['STOFCY_0'].dropna().unique())[:10] if len(df) else [],
+        "distinct_sdhtyp_seen": sorted(str(v) for v in df['SDHTYP_0'].dropna().unique())[:10] if len(df) else [],
+    }
+
+    filtered_df = df[_not_loan & _right_site & _not_validated & _known_route & _this_year].copy()
 
     if etd_days is not None:
         _etd_dt = pd.to_datetime(filtered_df['ZETD_0'], errors='coerce')
@@ -346,6 +366,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         _lo = _today - timedelta(days=etd_days)
         _hi = _today + timedelta(days=etd_days)
         filtered_df = filtered_df[(_etd_dt >= _lo) & (_etd_dt <= _hi)].copy()
+        LAST_FETCH_DIAGNOSTICS["after_etd_window"] = int(len(filtered_df))
 
     filtered_df['DATE_FORMATTED'] = pd.to_datetime(
         filtered_df['DLVDAT_0'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')

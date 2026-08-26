@@ -582,10 +582,13 @@ def api_dos_fetch():
         return _with_cookie({"error": f"Could not fetch DOs from the system: {e}"}, sid, 500)
     xbytes = do_source.report_to_xlsx_bytes(report_df)
     sess["_fetched_do_bytes"] = xbytes
-    return _with_cookie({
+    resp = {
         "count": int(len(report_df)),
         "weight": round(float(pd.to_numeric(report_df["GROSS WEIGHT"], errors="coerce").fillna(0).sum()) / 1000.0, 3),
-    }, sid)
+    }
+    if resp["count"] == 0:
+        resp["diagnostics"] = dict(do_source.LAST_FETCH_DIAGNOSTICS)
+    return _with_cookie(resp, sid)
 
 
 @app.route("/api/dos-fetch/download")
@@ -1597,11 +1600,23 @@ async function fetchAndAssign(){
     const df = await jpost('/api/dos-fetch', {etd_days: etdDays});
     if(df.error){ showBoardWithError(df.error); return; }
     if(!df.count){
+      let _diagMsg = '';
+      if(df.diagnostics){
+        const d = df.diagnostics;
+        _diagMsg = ` [diagnostics: raw SQL rows=${d.raw_rows_from_sql}, `+
+          `after not-LOAN=${d.after_not_loan}, after site 1SA=${d.after_site_1SA}, `+
+          `after not-yet-validated=${d.after_not_validated}, after known route=${d.after_known_route}, `+
+          `after this-year date=${d.after_this_year}`+
+          (d.after_etd_window!=null?`, after ETD window=${d.after_etd_window}`:'')+
+          `. Site codes seen: ${(d.distinct_stofcy_seen||[]).join(', ')||'none'}. `+
+          `Types seen: ${(d.distinct_sdhtyp_seen||[]).join(', ')||'none'}.]`;
+      }
       showBoardWithError(
         `The system returned 0 DOs for ${selUser}` +
         (etdDays!=null?` with the ETD window set to ±${etdDays} day(s)`:'') +
         `. Double-check the ETD window (0 or blank = all), the Today/Tomorrow ` +
-        `pick, and that today's DOs are actually in the system for ${selUser}'s routes.`
+        `pick, and that today's DOs are actually in the system for ${selUser}'s routes.` +
+        _diagMsg
       );
       return;
     }
