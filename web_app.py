@@ -1551,8 +1551,10 @@ async function loadLorryToggles(){
     chip.querySelector('.lane-toggle').onclick = async()=>{
       const btn = chip.querySelector('.lane-toggle');
       const turningOn = btn.classList.contains('off');
-      await jpost('/api/board/toggle-lorry', {plate: chip.dataset.plate, on: turningOn});
-      await loadLorryToggles();
+      // Shared with the board's own lane switches — so whichever one the
+      // user clicks, both this grid AND the board (if already showing)
+      // reflect the change immediately, not just on next reload.
+      await toggleLorry(chip.dataset.plate, turningOn);
     };
   });
 }
@@ -1598,7 +1600,10 @@ async function fetchAndAssign(){
     setMsg('#login-msg', 'Assigning lorries… ', false);
     const du = await jpost('/api/dos-fetch/use',{});
     if(du.offschedule){
-      await jpost('/api/offschedule',{assign:true});
+      // Which routes run today/tomorrow comes from the LORRY DAILY PLANNING
+      // file's SCHD sheet for the day the user picked — a route not on that
+      // day's list stays unassigned rather than being auto-included.
+      await jpost('/api/offschedule',{assign:false});
     } else if(du.error){
       showBoardWithError(du.messages||du.error||'Could not assign lorries.');
       return;
@@ -2100,7 +2105,12 @@ async function toggleLorry(plate, on){
   } else if(on && d.refilled_count){
     boardToast(`${plate} turned on · ${d.refilled_count} DO(s) it was carrying put back on.`);
   }
-  renderBoard();
+  // Both toggle points (the setup grid above and the board's own lane
+  // switches) call this — keep whichever one isn't the one just clicked
+  // in sync too, since they can be visible at the same time.
+  if(BOARD) renderBoard();
+  const _toggleSection = $('#tp-toggle-section');
+  if(_toggleSection && !_toggleSection.classList.contains('hidden')) await loadLorryToggles();
 }
 
 async function aiAssign(){
