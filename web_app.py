@@ -241,6 +241,59 @@ def _result_json(sess) -> dict:
     }
 
 
+def _board_json(sess) -> dict:
+    """Drag-and-drop board view: every DO (assigned or not) plus every lorry
+    with its current capacity, shaped for the board UI. Unassigned DOs are
+    also grouped by route for the pool panel."""
+    items = sess.get("items", []) or []
+    engine = sess.get("engine")
+
+    def _finite_ton(r):
+        try:
+            v = float(r["TON"])
+        except (TypeError, ValueError):
+            return None
+        return v if pd.notna(v) and v not in (float("inf"), float("-inf")) else None
+
+    caps = {}
+    if engine is not None and getattr(engine, "all_lorries", None) is not None:
+        try:
+            for _, r in engine.all_lorries.iterrows():
+                v = _finite_ton(r)
+                if v is not None:
+                    caps[str(r["LORRY"]).strip().upper()] = v
+        except Exception:
+            caps = {}
+
+    orders = []
+    routes: dict[str, dict] = {}
+    for it in items:
+        lorry = it.get("LORRY")
+        route = str(it.get("ROUTE", ""))
+        assigned_plate = lorry if lorry and lorry not in _SENTINELS else None
+        weight = float(it.get("WEIGHT", 0) or 0)
+        weight = round(weight, 3) if pd.notna(weight) else 0.0
+        orders.append({
+            "do": str(it.get("DO NUMBER", "")),
+            "route": route,
+            "customer": str(it.get("CUSTOMER NAME", "")),
+            "weight": weight,
+            "date": str(it.get("DATE", "")),
+            "remarks": str(it.get("REMARKS", "") or ""),
+            "lorry": assigned_plate,
+        })
+        if assigned_plate is None:
+            rt = routes.setdefault(route, {"route": route, "dos": 0, "weight": 0.0})
+            rt["dos"] += 1
+            rt["weight"] = round(rt["weight"] + weight, 3)
+
+    return {
+        "orders": orders,
+        "routes": sorted(routes.values(), key=lambda r: r["route"]),
+        "lorries": [{"plate": p, "capacity": c} for p, c in sorted(caps.items())],
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API endpoints — each drives the existing engine handler for the current step.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -560,6 +613,54 @@ def api_assign_specific():
     return _with_cookie(outcome, sid)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Drag-and-drop board — a visual alternative to the static result table.
+# Same engine, same session state (sess["items"]) as the rest of the wizard;
+# these just expose it in a shape suited to a board UI instead of a report.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/board")
+def api_board():
+    sid = _sid()
+    sess = bot.get_session(sid)
+    if not sess.get("items"):
+        return _with_cookie({"error": "No DOs loaded yet — upload or fetch a DO file first."}, sid, 400)
+    return _with_cookie(_board_json(sess), sid)
+
+
+@app.route("/api/board/move", methods=["POST"])
+def api_board_move():
+    """Drag-and-drop one DO onto a lorry (or back to the pool if lorry is
+    empty/omitted). Never rejected for a rule violation — bot.board_move()
+    always applies the move and returns warnings for the card to flag."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    body = request.json or {}
+    do = str(body.get("do", "")).strip()
+    plate = body.get("lorry")
+    if not do:
+        return _with_cookie({"error": "Missing 'do'."}, sid, 400)
+    outcome = bot.board_move(sess, do, plate)
+    if not outcome.get("ok"):
+        return _with_cookie(outcome, sid, 400)
+    outcome["board"] = _board_json(sess)
+    return _with_cookie(outcome, sid)
+
+
+@app.route("/api/board/ai-assign", methods=["POST"])
+def api_board_ai_assign():
+    """Re-run the real auto-assignment engine from scratch over the originally
+    uploaded/fetched DO file — same code path as the initial upload, just
+    re-triggered on demand. Overwrites any manual board edits made since."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    file_bytes = sess.get("_upload_bytes")
+    if not file_bytes:
+        return _with_cookie({"error": "No DO file on record for this session — upload or fetch one first."}, sid, 400)
+    outcome = _run_dos_upload(sid, sess, file_bytes)
+    outcome["board"] = _board_json(sess) if sess.get("items") else None
+    return _with_cookie(outcome, sid)
+
+
 @app.route("/api/download")
 def api_download():
     sid = _sid()
@@ -836,6 +937,72 @@ _PAGE = r"""<!doctype html>
     border-top-color:var(--brand);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px}
   @keyframes sp{to{transform:rotate(360deg)}}
   a.dl{display:inline-block;text-decoration:none}
+
+  /* ---- Drag-and-drop board ---- */
+  body.board-active .wrap{max-width:1400px}
+  .board-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .board-top .btn{width:auto}
+  .board-top .btn-ai{background:linear-gradient(135deg,var(--brand),#a855f7);color:#fff}
+  .board-grid{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:16px}
+  @media (max-width:860px){ .board-grid{grid-template-columns:1fr} }
+  .board-pool,.board-lanes-wrap{min-width:0}
+  .board-pool-label{font-size:11px;letter-spacing:.08em;color:var(--muted);
+    font-weight:700;text-transform:uppercase;margin:2px 2px 10px}
+  .board-route{border:1px solid var(--line);border-radius:10px;margin-bottom:8px;
+    overflow:hidden;background:var(--card2)}
+  .board-route-head{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer}
+  .board-route-head:hover{background:var(--line)}
+  .board-route-chev{font-size:10px;color:var(--muted);transition:transform .15s}
+  .board-route.open .board-route-chev{transform:rotate(90deg)}
+  .board-route-code{font-weight:700;font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
+  .board-route-name{font-size:11.5px;color:var(--muted);white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .board-route-meta{margin-left:auto;font-size:11px;color:var(--muted);flex-shrink:0;
+    font-family:ui-monospace,Menlo,monospace}
+  .board-route-body{display:none;flex-direction:column;gap:6px;padding:2px 8px 8px}
+  .board-route.open .board-route-body{display:flex}
+  .board-lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+  .board-lane{background:var(--card2);border:1px solid var(--line);border-radius:12px;
+    padding:12px;min-height:120px;transition:box-shadow .12s,border-color .12s}
+  .board-lane.collapsed{min-height:0}
+  .board-lane.collapsed .board-lane-body{display:none}
+  .board-lane.zone-active{border-color:var(--brand);box-shadow:0 0 0 2px rgba(56,189,248,.35)}
+  .board-lane-head{display:flex;align-items:baseline;gap:7px;margin-bottom:7px;
+    cursor:pointer;flex-wrap:wrap}
+  .board-lane-plate{font-weight:700;font-size:14px;font-family:ui-monospace,Menlo,monospace}
+  .board-lane-count{font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;
+    background:var(--bg);border-radius:10px;padding:1px 7px}
+  .board-lane-load{margin-left:auto;font-size:11px;font-weight:700;
+    font-family:ui-monospace,Menlo,monospace}
+  .board-cap-track{height:5px;background:var(--bg);border-radius:3px;overflow:hidden;margin-bottom:9px}
+  .board-cap-fill{height:100%;transition:width .2s;background:var(--ok)}
+  .board-cap-fill.hi{background:var(--warn)}
+  .board-cap-fill.over{background:var(--bad)}
+  .board-lane-body{display:flex;flex-direction:column;gap:6px;min-height:36px}
+  .board-empty{color:var(--muted);font-size:12.5px;font-style:italic;padding:6px 2px;opacity:.7}
+  .board-card{display:flex;gap:8px;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;padding:7px 9px;cursor:grab;font-size:12.5px;touch-action:none;position:relative}
+  .board-card.dragging{opacity:.25}
+  .board-card.warned{border-color:var(--warn)}
+  .board-card .b-body{min-width:0;flex:1}
+  .board-card .b-top{display:flex;align-items:center;gap:7px}
+  .board-card .b-id{font-family:ui-monospace,Menlo,monospace;font-weight:700;
+    color:var(--brand);font-size:12px}
+  .board-card .b-kg{margin-left:auto;font-family:ui-monospace,Menlo,monospace;
+    font-weight:700;font-size:12px;color:var(--ok);flex-shrink:0}
+  .board-card .b-cust{font-size:12px;font-weight:600;margin-top:2px;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .board-card .b-meta{color:var(--muted);font-size:10.5px;margin-top:1px;
+    font-family:ui-monospace,Menlo,monospace}
+  .board-card .b-warn{color:var(--warn);font-size:10.5px;margin-top:3px}
+  .board-ghost{position:fixed;transform:translate(-50%,-120%);display:flex;gap:8px;
+    align-items:center;background:var(--card2);border:1px solid var(--brand);border-radius:8px;
+    padding:8px 12px;pointer-events:none;box-shadow:0 8px 24px rgba(0,0,0,.4);
+    font-size:12.5px;z-index:999;max-width:80vw}
+  .board-toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);
+    background:var(--warn);color:#1a1300;padding:10px 18px;border-radius:10px;
+    font-size:13px;font-weight:600;z-index:1000;box-shadow:0 6px 20px rgba(0,0,0,.35);
+    max-width:90vw}
 </style>
 </head>
 <body>
@@ -954,9 +1121,36 @@ _PAGE = r"""<!doctype html>
     <button class="btn back" data-back="dos">← Back (re-upload DO file)</button>
   </div>
 
-  <!-- Step 5: result -->
+  <!-- Step 5: drag-and-drop board -->
+  <div class="card hidden" id="card-board">
+    <div class="board-top">
+      <p class="step-title" style="margin:0">Board · drag DOs onto a lorry, or let AI assign</p>
+      <button class="btn btn-ai" id="btn-board-ai" style="margin-left:auto">🤖 AI Assign</button>
+      <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
+      <button class="btn secondary" id="btn-board-table">📋 Table view</button>
+    </div>
+    <div class="msg hidden" id="board-msg"></div>
+    <div class="board-grid">
+      <section class="board-pool" data-zone="">
+        <div class="board-pool-label" id="board-pool-label">UNASSIGNED</div>
+        <div id="board-routes"></div>
+      </section>
+      <div class="board-lanes-wrap">
+        <div class="board-lanes" id="board-lanes"></div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn secondary" id="btn-board-back">← Back</button>
+      <button class="btn secondary" id="btn-board-restart">Start over</button>
+    </div>
+  </div>
+
+  <!-- Step 5b: result (table view / export / manual-assign tools) -->
   <div class="card hidden" id="card-result">
     <p class="step-title">Result</p>
+    <div class="row" style="margin-bottom:14px">
+      <button class="btn secondary" id="btn-result-board" style="width:auto">🧩 Board view</button>
+    </div>
     <div class="stat" id="result-stat"></div>
     <div style="margin-bottom:14px">
       <a class="dl" href="/api/download"><button class="btn">⬇️ Download filled Excel</button></a>
@@ -1020,15 +1214,16 @@ async function fpost(url,file){ const fd=new FormData(); fd.append('file',file);
 
 // ---- Wizard state (so Back can rewind the engine and replay prior steps) ----
 let selUser=null, masterFile=null, selDay=null, needsMaster=false;
-const ALL_CARDS=['#card-login','#card-master','#card-day','#card-dos','#card-offsched','#card-result'];
+const ALL_CARDS=['#card-login','#card-master','#card-day','#card-dos','#card-offsched','#card-board','#card-result'];
 function hideAll(){ ALL_CARDS.forEach(id=>show(id,false)); }
-function clearMsgs(){ ['#login-msg','#master-msg','#day-msg','#dos-msg','#offsched-msg'].forEach(id=>setMsg(id,null)); }
+function clearMsgs(){ ['#login-msg','#master-msg','#day-msg','#dos-msg','#offsched-msg','#board-msg'].forEach(id=>setMsg(id,null)); }
 
 // Rewind to an earlier step. This only moves the engine's state pointer back
 // (server keeps the loaded master), so it's instant — no re-upload, no blank
 // screen. We switch the visible card only after the quick request returns.
 async function goTo(step){
   clearMsgs();
+  document.body.classList.remove('board-active');
   await jpost('/api/back',{target:step});
   const inpD=document.getElementById('file-dos');
   const inpM=document.getElementById('file-master');
@@ -1166,7 +1361,7 @@ function handleDosResponse(d){
     show('#card-dos',false); show('#card-offsched',true);
     return true;
   }
-  if(d.result){ renderResult(d.result); show('#card-dos',false); show('#card-result',true); return true; }
+  if(d.result){ show('#card-dos',false); showBoard(); return true; }
   return false;
 }
 
@@ -1209,7 +1404,7 @@ $('#btn-dos-fetch-use').onclick=useFetchedDos;
 async function answerOffsched(assign){
   setMsg('#offsched-msg', assign?'Assigning off-schedule DOs… ':'Finalising… ');
   const d=await jpost('/api/offschedule',{assign});
-  if(d.result){ renderResult(d.result); show('#card-offsched',false); show('#card-result',true); }
+  if(d.result){ show('#card-offsched',false); showBoard(); }
   else { setMsg('#offsched-msg', d.messages||d.error||'Something went wrong',true); }
 }
 document.getElementById('offsched-yes').onclick=()=>answerOffsched(true);
@@ -1269,6 +1464,196 @@ function renderResult(r){
   $('#manual-picker').classList.add('hidden');
   setMsg('#manual-msg', null);
 }
+
+// ==================== Drag-and-drop board ====================
+let BOARD=null;
+let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set();
+let boardDrag=null, boardGhost=null;
+
+function showBoard(){
+  hideAll(); show('#card-board',true);
+  document.body.classList.add('board-active');
+  loadBoard();
+}
+function showResultTable(result){
+  hideAll();
+  document.body.classList.remove('board-active');
+  if(result) renderResult(result);
+  show('#card-result',true);
+}
+$('#btn-board-table').onclick=async()=>{
+  const d=await (await fetch('/api/state')).json();
+  showResultTable(d && d.result ? d.result : null);
+};
+$('#btn-result-board').onclick=showBoard;
+$('#btn-board-back').onclick=()=>{ document.body.classList.remove('board-active'); goTo('dos'); };
+$('#btn-board-restart').onclick=()=>{ document.body.classList.remove('board-active'); goTo('login'); };
+
+function boardToast(msg){
+  const t=document.createElement('div');
+  t.className='board-toast'; t.textContent=msg;
+  document.body.appendChild(t);
+  setTimeout(()=>t.remove(),4200);
+}
+
+async function loadBoard(){
+  setMsg('#board-msg','Loading board… ',false);
+  const d=await (await fetch('/api/board')).json();
+  if(d.error){ setMsg('#board-msg', d.error, true); return; }
+  setMsg('#board-msg', null);
+  BOARD=d;
+  if(!boardOpenRoutes.size && d.routes.length) boardOpenRoutes.add(d.routes[0].route);
+  renderBoard();
+}
+
+function boardOrdersInPool(route){ return BOARD.orders.filter(o=>o.route===route && !o.lorry); }
+function boardOrdersOnLorry(plate){ return BOARD.orders.filter(o=>o.lorry===plate); }
+function boardSumKg(list){ return list.reduce((s,o)=>s+o.weight,0); }
+function fmtT(w){ return w.toFixed(3)+'T'; }
+
+function boardCardEl(o){
+  const el=document.createElement('div');
+  el.className='board-card'+(o._warned?' warned':'');
+  el.dataset.do=o.do;
+  el.innerHTML=`
+    <div class="b-body">
+      <div class="b-top"><span class="b-id">${esc(o.do)}</span><span class="b-kg">${fmtT(o.weight)}</span></div>
+      <div class="b-cust">${esc(o.customer)}</div>
+      <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
+      ${o.remarks?`<div class="b-meta" style="color:var(--warn)">${esc(o.remarks)}</div>`:''}
+      ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
+    </div>`;
+  el.addEventListener('pointerdown', e=>startBoardDrag(e,o.do));
+  if(boardDrag && boardDrag.doId===o.do) el.classList.add('dragging');
+  return el;
+}
+
+function renderBoard(){
+  if(!BOARD) return;
+  const wrap=$('#board-routes'); wrap.innerHTML='';
+  let totalUn=0;
+  BOARD.routes.forEach(rt=>{
+    const list=boardOrdersInPool(rt.route);
+    if(!list.length) return;
+    totalUn+=list.length;
+    const div=document.createElement('div');
+    div.className='board-route'+(boardOpenRoutes.has(rt.route)?' open':'');
+    div.innerHTML=`
+      <div class="board-route-head">
+        <span class="board-route-chev">&#9654;</span>
+        <span class="board-route-code">${esc(rt.route)}</span>
+        <span class="board-route-meta">${list.length} DO &middot; ${fmtT(rt.weight)}</span>
+      </div>
+      <div class="board-route-body"></div>`;
+    div.querySelector('.board-route-head').onclick=()=>{
+      boardOpenRoutes.has(rt.route)?boardOpenRoutes.delete(rt.route):boardOpenRoutes.add(rt.route);
+      renderBoard();
+    };
+    const body=div.querySelector('.board-route-body');
+    list.forEach(o=>body.appendChild(boardCardEl(o)));
+    wrap.appendChild(div);
+  });
+  $('#board-pool-label').textContent=`UNASSIGNED · ${totalUn} DO${totalUn===1?'':'s'}`;
+
+  const lanes=$('#board-lanes'); lanes.innerHTML='';
+  BOARD.lorries.forEach(t=>{
+    const list=boardOrdersOnLorry(t.plate);
+    const load=boardSumKg(list);
+    const pct=t.capacity?Math.min(100,Math.round(load/t.capacity*100)):0;
+    const over=t.capacity && load>t.capacity;
+    const fillClass= over?'over': pct>=85?'hi':'';
+    const collapsed=boardCollapsedLanes.has(t.plate);
+    const lane=document.createElement('section');
+    lane.className='board-lane'+(collapsed?' collapsed':'');
+    lane.dataset.zone=t.plate;
+    lane.innerHTML=`
+      <div class="board-lane-head">
+        <span class="board-lane-plate">${esc(t.plate)}</span>
+        <span class="board-lane-count">${list.length}</span>
+        <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</span>
+      </div>
+      <div class="board-cap-track"><div class="board-cap-fill ${fillClass}" style="width:${pct}%"></div></div>
+      <div class="board-lane-body"></div>`;
+    lane.querySelector('.board-lane-head').onclick=()=>{
+      collapsed?boardCollapsedLanes.delete(t.plate):boardCollapsedLanes.add(t.plate);
+      renderBoard();
+    };
+    const body=lane.querySelector('.board-lane-body');
+    if(!list.length) body.innerHTML='<div class="board-empty">Drop DOs here</div>';
+    list.forEach(o=>body.appendChild(boardCardEl(o)));
+    lanes.appendChild(lane);
+  });
+}
+
+function startBoardDrag(e,doId){
+  e.preventDefault(); e.stopPropagation();
+  boardDrag={doId};
+  const o=BOARD.orders.find(x=>x.do===doId);
+  boardGhost=document.createElement('div');
+  boardGhost.className='board-ghost';
+  boardGhost.innerHTML=`<span style="color:var(--brand);font-weight:700;font-family:ui-monospace,Menlo,monospace">${esc(o.do)}</span>`+
+    `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(o.customer)}</span>`+
+    `<span style="color:var(--muted);flex-shrink:0">${fmtT(o.weight)}</span>`;
+  document.body.appendChild(boardGhost);
+  moveBoardGhost(e.clientX,e.clientY);
+  renderBoard();
+}
+function moveBoardGhost(x,y){ if(boardGhost){ boardGhost.style.left=x+'px'; boardGhost.style.top=y+'px'; } }
+function boardZoneAt(x,y){
+  for(const el of document.elementsFromPoint(x,y)){
+    const z=el.closest?.('[data-zone]');
+    if(z) return z;
+  }
+  return null;
+}
+document.addEventListener('pointermove', e=>{
+  if(!boardDrag) return;
+  moveBoardGhost(e.clientX,e.clientY);
+  document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
+  const z=boardZoneAt(e.clientX,e.clientY);
+  if(z) z.classList.add('zone-active');
+});
+document.addEventListener('pointerup', async e=>{
+  if(!boardDrag) return;
+  const z=boardZoneAt(e.clientX,e.clientY);
+  const doId=boardDrag.doId;
+  boardDrag=null;
+  if(boardGhost){ boardGhost.remove(); boardGhost=null; }
+  document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
+  if(!z){ renderBoard(); return; }
+  const zone=z.dataset.zone;  // '' = pool, else a plate
+  await moveBoardCard(doId, zone || null);
+});
+
+async function moveBoardCard(doId, plate){
+  const d=await jpost('/api/board/move',{do:doId, lorry:plate});
+  if(!d.ok){ boardToast(d.message||d.error||'Move failed'); await loadBoard(); return; }
+  if(d.warnings && d.warnings.length){ boardToast(`${doId}: ${d.warnings.join(' · ')}`); }
+  if(d.board){ BOARD=d.board;
+    if(plate){
+      const o=BOARD.orders.find(x=>x.do===doId);
+      if(o) o._warned = (d.warnings&&d.warnings.length) ? d.warnings[0] : null;
+    }
+  }
+  renderBoard();
+}
+
+async function aiAssign(){
+  const btn=$('#btn-board-ai'); btn.disabled=true;
+  setMsg('#board-msg','AI is assigning… this can take a moment ',false);
+  try{
+    const d=await jpost('/api/board/ai-assign',{});
+    if(d.offschedule){
+      setMsg('#board-msg', `⏭ ${d.offschedule.count} DO(s) are off-schedule — go to Table view to decide, then come back to Board.`, false);
+      if(d.board){ BOARD=d.board; renderBoard(); }
+      return;
+    }
+    if(d.error){ setMsg('#board-msg', d.error, true); return; }
+    setMsg('#board-msg', null);
+    if(d.board){ BOARD=d.board; renderBoard(); }
+  } finally { btn.disabled=false; }
+}
+$('#btn-board-ai').onclick=aiAssign;
 
 async function doReassign(){
   const plates=[...document.querySelectorAll('.reassign-cb:checked')].map(c=>c.value);
@@ -1355,11 +1740,7 @@ $('#btn-refresh').onclick=doRefresh;
 // user back to Step 1 and losing sight of what was just assigned.
 fetch('/api/state').then(r=>r.json()).then(d=>{
   if(d && d.email){ document.getElementById('who').textContent = d.email; }
-  if(d && d.result){
-    hideAll();
-    renderResult(d.result);
-    show('#card-result', true);
-  }
+  if(d && d.result){ showBoard(); }
 }).catch(()=>{});
 
 wireBackButtons();

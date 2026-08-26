@@ -958,6 +958,79 @@ def _strict_route_excl(route_text: str) -> set:
             excl.add(plate)
     return excl
 
+def _check_manual_placement(item: dict, plate: str, engine, sess: dict) -> list[str]:
+    """Spot-check a manual drag-and-drop placement (board UI) against the hard
+    rules the auto-assignment engine enforces. Never blocks the move — the
+    caller always applies it — this only returns human-readable warnings for
+    the UI to flag on the card, so a human can still make a judgment call the
+    engine can't (e.g. a phone call from the customer) while seeing what
+    they're overriding.
+
+    Not an exhaustive re-run of every rule in the full assignment algorithm —
+    covers the checks most likely to matter for a single manual move:
+    eligibility, strict-route reservations, size/forbidden-plate caps,
+    capacity, outstation minimum tonnage, and route compatibility with
+    whatever else is already on that lorry today.
+    """
+    warnings: list[str] = []
+    from lorry_engine import _routes_on_same_way
+
+    route = str(item.get("ROUTE", ""))
+    weight = float(item.get("WEIGHT", 0) or 0)
+
+    cap = None
+    in_eligible = False
+    if engine is not None and getattr(engine, "eligible_lorries", None) is not None:
+        _row = engine.eligible_lorries[engine.eligible_lorries["LORRY"] == plate]
+        if not _row.empty:
+            cap = float(_row.iloc[0]["TON"])
+            in_eligible = True
+    if cap is None and engine is not None and getattr(engine, "all_lorries", None) is not None:
+        _row = engine.all_lorries[engine.all_lorries["LORRY"] == plate]
+        if not _row.empty:
+            cap = float(_row.iloc[0]["TON"])
+    if cap is None:
+        # Caller (board_move) is expected to have already hard-rejected a
+        # plate unknown to the whole fleet before calling this — reaching
+        # here with cap still None means the fleet lookup itself is broken,
+        # not a real placement choice, so bail rather than compute nonsense.
+        return warnings
+    if not in_eligible:
+        warnings.append(f"{plate} isn't Available in today's master lorry list (cross-owner or blocked override).")
+
+    if plate in _strict_route_excl(route):
+        warnings.append(f"{plate} is reserved for other routes only — not this one.")
+
+    max_ton = item.get("MAX_TON")
+    if max_ton is not None and cap > float(max_ton) + 1e-9:
+        warnings.append(f"Exceeds this DO's size cap (max {max_ton}T, {plate} is {cap}T).")
+
+    forbid = item.get("FORBID_PLATES")
+    if forbid and plate in forbid:
+        warnings.append(f"{plate} is explicitly forbidden for this DO.")
+
+    others = [it for it in (sess.get("items") or [])
+              if it is not item and it.get("LORRY") == plate]
+    other_load = sum(float(o.get("WEIGHT", 0) or 0) for o in others)
+    if other_load + weight > cap * NAIK_FACTOR + 1e-6:
+        warnings.append(
+            f"Over capacity: {round(other_load + weight, 3)}T on a {cap}T lorry.")
+
+    incompatible = [o.get("ROUTE", "") for o in others
+                    if not (_same_corridor_group(route, o.get("ROUTE", ""))
+                            or _routes_on_same_way(route, o.get("ROUTE", "")))]
+    if incompatible:
+        warnings.append(
+            f"Route doesn't match what's already on {plate} ({incompatible[0]}).")
+
+    dest_grp = _classify_dest_group(route, item.get("STATE", ""))
+    min_t = _eff_dest_min_ton(route, dest_grp, weight)
+    if min_t > 0 and cap < min_t:
+        warnings.append(f"Too small for this outstation route (needs ≥{min_t}T).")
+
+    return warnings
+
+
 def _resolve_history_path() -> str:
     """Return the best available history file.
     Single source of truth is the .xlsx; bot-exported and legacy files are
@@ -3242,6 +3315,45 @@ def assign_specific_dos(sess, plate: str, do_numbers: list) -> dict:
             pass
 
     return {"ok": True, "assigned": len(selected), "plate": plate, "weight": round(new_w, 3)}
+
+
+def board_move(sess, do_number: str, plate) -> dict:
+    """Board UI: drag-and-drop one DO onto a lorry (plate), or back to the
+    unassigned pool (plate falsy). Never blocks on a rule violation — the
+    human stays in control — but returns human-readable warnings from
+    _check_manual_placement() for the UI to flag on the card. Keeps
+    pending_dos totals and the export in sync, same as assign_specific_dos."""
+    engine = sess.get("engine")
+    items = sess.get("items", []) or []
+    by_do = {str(it.get("DO NUMBER")): it for it in items}
+    it = by_do.get(str(do_number).strip())
+    if it is None:
+        return {"error": "unknown_do", "message": f"DO {do_number} not found in this session."}
+
+    plate = str(plate).strip().upper() if plate else ""
+    warnings: list[str] = []
+    if not plate:
+        it["LORRY"] = "NO_LORRY"
+        sess.setdefault("assigned", {}).pop(it["DO NUMBER"], None)
+    else:
+        _fleet_df = getattr(engine, "all_lorries", None) if engine is not None else None
+        if _fleet_df is None or _fleet_df[_fleet_df["LORRY"] == plate].empty:
+            return {"error": "unknown_plate",
+                    "message": f"{plate} is not a known lorry. Check the spelling."}
+        warnings = _check_manual_placement(it, plate, engine, sess)
+        it["LORRY"] = plate
+        sess.setdefault("assigned", {})[it["DO NUMBER"]] = plate
+        sess.setdefault("unassigned_reasons", {}).pop(it["DO NUMBER"], None)
+
+    for do in sess.get("pending_dos", []):
+        do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
+    if sess.get("raw_df") is not None:
+        try:
+            _export_result(sess)
+        except Exception:
+            pass
+
+    return {"ok": True, "do": it["DO NUMBER"], "lorry": it["LORRY"], "warnings": warnings}
 
 
 def _handle_excel_upload(phone, sess, file_bytes):
