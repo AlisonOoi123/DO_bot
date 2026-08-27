@@ -1588,6 +1588,20 @@ def toggle_staging_broken(sess, plate: str, broken: bool) -> dict:
     return {"ok": True, "plate": plate, "broken": broken}
 
 
+def reset_plate_holders(sess) -> dict:
+    """Escape hatch: clear every staging-station claim/release for today, so
+    every plate falls back to its master-file default owner (own planner,
+    or STAGING for a SPARE plate) — for when an earlier claim/release ends
+    up parking a plate somewhere a planner didn't intend, or leftover from
+    testing the drag-and-drop, and dragging things back one at a time isn't
+    practical. Does not touch the on/off (broken/not-running) toggles."""
+    state = _load_lorry_toggle()
+    state["holder"] = {}
+    _save_lorry_toggle(state)
+    refresh_eligible_from_toggle(sess)
+    return {"ok": True}
+
+
 def _spare_plates(engine) -> set:
     """Plates in this user's fleet that are SPARE (shared)."""
     el = engine.eligible_lorries

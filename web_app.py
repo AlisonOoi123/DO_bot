@@ -897,6 +897,19 @@ def api_board_staging_broken():
     return _with_cookie(outcome, sid)
 
 
+@app.route("/api/board/reset-holders", methods=["POST"])
+def api_board_reset_holders():
+    """Escape hatch for the staging station: put every plate back to its
+    master-file default owner, undoing all claim/release moves made today
+    (e.g. leftover from testing the drag-and-drop, or a plate parked
+    somewhere by mistake) — without touching on/off (broken) toggles."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    outcome = bot.reset_plate_holders(sess)
+    outcome["board"] = _board_json(sess)
+    return _with_cookie(outcome, sid)
+
+
 @app.route("/api/board/ai-assign", methods=["POST"])
 def api_board_ai_assign():
     """Re-run the real auto-assignment engine from scratch over the originally
@@ -1373,6 +1386,7 @@ _PAGE = r"""<!doctype html>
       <div class="tp-staging-station" data-tpzone="STAGING" id="tp-staging-station">
         <div class="tp-staging-label">🅿️ STAGING STATION
           <span class="tp-staging-hint">shared &mdash; drag a plate here to lend it, drag one out to claim it</span>
+          <button class="mini-btn" id="tp-reset-holders" type="button" style="margin-left:auto">&#8635; Reset sharing to defaults</button>
         </div>
         <div class="tp-staging-grid" id="tp-staging-grid"></div>
       </div>
@@ -1815,6 +1829,14 @@ document.addEventListener('pointermove', e=>{
   const zoneEl = z ? z.closest('[data-tpzone]') : null;
   if(zoneEl) zoneEl.classList.add('tpzone-active');
 });
+$('#tp-reset-holders').onclick=async()=>{
+  if(!confirm('Put every plate back to its default owner (own planner, or Staging for a SPARE plate)? This undoes all claim/release moves made today.')) return;
+  const d = await jpost('/api/board/reset-holders', {});
+  if(!d.ok){ boardToast(d.message||d.error||'Reset failed'); return; }
+  await loadLorryToggles();
+  if(BOARD) await loadBoard();
+  boardToast('Sharing reset to today\'s defaults.');
+};
 document.addEventListener('pointerup', async e=>{
   if(!chipDrag) return;
   const {plate, fromZone} = chipDrag;
