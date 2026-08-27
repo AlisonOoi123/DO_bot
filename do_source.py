@@ -64,17 +64,18 @@ number — several real discrepancies were found and fixed:
      row count on the reference dump (no duplicates existed there), but
      matches the source of truth exactly.
 
-2026-08-27 fix: this file also had a WHERE-clause filter
-(SIHNUM_0 IS NULL, i.e. "not yet invoiced") that the real production
-query does NOT have — pre-dates the audit above, never caught because
-it only strips ROWS, not columns, so it never broke anything visibly,
-it just silently under-fetched. A live comparison against the actual
-system (portal fetched far fewer DOs than the real invoice count for
-the same user/day) confirmed some pending DOs already carry an invoice
-number, so this filter was excluding real, still-need-a-lorry work.
-Removed to match the production query exactly; the VALIDATED output
-column is still computed and included for information, it's just no
-longer used to drop rows.
+2026-08-27: briefly removed the SIHNUM_0 IS NULL ("not yet invoiced")
+WHERE-clause filter to match the raw production query text exactly,
+on the theory it was silently under-fetching. Wrong call, reverted
+immediately — without it, the date floor (start of the CURRENT YEAR,
+~8 months of history by August) let through every already-invoiced,
+already-delivered DO for the whole year as well, ballooning one fetch
+to 25,000+ rows instead of the handful of still-pending ones. The raw
+query text is the report's base SELECT; the "not yet invoiced" filter
+is this file's own addition on top of it to scope that base query down
+to "still needs a lorry today", and DOES need to stay. The original
+under-fetch complaint that prompted removing it was never actually
+tied to this filter — it needs separate investigation.
 
 Configuration: a JSON file with {server, database, username, password,
 driver} — see configrd.json. NEVER commit this file; it holds a real
@@ -242,6 +243,7 @@ LEFT JOIN {schema}.BPADDRESS a
    AND c.BPAADD_0 = a.BPAADD_0
 WHERE d.SDHTYP_0 <> 'LOAN'
   AND d.STOFCY_0 = '1SA'
+  AND (d.SIHNUM_0 IS NULL OR LTRIM(RTRIM(d.SIHNUM_0)) = '')
   AND d.DLVDAT_0 >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
   AND c.DRN_0 IN ({drn_list})
   {etd_clause}
@@ -355,19 +357,21 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     _year_start = pd.Timestamp(datetime.now().year, 1, 1)
     _not_loan = df['SDHTYP_0'] != 'LOAN'
     _right_site = df['STOFCY_0'] == '1SA'
+    _not_validated = df['VALIDATED'] == 'NO'
     _known_route = df['DRN_0'].isin(DRN_LIST)
     _this_year = pd.to_datetime(df['DLVDAT_0'], errors='coerce') >= _year_start
     LAST_FETCH_DIAGNOSTICS = {
         "raw_rows_from_sql": int(len(df)),
         "after_not_loan": int(_not_loan.sum()),
         "after_site_1SA": int((_not_loan & _right_site).sum()),
-        "after_known_route": int((_not_loan & _right_site & _known_route).sum()),
-        "after_this_year": int((_not_loan & _right_site & _known_route & _this_year).sum()),
+        "after_not_validated": int((_not_loan & _right_site & _not_validated).sum()),
+        "after_known_route": int((_not_loan & _right_site & _not_validated & _known_route).sum()),
+        "after_this_year": int((_not_loan & _right_site & _not_validated & _known_route & _this_year).sum()),
         "distinct_stofcy_seen": sorted(str(v) for v in df['STOFCY_0'].dropna().unique())[:10] if len(df) else [],
         "distinct_sdhtyp_seen": sorted(str(v) for v in df['SDHTYP_0'].dropna().unique())[:10] if len(df) else [],
     }
 
-    filtered_df = df[_not_loan & _right_site & _known_route & _this_year].copy()
+    filtered_df = df[_not_loan & _right_site & _not_validated & _known_route & _this_year].copy()
 
     if etd_days is not None:
         _etd_dt = pd.to_datetime(filtered_df['ZETD_0'], errors='coerce')
