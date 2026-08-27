@@ -541,7 +541,13 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes) -> dict:
             },
         }
     result = _result_json(sess) if sess.get("items") else None
-    return {"messages": msgs, "state": sess.get("state"), "result": result}
+    resp = {"messages": msgs, "state": sess.get("state"), "result": result}
+    # bot.py's error messages consistently lead with "❌" — surface that as a
+    # real error instead of silently falling through to a generic "no DOs
+    # loaded" board message once /api/board is queried afterwards.
+    if not sess.get("items") and msgs and str(msgs[0]).strip().startswith("❌"):
+        resp["error"] = msgs[0]
+    return resp
 
 
 @app.route("/api/dos", methods=["POST"])

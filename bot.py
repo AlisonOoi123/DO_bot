@@ -7857,6 +7857,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
     except Exception as e:
         import traceback
+        traceback.print_exc()
         return [f"❌ Failed to read the Excel file: {e}\nPlease re-upload."]
 
 def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
