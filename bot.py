@@ -3326,13 +3326,19 @@ def _overload_rescue(sess, max_over: float = SLIGHT_OVERLOAD):
 
     def _near_ok(it, l):
         # Don't add an urban DO to a lorry that already carries a DIFFERENT
-        # urban route code more than _URBAN_MERGE_SPREAD away — no far mixing.
+        # urban route code — urban routes may only combine when they're the
+        # same route code or an explicit ROUTE_CORRIDOR_GROUPS pairing (e.g.
+        # KV19A+KV20A); for an approved pairing, still require the DOs stay
+        # within _URBAN_MERGE_SPREAD of each other (no far mixing).
         _la, _lo = it.get("GPS_LAT"), it.get("GPS_LON")
-        if _la is None or _lo is None:
-            return True
         _c = _pfx(it)
         for _pla, _plo, _pc in lpts[l]:
-            if _pc != _c and ((_la - _pla) ** 2 + (_lo - _plo) ** 2) ** 0.5 > _URBAN_MERGE_SPREAD:
+            if _pc == _c:
+                continue
+            if not _same_corridor_group(_c, _pc):
+                return False
+            if (_la is not None and _lo is not None
+                    and ((_la - _pla) ** 2 + (_lo - _plo) ** 2) ** 0.5 > _URBAN_MERGE_SPREAD):
                 return False
         return True
 
@@ -3456,9 +3462,18 @@ def _urban_rebalance(sess, max_over: float = SLIGHT_OVERLOAD):
                 continue
             if load[m] + L_w > caps[m] * max_over + 1e-9:
                 continue                               # no room even overloaded
-            # No far mix: the MAX pairwise distance between any two different
-            # urban route codes on the COMBINED lorry must stay within the
-            # guard (centroid-to-centroid is too loose for a wide cluster).
+            # Urban routes may only combine on one lorry when they're the
+            # same route code or an explicit ROUTE_CORRIDOR_GROUPS pairing
+            # (e.g. KV19A+KV20A) — geographic closeness alone is not enough,
+            # by explicit request.
+            _m_codes = {_pfx(x) for x in on[m]}
+            if not all(_lc == _mc or _same_corridor_group(_lc, _mc)
+                       for _lc in L_codes for _mc in _m_codes):
+                continue
+            # No far mix: for an approved pairing, the MAX pairwise distance
+            # between any two different urban route codes on the COMBINED
+            # lorry must still stay within the guard (centroid-to-centroid
+            # is too loose for a wide cluster).
             comb = [(x.get("GPS_LAT"), x.get("GPS_LON"), _pfx(x))
                     for x in (on[m] + L_items)
                     if x.get("GPS_LAT") is not None and _is_urban_do(x)]
@@ -4082,20 +4097,21 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _past_date_count   = 0
         _wrong_trip_count  = 0
         _today_date = datetime.now().date()
-        # A DO dated before today is normally left alone entirely — but if
-        # the user set an ETD window (e.g. ±2 days), they've explicitly
-        # asked for DOs from that window to be considered, including ones
-        # whose DATE already slipped a couple of days back. The past-date
-        # cutoff moves with that window instead of always being a hard
-        # "today" line, so PAST_DATE only catches what's actually outside
-        # what the user asked to see. No window set (None/blank/0 = fetch
-        # everything) keeps the original "today onward only" behaviour.
+        # A DO dated more than 30 days before today is stale and left alone
+        # entirely. Anything backdated within the last 30 days is still
+        # included and auto-assigned — by explicit request it should be
+        # PRIORITISED ahead of on-time DOs (the earliest-date-first sort
+        # below already does this once these rows are in the pool).
+        # An ETD window (e.g. ±2 days) can only make the cutoff MORE
+        # permissive than 30 days, never less.
         from datetime import timedelta as _td_cutoff
         _etd_days_for_cutoff = sess.get("etd_days")
-        _past_date_cutoff = (
-            _today_date - _td_cutoff(days=_etd_days_for_cutoff)
-            if _etd_days_for_cutoff else _today_date
-        )
+        _past_date_cutoff = _today_date - _td_cutoff(days=30)
+        if _etd_days_for_cutoff:
+            _past_date_cutoff = min(
+                _past_date_cutoff,
+                _today_date - _td_cutoff(days=_etd_days_for_cutoff),
+            )
         _trip_session = sess.get("trip_session")   # "1"/"2"/"3"/"4" / None (any)
         # Lorry tonnage lookup for enforcing REMARKS size caps on pre-filled rows.
         _prefill_cap_map: dict[str, float] = {}
@@ -4597,17 +4613,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _cc_pref = (_live_centroids.get(cand_bkey)
                             or _live_centroids.get(cand_route)
                             or _route_centroid(cand_route))
-                _geo_close = (
-                    _both_urban
-                    and _bc_pref and _cc_pref
-                    and _haversine_km(_bc_pref[0], _bc_pref[1], _cc_pref[0], _cc_pref[1])
-                        <= _MAX_CITY_MERGE_KM_OUTSTATION
-                )
+                # Urban (KL/Selangor) routes must NEVER share a lorry just because
+                # they're geographically close — by explicit request, two different
+                # urban route codes may only combine when they're the same route
+                # code or both belong to an explicit ROUTE_CORRIDOR_GROUPS entry
+                # (e.g. KV19A+KV20A). GPS-proximity merging (formerly _geo_close)
+                # is disabled here; it stays False for urban pairs unconditionally.
+                _geo_close = False
                 _pref_overlap = (
                     not _base_pref
                     or not _cand_pref
                     or bool(_base_pref & _cand_pref)
-                    or _geo_close   # urban routes close together may share a lorry
                 )
 
                 # Don't merge buckets whose GPS bearing octants are incompatible,
@@ -4712,12 +4728,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _same_city = (
                     bool(_base_cities2 & _cand_cities2)
                     and (not _st_base or not _st_cand or _st_base == _st_cand)
+                    # Urban (KL/Selangor) routes never merge on shared city/state
+                    # alone — only an identical route code or an explicit
+                    # ROUTE_CORRIDOR_GROUPS entry may combine them.
+                    and not _both_urban
                 )
 
                 # Same-state + nearest-longitude: both in the same state and their
                 # GPS centroids are within the city-merge radius of each other.
+                # (Designed for outstation corridor discovery — never applies to
+                # urban KL/Selangor pairs, which are geographically close by
+                # nature and would otherwise merge almost every time.)
                 _lon_close = False
-                if (_st_base and _st_cand and _st_base == _st_cand
+                if (not _both_urban and _st_base and _st_cand and _st_base == _st_cand
                         and _bc_pref and _cc_pref):
                     _lon_close = (
                         _haversine_km(_bc_pref[0], _bc_pref[1],
@@ -5456,10 +5479,15 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _preferred:
                 # Preferred lorries are a hint — weight fit wins.
                 # Hard-exclude preferred lorries if: truly unavailable, full,
-                # strictly forbidden for ANY route in this group, OR already
-                # committed to a different destination state.
+                # strictly forbidden for ANY route in this group, already
+                # committed to a different destination state, OR already
+                # carrying an incompatible route this session (_session_incompatible
+                # — e.g. a lorry preferred for BOTH KV04A and KV06A must not take
+                # both when they aren't the same route or a declared corridor
+                # pair; the FIT IN LORRY sheet listing a plate for two different
+                # routes doesn't mean they may ride together on the same day).
                 _hard_excl = (sess["unavailable"] | get_assigned_today()
-                               | _strict_excl | _state_excl)
+                               | _strict_excl | _state_excl | _session_incompatible)
                 # Also build destination-group rules here so preferred check is consistent
                 # with open assignment: urban routes (KL/Selangor) must use <11T lorries.
                 _pref_dest_min = _DEST_MIN_TON.get(_dest_grp, 0.0)
@@ -7580,6 +7608,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         _add = [_pt_of(x) for x in _cit if _pt_of(x)]
                         if not _lorry_geo_ok(_rpts + _add):
                             continue
+                        # Urban routes may only combine with an identical route
+                        # code or an explicit ROUTE_CORRIDOR_GROUPS pairing (e.g.
+                        # KV19A+KV20A) — spare capacity alone is not enough to
+                        # take on an unrelated urban route, by explicit request.
+                        if not all(_rc == _lc or _same_corridor_group(_rc, _lc)
+                                   for _rc in _croutes for _lc in _uc_routes[_r]):
+                            continue
                         _cands.append(_r)
                     if not _cands:
                         continue                      # no ≤11T home — keep on big lorry
@@ -7707,12 +7742,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _lcent = _centroid([x for x in items if x.get("LORRY") == _l])
                 if _lcent is None:
                     continue
+                _l_codes = {_rcode(x) for x in items if x.get("LORRY") == _l}
                 # candidate whole urban routes sitting on OTHER lorries
                 _cands = []
                 for _rc, _rits in _urb.items():
                     _lset = {x["LORRY"] for x in _rits}
                     if _l in _lset or len(_lset) != 1:
                         continue                  # only move a route that is whole elsewhere
+                    # Urban routes may only combine with an identical route
+                    # code or an explicit ROUTE_CORRIDOR_GROUPS pairing (e.g.
+                    # KV19A+KV20A) — GPS proximity alone is not enough to
+                    # share a lorry, by explicit request.
+                    if not all(_rc == _lc or _same_corridor_group(_rc, _lc)
+                               for _lc in _l_codes):
+                        continue
                     _rw = sum(x["WEIGHT"] for x in _rits)
                     if _rw > _free:
                         continue
@@ -7996,9 +8039,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
         if _other_user_count:
             header += f"\n📌 _{_other_user_count} DO(s) from another user's routes — left blank (cross-user assignment not allowed)._"
         if _past_date_count:
-            _cutoff_note = (f"before your ETD window (older than {_past_date_cutoff.strftime('%d/%m')})"
-                             if _etd_days_for_cutoff else "before today")
-            header += f"\n🗓️ _{_past_date_count} DO(s) dated {_cutoff_note} — left unassigned; assign these manually if still needed._"
+            header += f"\n🗓️ _{_past_date_count} DO(s) dated before {_past_date_cutoff.strftime('%d/%m')} — left unassigned; assign these manually if still needed._"
         if _wrong_trip_count:
             header += f"\n🕐 _{_wrong_trip_count} DO(s) marked for a different trip in REMARKS — left unassigned (you picked Trip {_trip_session})._"
         if _remarks_skip_count:
