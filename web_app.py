@@ -472,9 +472,41 @@ _MASTER_LORRY_DEFAULT_PATH = os.path.join(
 
 @app.route("/api/master-default")
 def api_master_default():
-    """Return today's starting master-lorry grid (from the committed default
-    file) as JSON rows for the portal's editable table."""
+    """Return today's starting master-lorry grid as JSON rows for the
+    portal's editable table.
+
+    Sourced from the logged-in session's own engine.all_lorries — the SAME
+    live LORRY DAILY PLANNING.xlsx (MUATAN sheet) LorryEngine already parsed
+    at login — not a separately committed sample file. Two parallel copies
+    of "today's fleet" (one live, one a static snapshot) can only drift
+    apart; this was confirmed live as the cause of ABI-owned plates
+    (BQU3875, BQX7228, BQX9983, BQY7823, VEA2818) showing up in VIVIAN's own
+    fleet list, sourced from the stale sample file's ownership column."""
     sid = _sid()
+    sess = bot.get_session(sid)
+    engine = sess.get("engine")
+    if engine is not None and getattr(engine, "all_lorries", None) is not None and not engine.all_lorries.empty:
+        rows = []
+        for _, r in engine.all_lorries.iterrows():
+            plate = str(r.get("LORRY", "")).strip().upper()
+            if not plate:
+                continue
+            try:
+                ton = float(r.get("TON"))
+            except (TypeError, ValueError):
+                ton = None
+            user = str(r.get("USER", "")).strip().upper()
+            rows.append({
+                "lorry": plate,
+                "ton": ton,
+                "ori_user": user,
+                "user": user,
+                "status": str(r.get("Status", "")).strip().upper() or "AVAILABLE",
+            })
+        return _with_cookie({"rows": rows}, sid)
+
+    # Fall back to the committed sample only if no session engine exists yet
+    # (shouldn't normally happen — this endpoint is always called after login).
     try:
         df = pd.read_excel(_MASTER_LORRY_DEFAULT_PATH)
     except Exception as e:
