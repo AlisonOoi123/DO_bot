@@ -139,6 +139,15 @@ _SENTINELS = {"NO_LORRY", "NO_ELIGIBLE_LORRY", "SPLIT", "SKIPPED",
               "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE",
               "WRONG_TRIP", "PAST_DATE", "", None}
 
+# Not actionable by the logged-in planner at all today — not "their" route
+# (OTHER_USER), not their scheduled day (NOT_TODAY), outsourced (OUT_SOURCE),
+# explicitly skipped (REMARKS_SKIP), or the wrong half-day (WRONG_TRIP).
+# _result_json (table view) has always kept these out of the actionable
+# "unassigned" list, showing only a count via dos_other/skipped_other —
+# _board_json must apply the same exclusion or a planner's board pool ends
+# up showing the OTHER planner's routes as if they were theirs to work on.
+_NOT_MINE_TODAY = {"OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP"}
+
 
 def _result_json(sess) -> dict:
     """Group the assigned items by lorry and list what couldn't be assigned."""
@@ -193,7 +202,7 @@ def _result_json(sess) -> dict:
             "state": str(it.get("STATE", "")),
             "date": str(it.get("DATE", "")),
         }
-        if lorry in ("OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP"):
+        if lorry in _NOT_MINE_TODAY:
             skipped_other += 1
             continue
         if lorry in _SENTINELS:
@@ -328,11 +337,13 @@ def _board_json(sess) -> dict:
     routes: dict[str, dict] = {}
     for it in items:
         lorry = it.get("LORRY")
+        if lorry in _NOT_MINE_TODAY:
+            continue
         route = str(it.get("ROUTE", ""))
         assigned_plate = lorry if lorry and lorry not in _SENTINELS else None
         weight = float(it.get("WEIGHT", 0) or 0)
         weight = round(weight, 3) if pd.notna(weight) else 0.0
-        # A real reason (e.g. PAST_DATE, WRONG_TRIP) beats no explanation at
+        # A real reason (e.g. PAST_DATE) beats no explanation at
         # all for a pool card the AI deliberately skipped rather than one it
         # just couldn't fit anywhere (NO_LORRY etc. show no reason tag).
         _reason = lorry if lorry in _SENTINELS and lorry not in ("NO_LORRY", "", None) else ""
