@@ -158,8 +158,20 @@ def _load_user_route_prefixes(user: str) -> set | None:
         return None
     try:
         u = user.strip().upper()
-        sheet_name = f"{u} ROUTE"   # e.g. "ABI ROUTE" or "VIVIAN ROUTE"
-        df = pd.read_excel(PLANNING_PATH, sheet_name=sheet_name, header=None)
+        target = f"{u} ROUTE"   # e.g. "ABI ROUTE" or "VIVIAN ROUTE"
+        # Sheet names may have trailing spaces (this file already has one on
+        # "SCHD(vivian) ") — match by stripped name like _load_schedule does,
+        # instead of an exact pd.read_excel(sheet_name=...) lookup that would
+        # silently raise (and fall through to "no filtering" below) on any
+        # such mismatch — the worst possible failure mode for a per-user
+        # route filter, since it means everyone sees everyone's routes.
+        xl = pd.ExcelFile(PLANNING_PATH)
+        sheet = next((s for s in xl.sheet_names if s.strip().upper() == target), None)
+        if sheet is None:
+            print(f"[_load_user_route_prefixes] No sheet matching '{target}' found "
+                  f"(have: {xl.sheet_names}) — route filtering disabled for {u}.")
+            return None
+        df = pd.read_excel(PLANNING_PATH, sheet_name=sheet, header=None)
         prefixes: set[str] = set()
         # Scan every cell — route strings start with a code like KV01A, PH09, NS04
         _route_pat = re.compile(r'^([A-Za-z]{2,4}\d{1,2}[A-Za-z]?)')
@@ -169,7 +181,8 @@ def _load_user_route_prefixes(user: str) -> set | None:
                 if m:
                     prefixes.add(m.group(1).upper())
         return prefixes if prefixes else None
-    except Exception:
+    except Exception as e:
+        print(f"[_load_user_route_prefixes] Failed for {user}: {type(e).__name__}: {e}")
         return None
 
 # _SCHD_DAY_MAP and _REMARKS_KEYWORD_DAY imported from assignment_config
@@ -3570,10 +3583,13 @@ def assign_specific_dos(sess, plate: str, do_numbers: list) -> dict:
     return {"ok": True, "assigned": len(selected), "plate": plate, "weight": round(new_w, 3)}
 
 
-def _unknown_plate_diag(fleet_df, plate: str) -> str:
+def _unknown_plate_diag(fleet_df, plate: str, engine=None) -> str:
     """Extra detail for an 'unknown_plate' error — since this shouldn't
     normally happen for a plate the board itself just showed a lane for,
     surface WHY the lookup failed instead of leaving it a mystery."""
+    _load_err = getattr(engine, "_load_master_error", None) if engine is not None else None
+    if _load_err:
+        return f" (diagnostics: the master lorry file failed to load at login — {_load_err})"
     if fleet_df is None:
         return " (diagnostics: engine.all_lorries is None — the session's engine wasn't built correctly.)"
     try:
@@ -3618,7 +3634,7 @@ def board_move(sess, do_number: str, plate) -> dict:
         if _fleet_df is None or _fleet_df[_fleet_df["LORRY"] == plate].empty:
             return {"error": "unknown_plate",
                     "message": f"{plate} is not a known lorry. Check the spelling."
-                                + _unknown_plate_diag(_fleet_df, plate)}
+                                + _unknown_plate_diag(_fleet_df, plate, engine)}
         warnings = _check_manual_placement(it, plate, engine, sess)
         _user = sess.get("user_id")
         if _user and plate in get_unavailable_plates_for(_user):
@@ -3652,7 +3668,7 @@ def board_move_route(sess, route: str, plate) -> dict:
     if _fleet_df is None or _fleet_df[_fleet_df["LORRY"] == plate].empty:
         return {"error": "unknown_plate",
                 "message": f"{plate} is not a known lorry. Check the spelling."
-                            + _unknown_plate_diag(_fleet_df, plate)}
+                            + _unknown_plate_diag(_fleet_df, plate, engine)}
 
     _known_plates = set()
     if _fleet_df is not None:

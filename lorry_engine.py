@@ -602,9 +602,10 @@ class LorryEngine:
         Section labels identify which USER owns the following lorry rows.
         LORRY NAIK (5%) is used as TON (converted kg → tonnes).
         """
+        self._load_master_error = None
         try:
             raw = pd.read_excel(path, sheet_name="MUATAN", header=None)
-        except Exception:
+        except Exception as e1:
             # Fallback: try reading as plain master lorry format
             try:
                 raw = pd.read_excel(path)
@@ -613,7 +614,15 @@ class LorryEngine:
                 raw = raw.drop_duplicates(subset=["LORRY"], keep="first")
                 self.eligible_lorries = raw[raw["USER"].isin({self.owner_user, "SPARE"})].copy()
                 self.all_lorries = raw.copy()
-            except Exception:
+            except Exception as e2:
+                # Both the MUATAN-sheet read AND the plain-format fallback
+                # failed — record why (e.g. file locked/open elsewhere, path
+                # wrong, sheet renamed) instead of silently handing back an
+                # empty fleet with no trace of the real cause.
+                self._load_master_error = (
+                    f"MUATAN sheet read failed: {type(e1).__name__}: {e1}; "
+                    f"plain-format fallback also failed: {type(e2).__name__}: {e2}")
+                print(f"[LorryEngine._load_master] {self._load_master_error}")
                 self.eligible_lorries = pd.DataFrame(columns=["LORRY", "TON", "USER", "Status"])
                 self.all_lorries = self.eligible_lorries.copy()
             return
