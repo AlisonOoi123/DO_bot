@@ -259,53 +259,47 @@ def _result_json(sess) -> dict:
     }
 
 
-def _board_json(sess) -> dict:
-    """Drag-and-drop board view: every DO (assigned or not) plus every lorry
-    with its current capacity, shaped for the board UI. Unassigned DOs are
-    also grouped by route for the pool panel."""
-    # Refresh _my_zone_fleet/_staging_fleet/eligible_lorries fresh on every
-    # read, not just after this session's own toggle/claim actions — the
-    # OTHER planner may have released or claimed a plate since this
-    # session's fields were last computed (they're only written on a local
-    # write, not kept live), and a stale read here would show a plate as
-    # still staged (or still available) when it's actually just been taken.
+def _finite_ton(r):
+    try:
+        v = float(r["TON"])
+    except (TypeError, ValueError):
+        return None
+    return v if pd.notna(v) and v not in (float("inf"), float("-inf")) else None
+
+
+def _caps_from_pairs(pairs):
+    out = {}
+    for p, t in pairs or []:
+        try:
+            v = float(t)
+        except (TypeError, ValueError):
+            continue
+        if pd.notna(v) and v not in (float("inf"), float("-inf")):
+            out[str(p).strip().upper()] = v
+    return out
+
+
+def _fleet_lists(sess) -> dict:
+    """This planner's current holder-based fleet — own plates plus any
+    SPARE/staged one actually claimed for today, and the shared staging
+    pool — with today's on/off state. This is the single source of truth
+    for "who currently holds this plate": once a plate's holder is the
+    OTHER planner (not staging), it must not appear here at all, or a
+    stale claim would leak a plate back onto the wrong screen.
+
+    Refreshes _my_zone_fleet/_staging_fleet/eligible_lorries fresh on every
+    call, not just after this session's own toggle/claim actions — the
+    OTHER planner may have released or claimed a plate since this
+    session's fields were last computed (they're only written on a local
+    write, not kept live), and a stale read here would show a plate as
+    still staged (or still available) when it's actually just been taken.
+    """
     if sess.get("engine") is not None and sess.get("user_id"):
         try:
             bot.refresh_eligible_from_toggle(sess)
         except Exception:
             pass
-    items = sess.get("items", []) or []
     engine = sess.get("engine")
-
-    def _finite_ton(r):
-        try:
-            v = float(r["TON"])
-        except (TypeError, ValueError):
-            return None
-        return v if pd.notna(v) and v not in (float("inf"), float("-inf")) else None
-
-    # Board lanes = the logged-in planner's OWN CURRENTLY-HELD fleet only —
-    # own plates plus any SPARE/staged one they've actually claimed for
-    # today, not the whole company's, and not a plate the other planner
-    # currently holds. Sourced from sess["_my_zone_fleet"] (computed by
-    # bot.refresh_eligible_from_toggle from live holder + toggle state), not
-    # engine.eligible_lorries directly, so a plate the planner has toggled
-    # OFF still shows a lane (with a working switch) instead of
-    # disappearing. A plate that already has a DO on it from elsewhere (e.g.
-    # a manual table-view assignment onto a BIG/SELAYANG plate) still gets a
-    # lane so that assignment stays visible, even though it's not itself a
-    # drop target.
-    def _caps_from_pairs(pairs):
-        out = {}
-        for p, t in pairs or []:
-            try:
-                v = float(t)
-            except (TypeError, ValueError):
-                continue
-            if pd.notna(v) and v not in (float("inf"), float("-inf")):
-                out[str(p).strip().upper()] = v
-        return out
-
     caps = _caps_from_pairs(sess.get("_my_zone_fleet"))
     if not caps and sess.get("_my_zone_fleet") is None:
         # Fallback only if the holder-aware fleet was never computed for
@@ -324,6 +318,36 @@ def _board_json(sess) -> dict:
         _off_plates = bot.get_unavailable_plates_for(sess.get("user_id") or "")
     except Exception:
         pass
+    return {
+        "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates}
+                    for p, c in sorted(caps.items())],
+        "staging": [{"plate": p, "capacity": c, "broken": bot.is_staging_plate_broken(p)}
+                    for p, c in sorted(staging_caps.items())],
+    }
+
+
+def _board_json(sess) -> dict:
+    """Drag-and-drop board view: every DO (assigned or not) plus every lorry
+    with its current capacity, shaped for the board UI. Unassigned DOs are
+    also grouped by route for the pool panel."""
+    # _fleet_lists() already refreshes holder/toggle state fresh — reuse its
+    # caps/staging_caps rather than recomputing (also runs the refresh once).
+    _fl = _fleet_lists(sess)
+    caps = {l["plate"]: l["capacity"] for l in _fl["lorries"]}
+    staging_caps = {l["plate"]: l["capacity"] for l in _fl["staging"]}
+    _off_plates = {l["plate"] for l in _fl["lorries"] if not l["on"]}
+    items = sess.get("items", []) or []
+    engine = sess.get("engine")
+
+    # Board lanes = the logged-in planner's OWN CURRENTLY-HELD fleet, PLUS —
+    # unlike the setup screen's toggle grid (_fleet_lists alone) — a plate
+    # that already has a DO on it from elsewhere (e.g. a manual table-view
+    # assignment onto a BIG/SELAYANG plate) still gets a lane here so that
+    # assignment stays visible, even though it's not itself a drop target.
+    # This enrichment is intentionally NOT part of _fleet_lists: applying it
+    # to the toggle grid too let a plate the OTHER planner had since claimed
+    # reappear on this planner's setup screen just because an old DO in
+    # sess["items"] still referenced it from before the claim.
     _all_caps = {}
     if engine is not None and getattr(engine, "all_lorries", None) is not None:
         try:
@@ -856,8 +880,7 @@ def api_lorry_toggles():
     sess = bot.get_session(sid)
     if not sess.get("engine"):
         return _with_cookie({"lorries": [], "staging": []}, sid)
-    _b = _board_json(sess)
-    return _with_cookie({"lorries": _b["lorries"], "staging": _b["staging"]}, sid)
+    return _with_cookie(_fleet_lists(sess), sid)
 
 
 @app.route("/api/board")
@@ -1323,6 +1346,7 @@ _PAGE = r"""<!doctype html>
   .board-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
   .board-top .btn{width:auto}
   .board-top .btn-ai{background:linear-gradient(135deg,var(--brand),#a855f7);color:#fff}
+  .board-top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-left:auto}
   .board-plan-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .board-plan-field{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
     font-weight:600;background:var(--card2);border:1px solid var(--line);border-radius:20px;
@@ -1599,9 +1623,11 @@ _PAGE = r"""<!doctype html>
           </span>
         </span>
       </div>
-      <button class="btn btn-ai" id="btn-board-ai" style="margin-left:auto">🤖 AI Assign</button>
-      <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
-      <button class="btn secondary" id="btn-board-table">📋 Table view</button>
+      <div class="board-top-actions">
+        <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
+        <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
+        <button class="btn secondary" id="btn-board-table">📋 Table view</button>
+      </div>
     </div>
     <div class="msg hidden" id="board-msg"></div>
     <div class="board-grid">
