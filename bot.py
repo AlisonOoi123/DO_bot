@@ -2919,30 +2919,34 @@ def _handle_master_upload(phone, sess, file_bytes):
         clear_specific_plates_from_log(_mine_in_log)
     sess["unavailable"] = set(get_assigned_today()) | set(get_broken_lorries())
 
-    # Keep the FULL per-user fleet (own + SPARE, before holder/toggle
-    # filtering) so the board can still render a lane — with a working
-    # switch — for a plate the user has toggled OFF, and so staging
-    # claim/release has the complete candidate list to work from.
-    sess["_full_fleet"] = list(my_fleet)
+    # The FULL shareable universe — every plate belonging to EITHER planner
+    # (own or SPARE), not just this user's own+SPARE. This matters for the
+    # staging station: if VIVIAN releases her own plate BPR9226 into
+    # staging, ABI's session needs to know BPR9226 exists at all in order
+    # to show it in ABI's staging view and let ABI claim it — a plate
+    # scoped only to "my own fleet" would never appear there, since it was
+    # never one of ABI's candidates to begin with. Each plate's TON is the
+    # same regardless of whose per_user list it's read from.
+    _abi_map = {p.upper(): t for p, t in per_user.get("ABI", [])}
+    _vivian_map = {p.upper(): t for p, t in per_user.get("VIVIAN", [])}
+    _shareable = {**_vivian_map, **_abi_map}
+    sess["_full_fleet"] = list(_shareable.items())
 
     # Each plate's OWN default owner (SPARE if shared with the other
     # planner, else whichever single planner it belongs to) — the baseline
-    # the staging station's holder overrides layer on top of. Derived from
-    # per_user rather than re-parsing the file: a SPARE row was duplicated
-    # into BOTH planners' lists by _parse_master_lorry, so a plate in both
-    # is SPARE; a plate in only one list belongs to that one.
-    _abi_plates = {p.upper() for p, _ in per_user.get("ABI", [])}
-    _vivian_plates = {p.upper() for p, _ in per_user.get("VIVIAN", [])}
+    # the staging station's holder overrides layer on top of. A plate in
+    # BOTH planners' per_user lists is SPARE (that's how _parse_master_lorry
+    # marks a shared row); one in only one list belongs to that one.
     def _default_owner(p):
         p = p.upper()
-        if p in _abi_plates and p in _vivian_plates:
+        if p in _abi_map and p in _vivian_map:
             return "SPARE"
-        if p in _abi_plates:
+        if p in _abi_map:
             return "ABI"
-        if p in _vivian_plates:
+        if p in _vivian_map:
             return "VIVIAN"
         return user
-    sess["_plate_default_owner"] = {p.upper(): _default_owner(p) for p, _ in my_fleet}
+    sess["_plate_default_owner"] = {p: _default_owner(p) for p in _shareable}
 
     # Builds eligible_lorries plus this session's _my_zone_fleet/
     # _staging_fleet board views from the live holder + on/off toggle state.

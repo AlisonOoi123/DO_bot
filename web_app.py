@@ -253,6 +253,17 @@ def _board_json(sess) -> dict:
     """Drag-and-drop board view: every DO (assigned or not) plus every lorry
     with its current capacity, shaped for the board UI. Unassigned DOs are
     also grouped by route for the pool panel."""
+    # Refresh _my_zone_fleet/_staging_fleet/eligible_lorries fresh on every
+    # read, not just after this session's own toggle/claim actions — the
+    # OTHER planner may have released or claimed a plate since this
+    # session's fields were last computed (they're only written on a local
+    # write, not kept live), and a stale read here would show a plate as
+    # still staged (or still available) when it's actually just been taken.
+    if sess.get("engine") is not None and sess.get("user_id"):
+        try:
+            bot.refresh_eligible_from_toggle(sess)
+        except Exception:
+            pass
     items = sess.get("items", []) or []
     engine = sess.get("engine")
 
