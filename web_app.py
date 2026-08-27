@@ -349,6 +349,7 @@ def _board_json(sess) -> dict:
         _reason = lorry if lorry in _SENTINELS and lorry not in ("NO_LORRY", "", None) else ""
         orders.append({
             "do": str(it.get("DO NUMBER", "")),
+            "code": str(it.get("CODE", "")),
             "route": route,
             "customer": str(it.get("CUSTOMER NAME", "")),
             "weight": weight,
@@ -1138,11 +1139,11 @@ _PAGE = r"""<!doctype html>
   :root{
     --bg:#0f172a; --card:#1e293b; --card2:#273449; --line:#334155;
     --ink:#e2e8f0; --muted:#94a3b8; --brand:#38bdf8; --brand2:#0ea5e9;
-    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --radius:14px;
+    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --stage:#c084fc; --radius:14px;
   }
   @media (prefers-color-scheme: light){
     :root{ --bg:#f1f5f9; --card:#ffffff; --card2:#f8fafc; --line:#e2e8f0;
-      --ink:#0f172a; --muted:#64748b; --brand:#0284c7; --brand2:#0369a1; }
+      --ink:#0f172a; --muted:#64748b; --brand:#0284c7; --brand2:#0369a1; --stage:#9333ea; }
   }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0}
@@ -1199,10 +1200,11 @@ _PAGE = r"""<!doctype html>
   .tp-toggle-grid{display:flex;flex-wrap:wrap;gap:8px;min-height:40px;border-radius:10px;
     transition:box-shadow .12s}
   .tp-toggle-grid.tpzone-active{box-shadow:0 0 0 2px rgba(56,189,248,.45)}
-  .tp-staging-station{background:var(--card2);border:1px dashed var(--line);border-radius:12px;
+  .tp-staging-station{background:color-mix(in srgb, var(--stage) 14%, var(--card2));
+    border:1px dashed var(--stage);border-radius:12px;
     padding:12px;margin-bottom:14px;transition:box-shadow .12s,border-color .12s}
   .tp-staging-station.tpzone-active{border-color:var(--brand);box-shadow:0 0 0 2px rgba(56,189,248,.35)}
-  .tp-staging-label{font-size:12px;font-weight:700;letter-spacing:.04em;color:var(--muted);
+  .tp-staging-label{font-size:12px;font-weight:700;letter-spacing:.04em;color:var(--stage);
     margin-bottom:8px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
   .tp-staging-hint{font-size:11px;font-weight:400;color:var(--muted);opacity:.75}
   .tp-staging-grid{display:flex;flex-wrap:wrap;gap:8px;min-height:36px}
@@ -1219,6 +1221,9 @@ _PAGE = r"""<!doctype html>
   .tp-toggle-chip{display:flex;align-items:center;gap:7px;padding:7px 10px;border-radius:8px;
     border:1px solid var(--line);background:var(--card2);font-size:12.5px;
     font-family:ui-monospace,Menlo,monospace}
+  .tp-toggle-chip[data-tphome="STAGING"]{border-color:var(--stage);
+    background:color-mix(in srgb, var(--stage) 16%, var(--card2))}
+  .tp-toggle-chip[data-tphome="STAGING"].tp-broken{border-color:var(--bad)}
   .tp-day-row{display:flex;align-items:center;gap:24px;flex-wrap:wrap;margin-top:14px;
     padding-top:14px;border-top:1px solid var(--line)}
   .tp-day-btn,.tp-trip-btn{opacity:.55}
@@ -1343,6 +1348,8 @@ _PAGE = r"""<!doctype html>
   .board-card .b-top{display:flex;align-items:center;gap:7px}
   .board-card .b-id{font-family:ui-monospace,Menlo,monospace;font-weight:700;
     color:var(--brand);font-size:12px}
+  .board-card .b-code{font-family:ui-monospace,Menlo,monospace;font-weight:700;
+    color:var(--ink);font-size:12px}
   .board-card .b-kg{margin-left:auto;font-family:ui-monospace,Menlo,monospace;
     font-weight:700;font-size:12px;color:var(--ok);flex-shrink:0}
   .board-card .b-delete{display:inline-flex;align-items:center;justify-content:center;
@@ -2232,7 +2239,7 @@ function boardCardEl(o){
   el.innerHTML=`
     <span class="b-stripe" style="background:${color}"></span>
     <div class="b-body">
-      <div class="b-top"><span class="b-id">${esc(o.do)}</span><span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
+      <div class="b-top"><span class="b-id">${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn)">${esc(o.remarks)}</div>`:''}
