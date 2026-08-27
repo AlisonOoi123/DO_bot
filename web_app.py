@@ -1217,6 +1217,66 @@ def api_board_ai_assign():
     return _with_cookie(outcome, sid)
 
 
+@app.route("/api/board/refetch", methods=["POST"])
+def api_board_refetch():
+    """Pull fresh DOs from the live DB and merge in ONLY the ones not already
+    on this board — unlike AI Assign, this must never disturb anything the
+    planner has already assigned or left in the unassigned pool. DOs update
+    continuously in the source system, so a planner mid-way through a board
+    needs a way to pick up newly-appeared DOs without losing their progress.
+
+    Approach: snapshot every item's current real-plate assignment by DO
+    NUMBER, append only the genuinely new rows to the original raw sheet,
+    re-parse the combined file the normal deferred way (assign_now=False,
+    same as a fresh fetch — new rows land in Unassigned, nothing auto-fits),
+    then restore the snapshot onto the DO numbers that already existed. Old
+    rows re-classify identically to before (same day, same data) since
+    nothing about them changed, so restoring only the ones that were
+    actually assigned a real plate is sufficient to make the refetch a
+    no-op for everything except the new DOs."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    old_raw = sess.get("raw_df")
+    if old_raw is None or not sess.get("items"):
+        return _with_cookie({"error": "No board to refetch into — fetch or upload DOs first."}, sid, 400)
+    try:
+        fresh_df = do_source.fetch_delivery_report(etd_days=sess.get("etd_days"))
+    except Exception as e:
+        return _with_cookie({"error": f"Could not fetch DOs from the system: {e}"}, sid, 500)
+
+    _known = set(old_raw["DO NUMBER"].astype(str).str.strip())
+    fresh_df = fresh_df.copy()
+    fresh_df["DO NUMBER"] = fresh_df["DO NUMBER"].astype(str).str.strip()
+    new_rows = fresh_df[~fresh_df["DO NUMBER"].isin(_known)]
+    if new_rows.empty:
+        return _with_cookie({"new_count": 0, "board": _board_json(sess)}, sid)
+
+    # Snapshot: DO NUMBER -> its current real lorry plate, for every item
+    # that's actually assigned right now (drag-and-drop, a prior AI Assign,
+    # or a manual pick) — this is exactly what must survive the refetch.
+    _prev_assigned = {
+        str(it.get("DO NUMBER", "")).strip(): it["LORRY"]
+        for it in sess["items"]
+        if it.get("LORRY") and it["LORRY"] not in _SENTINELS
+    }
+
+    combined = pd.concat(
+        [old_raw, new_rows.reindex(columns=old_raw.columns, fill_value="")],
+        ignore_index=True,
+    )
+    combined_bytes = do_source.report_to_xlsx_bytes(combined)
+
+    outcome = _run_dos_upload(sid, sess, combined_bytes, assign_now=False)
+    for it in sess.get("items", []) or []:
+        do_num = str(it.get("DO NUMBER", "")).strip()
+        if do_num in _prev_assigned and it.get("LORRY") == "NO_LORRY":
+            it["LORRY"] = _prev_assigned[do_num]
+
+    outcome["new_count"] = int(len(new_rows))
+    outcome["board"] = _board_json(sess) if sess.get("items") else None
+    return _with_cookie(outcome, sid)
+
+
 @app.route("/api/download")
 def api_download():
     sid = _active_user_sid()
@@ -2636,7 +2696,7 @@ $('#btn-board-table').onclick=async()=>{
   showResultTable(d && d.result ? d.result : null);
 };
 $('#btn-result-board').onclick=showBoard;
-$('#btn-board-back').onclick=restartPlanner;
+$('#btn-board-back').onclick=refetchDOs;
 $('#btn-board-restart').onclick=restartPlanner;
 
 function boardToast(msg){
@@ -2929,6 +2989,18 @@ async function aiAssign(){
   } finally { btn.disabled=false; }
 }
 $('#btn-board-ai').onclick=aiAssign;
+
+async function refetchDOs(){
+  const btn=$('#btn-board-back'); btn.disabled=true;
+  setMsg('#board-msg','Checking for new DOs… ',false);
+  try{
+    const d=await jpost('/api/board/refetch',{});
+    if(d.error){ setMsg('#board-msg', d.error, true); return; }
+    if(d.board){ BOARD=d.board; renderBoard(); }
+    const n=d.new_count||0;
+    setMsg('#board-msg', n ? `✅ Found ${n} new DO(s) — added to Unassigned.` : 'No new DOs found — everything is already on the board.', false);
+  } finally { btn.disabled=false; }
+}
 
 async function doReassign(){
   const plates=[...document.querySelectorAll('.reassign-cb:checked')].map(c=>c.value);
