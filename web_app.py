@@ -111,16 +111,38 @@ def _is_authed(sess) -> bool:
 
 
 def _sid() -> str:
-    """Return the caller's session id, creating one if absent."""
+    """Return the caller's BASE (browser-cookie) session id, creating one if
+    absent. This identifies the browser/login only, not a specific
+    planner — see _active_user_sid() for the per-planner id that all real
+    engine/DO operations use."""
     sid = request.cookies.get(_COOKIE)
     if not sid:
         sid = "web_" + secrets.token_hex(8)
     return sid
 
 
+def _active_user_sid() -> str:
+    """Per-planner session id for real engine/DO state: base::<user>. Every
+    endpoint that touches the engine, fetched DOs, the board, or lorry
+    toggles resolves its session through this — not _sid() directly — so
+    clicking the OTHER planner's tab and coming back doesn't wipe this
+    planner's in-progress work. The two planners share one browser cookie
+    (one login) but get fully independent engine state.
+
+    Falls back to the bare base id before any planner tab has been picked
+    yet (matches the previous single-session behaviour for that window).
+    _with_cookie always recovers the base id by splitting on '::', so the
+    browser's cookie itself never becomes planner-specific."""
+    base = _sid()
+    outer = bot.get_session(base)
+    user = outer.get("_active_user")
+    return f"{base}::{user}" if user else base
+
+
 def _with_cookie(payload, sid, status=200):
     resp = make_response(jsonify(payload), status)
-    resp.set_cookie(_COOKIE, sid, samesite="Lax", max_age=60 * 60 * 8)
+    base = sid.split("::", 1)[0]
+    resp.set_cookie(_COOKIE, base, samesite="Lax", max_age=60 * 60 * 8)
     return resp
 
 
@@ -477,7 +499,12 @@ def auth():
 @app.route("/logout", methods=["POST", "GET"])
 def logout():
     sid = _sid()
-    bot.reset_session(sid)          # clears auth + any in-progress assignment
+    # Clears auth plus BOTH planners' in-progress engine state — each lives
+    # in its own base::<user> session (see _active_user_sid), so the plain
+    # base session alone isn't enough to wipe everything on logout.
+    for _u in ("ABI", "VIVIAN"):
+        bot.reset_session(f"{sid}::{_u}")
+    bot.reset_session(sid)
     resp = make_response(redirect("/"))
     resp.set_cookie(_COOKIE, sid, samesite="Lax", max_age=60 * 60 * 8)
     return resp
@@ -487,15 +514,19 @@ def logout():
 def api_state():
     """Current session snapshot — also used to restore the Result screen
     after a real browser refresh (or an explicit Refresh button click),
-    since the assignment itself lives in the server session, not the page."""
-    sid = _sid()
-    sess = bot.get_session(sid)
+    since the assignment itself lives in the server session, not the page.
+    state/user/result come from the currently ACTIVE planner's own session
+    (see _active_user_sid) so a refresh restores whichever planner tab was
+    last open, not a stale mix; email is account-level, from the base
+    session."""
+    base = _sid()
+    sess = bot.get_session(_active_user_sid())
     return _with_cookie({
         "state": sess.get("state", "IDLE"),
         "user": sess.get("user_id"),
-        "email": sess.get("_email"),
+        "email": bot.get_session(base).get("_email"),
         "result": _result_json(sess) if sess.get("items") else None,
-    }, sid)
+    }, base)
 
 
 @app.route("/api/users")
@@ -515,24 +546,63 @@ def api_users():
     return _with_cookie({"users": list(users)}, sid)
 
 
+def _planner_already_active(sess: dict, user: str) -> bool:
+    """True if this planner's OWN session already has real work in flight —
+    either DOs already fetched (state can be CONFIRMING, or parked at
+    AWAIT_OTHER_USER_REPLY on a pending off-schedule prompt re-triggered by
+    a later AI Assign re-run — either way sess["items"] exists and is worth
+    restoring), or day/trip already picked and just waiting on Fetch
+    (AWAIT_EXCEL, no items yet). Checking sess["items"] directly instead of
+    enumerating every in-progress state is what actually holds up: any new
+    intermediate state added later still gets recognised as "has work"
+    correctly, as long as it left items behind."""
+    if sess.get("user_id") != user:
+        return False
+    return bool(sess.get("items")) or sess.get("state") == "AWAIT_EXCEL"
+
+
 @app.route("/api/login", methods=["POST"])
 def api_login():
-    sid = _sid()
+    """Picking a planner tab activates their OWN persistent session
+    (base::<user>) — if that planner already has in-progress or completed
+    work (they'd set up and maybe fetched before switching to the other
+    tab), this reports it as already_active instead of re-running the
+    whole login/master-upload flow, which would otherwise silently wipe
+    it. A genuinely first-time pick for that planner still runs the full
+    flow as before."""
+    base = _sid()
+    outer = bot.get_session(base)
+    user = str((request.json or {}).get("user", "")).strip().upper()
+    outer["_active_user"] = user
+    sid = f"{base}::{user}" if user else base
     sess = bot.get_session(sid)
-    user = (request.json or {}).get("user", "")
+
+    if _planner_already_active(sess, user):
+        return _with_cookie({
+            "messages": [],
+            "state": sess.get("state"),
+            "user": sess.get("user_id"),
+            "needs_master": False,
+            "already_active": True,
+            "has_items": bool(sess.get("items")),
+            "trip_day": sess.get("trip_day"),
+            "trip_session": sess.get("trip_session"),
+        }, base)
+
     msgs = bot._handle_user_id(sid, sess, str(user))
     return _with_cookie({
         "messages": msgs,
         "state": sess.get("state"),
         "user": sess.get("user_id"),
+        "already_active": False,
         # AWAIT_MASTER_UPLOAD → needs master file; AWAIT_TRIP_DAY → skip to day
         "needs_master": sess.get("state") == "AWAIT_MASTER_UPLOAD",
-    }, sid)
+    }, base)
 
 
 @app.route("/api/master", methods=["POST"])
 def api_master():
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     fb = _file_bytes()
     if fb is None:
@@ -571,7 +641,7 @@ def api_master_default():
     apart; this was confirmed live as the cause of ABI-owned plates
     (BQU3875, BQX7228, BQX9983, BQY7823, VEA2818) showing up in VIVIAN's own
     fleet list, sourced from the stale sample file's ownership column."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     engine = sess.get("engine")
     if engine is not None and getattr(engine, "all_lorries", None) is not None and not engine.all_lorries.empty:
@@ -628,7 +698,7 @@ def api_master_grid():
     """Accept the (possibly edited) master-lorry grid from the portal and
     feed it through the exact same validation/parsing as a file upload —
     built in-memory, never written to disk, so this stays session-only."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     rows = (request.json or {}).get("rows", []) or []
     if not rows:
@@ -656,7 +726,7 @@ def api_day():
     web app's calendar picker — which day's DOs to plan for. This is purely
     which SCHD-sheet weekday to filter routes against; it never filters DOs
     by their own DATE column."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     day = (request.json or {}).get("day", "today")
     # Keep the SCHD schedule filter ON so off-schedule DOs are surfaced and the
@@ -726,7 +796,7 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -
 
 @app.route("/api/dos", methods=["POST"])
 def api_dos():
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     fb = _file_bytes()
     if fb is None:
@@ -743,7 +813,7 @@ def api_dos():
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/dos-fetch", methods=["POST"])
 def api_dos_fetch():
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     _etd_days = (request.json or {}).get("etd_days")
     try:
@@ -777,7 +847,7 @@ def api_dos_fetch():
 
 @app.route("/api/dos-fetch/download")
 def api_dos_fetch_download():
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     data = sess.get("_fetched_do_bytes")
     if not data:
@@ -792,7 +862,7 @@ def api_dos_fetch_download():
 
 @app.route("/api/dos-fetch/use", methods=["POST"])
 def api_dos_fetch_use():
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     data = sess.get("_fetched_do_bytes")
     if not data:
@@ -804,7 +874,7 @@ def api_dos_fetch_use():
 def api_offschedule():
     """User's answer to 'assign the off-schedule DOs too?' — YES re-runs the
     assignment with the schedule filter off; NO leaves them unassigned."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     assign = bool((request.json or {}).get("assign"))
     msgs = bot._handle_other_user_reply(sid, sess, "YES" if assign else "NO")
@@ -823,7 +893,7 @@ def api_offschedule():
 def api_reassign():
     """Assign the still-unassigned DOs onto the lorries the user says are now
     available — no re-upload. Returns the refreshed result."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     plates = (request.json or {}).get("lorries", []) or []
     if isinstance(plates, str):
@@ -839,7 +909,7 @@ def api_assign_specific():
     lorry — the counterpart to /api/reassign (which auto-bin-packs across
     multiple ticked lorries). All-or-nothing: rejects an unrecognised plate,
     a DO that's no longer unassigned, or a selection over capacity."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     body = request.json or {}
     plate = str(body.get("plate", ""))
@@ -861,7 +931,7 @@ def api_trip_session():
     """Which trip of the day to assign for. "any" (default) applies no
     filter; "1"/"2"/"3"/"4" excludes DOs whose REMARKS explicitly say a
     different trip (a REMARKS with no trip-timing note is unaffected)."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     session = str((request.json or {}).get("session", "any")).strip().lower()
     if session not in ("any", "1", "2", "3", "4"):
@@ -876,7 +946,7 @@ def api_lorry_toggles():
     on/off and claim state — used by the setup screen so lorries can be
     turned off/claimed BEFORE fetching/assigning, not just from the board
     afterwards. Works even before any DOs are loaded."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     if not sess.get("engine"):
         return _with_cookie({"lorries": [], "staging": []}, sid)
@@ -885,7 +955,7 @@ def api_lorry_toggles():
 
 @app.route("/api/board")
 def api_board():
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     if not sess.get("items"):
         return _with_cookie({"error": "No DOs loaded yet — upload or fetch a DO file first."}, sid, 400)
@@ -897,7 +967,7 @@ def api_board_move():
     """Drag-and-drop one DO onto a lorry (or back to the pool if lorry is
     empty/omitted). Never rejected for a rule violation — bot.board_move()
     always applies the move and returns warnings for the card to flag."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     body = request.json or {}
     do = str(body.get("do", "")).strip()
@@ -915,7 +985,7 @@ def api_board_move():
 def api_board_move_route():
     """Drag an entire route group (all its currently-unassigned DOs) onto
     one lorry in a single drop, instead of one card at a time."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     body = request.json or {}
     route = str(body.get("route", "")).strip()
@@ -934,7 +1004,7 @@ def api_board_toggle_lorry():
     """Flip a lorry's on/off availability for today. Off means it's not
     available for AI assignment (and any DOs on it get unassigned); a SPARE
     plate turned on for one planner is forced off for the other."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     body = request.json or {}
     plate = str(body.get("plate", "")).strip()
@@ -954,7 +1024,7 @@ def api_board_claim_plate():
     shared staging pool into this planner's own lane list ('claim'), or
     park one of this planner's own plates into staging for the other
     planner to pick up ('release')."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     body = request.json or {}
     plate = str(body.get("plate", "")).strip()
@@ -973,7 +1043,7 @@ def api_board_staging_broken():
     """Mark a staging-pool plate broken/fixed — visible to both planners at
     once, since a plate parked unclaimed in staging isn't "mine" to switch
     off just for myself."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     body = request.json or {}
     plate = str(body.get("plate", "")).strip()
@@ -993,7 +1063,7 @@ def api_board_reset_holders():
     master-file default owner, undoing all claim/release moves made today
     (e.g. leftover from testing the drag-and-drop, or a plate parked
     somewhere by mistake) — without touching on/off (broken) toggles."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     outcome = bot.reset_plate_holders(sess)
     outcome["board"] = _board_json(sess)
@@ -1005,7 +1075,7 @@ def api_board_ai_assign():
     """Re-run the real auto-assignment engine from scratch over the originally
     uploaded/fetched DO file — same code path as the initial upload, just
     re-triggered on demand. Overwrites any manual board edits made since."""
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     file_bytes = sess.get("_upload_bytes")
     if not file_bytes:
@@ -1017,7 +1087,7 @@ def api_board_ai_assign():
 
 @app.route("/api/download")
 def api_download():
-    sid = _sid()
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     # Ensure the export bytes exist (build them if the user goes straight to
     # download after seeing the result).
@@ -1040,21 +1110,18 @@ def api_download():
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
-    sid = _sid()
+    sid = _active_user_sid()
     bot.reset_session(sid)
     return _with_cookie({"ok": True}, sid)
 
 
 @app.route("/api/reset-engine", methods=["POST"])
 def api_reset_engine():
-    """Clear the assignment state machine (for start-over) WITHOUT logging the
-    user out."""
-    sid = _sid()
-    sess = bot.get_session(sid)
-    auth = {k: sess.get(k) for k in ("_authed", "_email", "_device")}
+    """Clear this planner's assignment state machine (for start-over)
+    WITHOUT logging the browser out — auth lives on the separate base
+    session (see _active_user_sid), so there's nothing to preserve here."""
+    sid = _active_user_sid()
     bot.reset_session(sid)
-    sess = bot.get_session(sid)
-    sess.update(auth)
     return _with_cookie({"ok": True}, sid)
 
 
@@ -1071,15 +1138,14 @@ def api_back():
     """Step the wizard backward. Rewinding to an earlier step just moves the
     engine's state pointer back — the loaded master/engine is kept, so there's
     no slow Excel re-parse. Going all the way back to the user picker clears
-    the engine (but keeps the login)."""
-    sid = _sid()
+    this planner's own session (auth lives separately — see
+    _active_user_sid — so the browser stays logged in)."""
+    sid = _active_user_sid()
     sess = bot.get_session(sid)
     target = (request.json or {}).get("target")
     if target == "login":
-        auth = {k: sess.get(k) for k in ("_authed", "_email", "_device")}
         bot.reset_session(sid)
         sess = bot.get_session(sid)
-        sess.update(auth)
     elif target in _STEP_STATE and sess.get("user_id"):
         sess["state"] = _STEP_STATE[target]
     return _with_cookie({"ok": True, "state": sess.get("state")}, sid)
@@ -1814,8 +1880,25 @@ async function autoLoadPlanner(user, autoFetch){
     setMsg('#login-msg', 'Loading '+user+"'s lorries… ", false);
     const dl = await jpost('/api/login',{user});
     if(!dl.user){ setMsg('#login-msg', dl.messages||'Could not load '+user, true); return; }
-    needsMaster = !!dl.needs_master;
     $('#who').textContent = 'Logged in as '+dl.user;
+
+    if(dl.already_active){
+      // This planner already has in-progress or completed work from
+      // before switching to the other tab — restore it directly instead
+      // of re-running the whole setup wizard, which would wipe it.
+      setMsg('#login-msg', null);
+      setDayDate(dl.trip_day || _todayISO());
+      setTripActive(dl.trip_session || 'any');
+      _loadSavedEtdDays();
+      show('#tp-etd-row', true);
+      show('#tp-toggle-section', true);
+      show('#tp-fetch-row', true);
+      await loadLorryToggles();
+      if(dl.has_items){ showBoard(); }
+      return;
+    }
+
+    needsMaster = !!dl.needs_master;
 
     if(needsMaster){
       const dm = await (await fetch('/api/master-default')).json();
