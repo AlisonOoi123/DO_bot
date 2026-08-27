@@ -1773,7 +1773,11 @@ function renderLorryToggles(){
       const turningOn = btn.classList.contains('off');
       if(home==='STAGING'){
         await jpost('/api/board/staging-broken', {plate: chip.dataset.plate, broken: !turningOn});
-        if(BOARD) await loadBoard(); else await loadLorryToggles();
+        // Refresh whichever views are visible — loadBoard() alone doesn't
+        // touch this toggle grid, so without also reloading it the chip's
+        // own broken/fixed state looked stuck even though the click worked.
+        if(BOARD) await loadBoard();
+        await loadLorryToggles();
       } else {
         // Shared with the board's own lane switches — so whichever one the
         // user clicks, both this grid AND the board (if already showing)
@@ -2528,7 +2532,20 @@ async function boot(){
   await loadUsers();
   const d = await (await fetch('/api/state')).json();
   if(d && d.email){ $('#who').textContent = d.email; }
-  if(d && d.user && d.result){ setActiveTab(d.user); showBoard(); return; }
+  if(d && d.user && d.result){
+    setActiveTab(d.user);
+    // A real browser refresh lands here directly (skipping autoLoadPlanner
+    // entirely), so the 1)/2)/3) setup rows — hidden by default in the HTML
+    // — need to be shown here too, or they just stay gone after a refresh.
+    _loadSavedEtdDays();
+    show('#tp-etd-row', true);
+    show('#tp-toggle-section', true);
+    show('#tp-day-row', true);
+    show('#tp-fetch-row', true);
+    await loadLorryToggles();
+    showBoard();
+    return;
+  }
   if(validUsers.length){ autoLoadPlanner(validUsers[0]); }
 }
 wireBackButtons();
