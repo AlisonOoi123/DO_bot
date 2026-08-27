@@ -1392,12 +1392,14 @@ _PAGE = r"""<!doctype html>
       </label>
     </div>
     <div class="tp-toggle-section hidden" id="tp-toggle-section">
-      <p class="tp-section-label">2&#41; Lorries available today &mdash; drag a plate into Staging to share it,
-        drag one out to claim it, or turn off any not running:</p>
+      <p class="tp-section-label" style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+        <span>2&#41; Lorries available today &mdash; drag a plate into Staging to share it,
+          drag one out to claim it, or turn off any not running:</span>
+        <button class="mini-btn" id="tp-reset-holders" type="button" style="margin-left:auto">&#8635; Reset ALL lorries below to their default owner</button>
+      </p>
       <div class="tp-staging-station" data-tpzone="STAGING" id="tp-staging-station">
         <div class="tp-staging-label">🅿️ STAGING STATION
           <span class="tp-staging-hint">shared &mdash; drag a plate here to lend it, drag one out to claim it</span>
-          <button class="mini-btn" id="tp-reset-holders" type="button" style="margin-left:auto">&#8635; Reset sharing to defaults</button>
         </div>
         <div class="tp-staging-grid" id="tp-staging-grid"></div>
       </div>
@@ -1841,12 +1843,12 @@ document.addEventListener('pointermove', e=>{
   if(zoneEl) zoneEl.classList.add('tpzone-active');
 });
 $('#tp-reset-holders').onclick=async()=>{
-  if(!confirm('Put every plate back to its default owner (own planner, or Staging for a SPARE plate)? This undoes all claim/release moves made today.')) return;
+  if(!confirm('Put EVERY lorry plate back to its default owner today — ABI\'s plates to ABI, VIVIAN\'s to VIVIAN, SPARE plates to Staging — whether it\'s currently sitting in Staging or in someone\'s own lorries list below? This undoes all claim/release moves made today.')) return;
   const d = await jpost('/api/board/reset-holders', {});
   if(!d.ok){ boardToast(d.message||d.error||'Reset failed'); return; }
   await loadLorryToggles();
   if(BOARD) await loadBoard();
-  boardToast('Sharing reset to today\'s defaults.');
+  boardToast('All lorries reset to today\'s default owner.');
 };
 document.addEventListener('pointerup', async e=>{
   if(!chipDrag) return;
