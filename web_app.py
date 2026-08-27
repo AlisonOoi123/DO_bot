@@ -137,7 +137,7 @@ def _file_bytes():
 # ─────────────────────────────────────────────────────────────────────────────
 _SENTINELS = {"NO_LORRY", "NO_ELIGIBLE_LORRY", "SPLIT", "SKIPPED",
               "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE",
-              "WRONG_TRIP", "", None}
+              "WRONG_TRIP", "PAST_DATE", "", None}
 
 
 def _result_json(sess) -> dict:
@@ -191,13 +191,21 @@ def _result_json(sess) -> dict:
             "customer": str(it.get("CUSTOMER NAME", "")),
             "weight": round(_w, 3) if pd.notna(_w := (float(it.get("WEIGHT", 0) or 0))) else 0.0,
             "state": str(it.get("STATE", "")),
+            "date": str(it.get("DATE", "")),
         }
         if lorry in ("OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP"):
             skipped_other += 1
             continue
         if lorry in _SENTINELS:
             _reasons = sess.get("unassigned_reasons")
-            do["reason"] = _reasons.get(do["do"], "NO_LORRY") if isinstance(_reasons, dict) else "NO_LORRY"
+            _reason = _reasons.get(do["do"]) if isinstance(_reasons, dict) else None
+            # Fall back to the sentinel itself (e.g. "PAST_DATE") when there's
+            # no explicit recorded reason — a real label beats the generic
+            # "NO_LORRY" for a DO the AI deliberately skipped, not one it
+            # just couldn't fit anywhere.
+            if not _reason:
+                _reason = lorry if lorry not in ("NO_LORRY", "", None) else "NO_LORRY"
+            do["reason"] = _reason
             unassigned.append(do)
             continue
         grp = lorries.setdefault(lorry, {
@@ -212,13 +220,7 @@ def _result_json(sess) -> dict:
         grp["load"] = round(grp["load"] + do["weight"], 3)
         grp["dos"].append(do)
 
-    _past_date_grp = lorries.pop("PAST_DATE", None)
     lorry_list = sorted(lorries.values(), key=lambda g: g["lorry"])
-    # PAST_DATE isn't a real lorry — it's DOs the AI deliberately left alone
-    # because their DATE is before today. Keep it out of the alphabetical
-    # plate ordering and tack it on at the very end, right before Unassigned.
-    if _past_date_grp is not None:
-        lorry_list.append(_past_date_grp)
     for g in lorry_list:
         cap = g["capacity"]
         g["util"] = round(100.0 * g["load"] / cap, 1) if cap else None
@@ -319,6 +321,10 @@ def _board_json(sess) -> dict:
         assigned_plate = lorry if lorry and lorry not in _SENTINELS else None
         weight = float(it.get("WEIGHT", 0) or 0)
         weight = round(weight, 3) if pd.notna(weight) else 0.0
+        # A real reason (e.g. PAST_DATE, WRONG_TRIP) beats no explanation at
+        # all for a pool card the AI deliberately skipped rather than one it
+        # just couldn't fit anywhere (NO_LORRY etc. show no reason tag).
+        _reason = lorry if lorry in _SENTINELS and lorry not in ("NO_LORRY", "", None) else ""
         orders.append({
             "do": str(it.get("DO NUMBER", "")),
             "route": route,
@@ -327,6 +333,7 @@ def _board_json(sess) -> dict:
             "date": str(it.get("DATE", "")),
             "remarks": str(_rm) if pd.notna(_rm := it.get("REMARKS")) else "",
             "lorry": assigned_plate,
+            "reason": _reason,
         })
         if assigned_plate is None:
             rt = routes.setdefault(route, {"route": route, "dos": 0, "weight": 0.0})
@@ -650,6 +657,10 @@ def api_dos_fetch():
     # today's ETD" — a window of exactly zero days isn't a useful choice.
     if _etd_days == 0:
         _etd_days = None
+    # Remembered so _handle_excel_upload can widen its past-date cutoff to
+    # match — a DO within the window the user explicitly asked for shouldn't
+    # get excluded as "too old" just because its own DATE trails its ETD.
+    sess["etd_days"] = _etd_days
     try:
         report_df = do_source.fetch_delivery_report(etd_days=_etd_days)
     except Exception as e:
@@ -2050,20 +2061,21 @@ function renderResult(r){
     (s.dos_other?`<span class="pill">Other user / skipped <b>${s.dos_other}</b></span>`:'');
   let html='';
   r.lorries.forEach(g=>{
-    const isPastDate = g.lorry === 'PAST_DATE';
     const cap=g.capacity!=null?g.capacity.toFixed(2)+'T':'—';
     const util=g.util!=null?g.util:0;
-    const label = isPastDate ? `🗓️ PAST_DATE — dated before today, not auto-assigned (${g.dos.length})` : `🚚 ${esc(g.lorry)} <span class="cap">${g.load.toFixed(2)}T / ${cap}${g.util!=null?' · '+g.util+'%':''}</span>`;
-    html+=`<div class="lorry${isPastDate?' collapsed':''}"><h3${isPastDate?' class="collapsible"':''}>${label}</h3>`;
-    if(!isPastDate){ html+=`<div class="bar"><i class="${util>100?'hi':''}" style="width:${Math.min(util,100)}%"></i></div>`; }
+    html+=`<div class="lorry"><h3>🚚 ${esc(g.lorry)} <span class="cap">${g.load.toFixed(2)}T / ${cap}${g.util!=null?' · '+g.util+'%':''}</span></h3>`;
+    html+=`<div class="bar"><i class="${util>100?'hi':''}" style="width:${Math.min(util,100)}%"></i></div>`;
     html+=`<div class="scroll"><table><thead><tr><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th></tr></thead><tbody>`;
     g.dos.forEach(d=>{ html+=`<tr><td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td></tr>`; });
     html+=`</tbody></table></div></div>`;
   });
   if(r.unassigned.length){
+    // PAST_DATE (dated before today, not auto-assigned) and any other
+    // reasoned skip live in this same list — the Date column is what makes
+    // "why is this here" legible instead of needing a separate section.
     html+=`<div class="lorry unassigned"><h3>⚠️ Unassigned (${r.unassigned.length})</h3>`;
-    html+=`<div class="scroll"><table><thead><tr><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th><th>Reason</th></tr></thead><tbody>`;
-    r.unassigned.forEach(d=>{ html+=`<tr><td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td><td>${esc(d.reason||'')}</td></tr>`; });
+    html+=`<div class="scroll"><table><thead><tr><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th><th>Date</th><th>Reason</th></tr></thead><tbody>`;
+    r.unassigned.forEach(d=>{ html+=`<tr><td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td><td>${esc(d.date||'')}</td><td>${esc(d.reason||'')}</td></tr>`; });
     html+=`</tbody></table></div></div>`;
   }
   $('#result-body').innerHTML=html;
@@ -2168,6 +2180,7 @@ function boardCardEl(o){
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn)">${esc(o.remarks)}</div>`:''}
+      ${o.reason?`<div class="b-meta" style="color:var(--bad)">${esc(o.reason)}</div>`:''}
       ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
     </div>`;
   if(o.lorry){

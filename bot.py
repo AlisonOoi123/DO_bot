@@ -3999,6 +3999,20 @@ def _handle_excel_upload(phone, sess, file_bytes):
         _past_date_count   = 0
         _wrong_trip_count  = 0
         _today_date = datetime.now().date()
+        # A DO dated before today is normally left alone entirely — but if
+        # the user set an ETD window (e.g. ±2 days), they've explicitly
+        # asked for DOs from that window to be considered, including ones
+        # whose DATE already slipped a couple of days back. The past-date
+        # cutoff moves with that window instead of always being a hard
+        # "today" line, so PAST_DATE only catches what's actually outside
+        # what the user asked to see. No window set (None/blank/0 = fetch
+        # everything) keeps the original "today onward only" behaviour.
+        from datetime import timedelta as _td_cutoff
+        _etd_days_for_cutoff = sess.get("etd_days")
+        _past_date_cutoff = (
+            _today_date - _td_cutoff(days=_etd_days_for_cutoff)
+            if _etd_days_for_cutoff else _today_date
+        )
         _trip_session = sess.get("trip_session")   # "MORNING" / "AFTERNOON" / None (any)
         # Lorry tonnage lookup for enforcing REMARKS size caps on pre-filled rows.
         _prefill_cap_map: dict[str, float] = {}
@@ -4036,7 +4050,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if _is_mine:
                 _row_dt = pd.to_datetime(str(row.get("DATE", "")).strip(),
                                           dayfirst=True, errors="coerce")
-                if pd.notna(_row_dt) and _row_dt.date() < _today_date:
+                if pd.notna(_row_dt) and _row_dt.date() < _past_date_cutoff:
                     _is_past_date = True
 
             _remarks_cell = row.get("REMARKS", "")
@@ -7904,7 +7918,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
         if _other_user_count:
             header += f"\n📌 _{_other_user_count} DO(s) from another user's routes — left blank (cross-user assignment not allowed)._"
         if _past_date_count:
-            header += f"\n🗓️ _{_past_date_count} DO(s) dated before today — left unassigned (AI only assigns today's DOs and onward; assign these manually if still needed)._"
+            _cutoff_note = (f"before your ETD window (older than {_past_date_cutoff.strftime('%d/%m')})"
+                             if _etd_days_for_cutoff else "before today")
+            header += f"\n🗓️ _{_past_date_count} DO(s) dated {_cutoff_note} — left unassigned; assign these manually if still needed._"
         if _wrong_trip_count:
             _other_trip = "AFTERNOON" if _trip_session == "MORNING" else "MORNING"
             header += f"\n🕐 _{_wrong_trip_count} DO(s) marked {_other_trip} TRIP in REMARKS — left unassigned (you picked the {_trip_session} trip)._"
