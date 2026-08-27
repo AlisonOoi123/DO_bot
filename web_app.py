@@ -774,18 +774,19 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -
     upload land every DO in Unassigned (assign_now=False) — the AI only
     actually fits lorries when the user clicks AI Assign (assign_now=True)."""
     msgs = bot._handle_excel_upload(sid, sess, fb)
-    # If some DOs aren't on the chosen day's route schedule, the engine parks in
-    # AWAIT_OTHER_USER_REPLY and expects a YES/NO. Surface that as a question
-    # instead of the final result.
+    # If some DOs aren't on the chosen day's route schedule, the engine parks
+    # in AWAIT_OTHER_USER_REPLY wanting a YES/NO ("assign the off-schedule
+    # ones too?"). Every fresh re-parse (fetch, Picking List's Next, AI
+    # Assign) independently re-derives this from scratch, so it can come up
+    # again on any of them. There's no UI surfaced for it any more (that was
+    # the now-hidden Table view's job), so auto-answer NO — off-schedule DOs
+    # default to excluded, same as the original fetch flow's own explicit
+    # choice — and continue, rather than parking the state machine and
+    # returning early. Returning early used to skip _reset_items_to_unassigned
+    # below entirely, so whatever _handle_excel_upload's internal auto-assign
+    # pass had already computed silently stayed on the board.
     if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
-        return {
-            "messages": msgs,
-            "state": sess.get("state"),
-            "offschedule": {
-                "count": sess.get("not_today_pending_count", 0),
-                "day": sess.get("trip_day", "today"),
-            },
-        }
+        msgs = bot._handle_other_user_reply(sid, sess, "NO")
     if not assign_now:
         _reset_items_to_unassigned(sess)
         # Marks "fetched, waiting on the Picking List" — cleared by
@@ -1795,7 +1796,7 @@ _PAGE = r"""<!doctype html>
       <div class="board-top-actions">
         <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
         <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
-        <button class="btn secondary" id="btn-board-table">📋 Table view</button>
+        <button class="btn secondary hidden" id="btn-board-table">📋 Table view</button>
       </div>
     </div>
     <div class="msg hidden" id="board-msg"></div>
@@ -2844,11 +2845,6 @@ async function aiAssign(){
   setMsg('#board-msg','AI is assigning… this can take a moment ',false);
   try{
     const d=await jpost('/api/board/ai-assign',{});
-    if(d.offschedule){
-      setMsg('#board-msg', `⏭ ${d.offschedule.count} DO(s) are off-schedule — go to Table view to decide, then come back to Board.`, false);
-      if(d.board){ BOARD=d.board; renderBoard(); }
-      return;
-    }
     if(d.error){ setMsg('#board-msg', d.error, true); return; }
     setMsg('#board-msg', null);
     if(d.board){ BOARD=d.board; renderBoard(); }
