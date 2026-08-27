@@ -1091,6 +1091,10 @@ _PAGE = r"""<!doctype html>
   .board-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
   .board-top .btn{width:auto}
   .board-top .btn-ai{background:linear-gradient(135deg,var(--brand),#a855f7);color:#fff}
+  .board-assigned-stat{font-size:12.5px;color:var(--muted);background:var(--card2);
+    border:1px solid var(--line);border-radius:20px;padding:4px 12px;font-weight:600;
+    font-family:ui-monospace,Menlo,monospace}
+  .board-assigned-stat b{color:var(--ok)}
   .board-grid{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:16px}
   @media (max-width:860px){ .board-grid{grid-template-columns:1fr} }
   .board-pool,.board-lanes-wrap{min-width:0}
@@ -1144,6 +1148,15 @@ _PAGE = r"""<!doctype html>
   .board-cap-fill{height:100%;transition:width .2s;background:var(--ok)}
   .board-cap-fill.hi{background:var(--warn)}
   .board-cap-fill.over{background:var(--bad)}
+  .lane-max-btn{background:none;border:1px solid var(--line);border-radius:6px;color:var(--muted);
+    width:22px;height:22px;flex-shrink:0;cursor:pointer;font-size:12px;line-height:1;
+    display:inline-flex;align-items:center;justify-content:center}
+  .lane-max-btn:hover{color:var(--ink);border-color:var(--brand)}
+  .board-lanes.has-maximized{grid-template-columns:1fr}
+  .board-lane-maximized{padding:20px;min-height:60vh}
+  .board-lane-maximized .board-lane-plate{font-size:20px}
+  .board-lane-maximized .board-lane-body{gap:10px}
+  .board-lane-maximized .board-card{padding:10px 14px;font-size:13.5px}
   .board-lane-body{display:flex;flex-direction:column;gap:6px;min-height:36px}
   .board-empty{color:var(--muted);font-size:12.5px;font-style:italic;padding:6px 2px;opacity:.7}
   .board-card{display:flex;gap:8px;background:var(--card);border:1px solid var(--line);
@@ -1323,6 +1336,7 @@ _PAGE = r"""<!doctype html>
   <div class="card hidden" id="card-board">
     <div class="board-top">
       <p class="step-title" style="margin:0">Board · drag DOs onto a lorry, or let AI assign</p>
+      <span class="board-assigned-stat" id="board-assigned-stat"></span>
       <button class="btn btn-ai" id="btn-board-ai" style="margin-left:auto">🤖 AI Assign</button>
       <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
       <button class="btn secondary" id="btn-board-table">📋 Table view</button>
@@ -1868,6 +1882,7 @@ function renderResult(r){
 // ==================== Drag-and-drop board ====================
 let BOARD=null;
 let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set();
+let boardMaximizedPlate=null;
 let boardDrag=null, boardGhost=null;
 let routeDragCandidate=null, routeDrag=null, routeGhost=null, routeDragJustHappened=false;
 
@@ -1983,24 +1998,31 @@ function renderBoard(){
     wrap.appendChild(div);
   });
   $('#board-pool-label').textContent=`UNASSIGNED · ${totalUn} DO${totalUn===1?'':'s'}`;
+  const totalAssigned = BOARD.orders.filter(o=>o.lorry).length;
+  $('#board-assigned-stat').innerHTML = `Assigned <b>${totalAssigned}</b> / ${BOARD.orders.length} DO${BOARD.orders.length===1?'':'s'}`;
 
-  const lanes=$('#board-lanes'); lanes.innerHTML='';
+  const lanes=$('#board-lanes');
+  lanes.className='board-lanes'+(boardMaximizedPlate?' has-maximized':'');
+  lanes.innerHTML='';
   BOARD.lorries.forEach(t=>{
+    if(boardMaximizedPlate && t.plate!==boardMaximizedPlate) return;   // hidden while another lane is focused
+    const maximized = t.plate===boardMaximizedPlate;
     const list=boardOrdersOnLorry(t.plate);
     const load=boardSumKg(list);
     const pct=t.capacity?Math.min(100,Math.round(load/t.capacity*100)):0;
     const over=t.capacity && load>t.capacity;
     const fillClass= over?'over': pct>=85?'hi':'';
-    const collapsed=boardCollapsedLanes.has(t.plate);
+    const collapsed=!maximized && boardCollapsedLanes.has(t.plate);
     const isOn=t.on!==false;
     const lane=document.createElement('section');
-    lane.className='board-lane'+(collapsed?' collapsed':'')+(isOn?'':' lane-off');
+    lane.className='board-lane'+(collapsed?' collapsed':'')+(isOn?'':' lane-off')+(maximized?' board-lane-maximized':'');
     if(isOn) lane.dataset.zone=t.plate;
     lane.innerHTML=`
       <div class="board-lane-head">
         <span class="board-lane-chev">&#9660;</span>
         <span class="board-lane-plate">${esc(t.plate)}</span>
         <button class="lane-toggle${isOn?'':' off'}" title="${isOn?'Available today — click to turn off':'Not available today — click to turn on'}"></button>
+        <button class="lane-max-btn" title="${maximized?'Minimize':'Maximize — focus assigning on this lorry'}">${maximized?'&#10529;':'&#10530;'}</button>
         <span class="board-lane-count">${list.length} DO${list.length===1?'':'s'}</span>
         <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</span>
       </div>
@@ -2008,13 +2030,18 @@ function renderBoard(){
       <div class="board-cap-track"><div class="board-cap-fill ${fillClass}" style="width:${pct}%"></div></div>
       <div class="board-lane-body"></div>`;
     lane.querySelector('.board-lane-head').onclick=(e)=>{
-      if(e.target.closest('.lane-toggle')) return;
+      if(e.target.closest('.lane-toggle') || e.target.closest('.lane-max-btn')) return;
       collapsed?boardCollapsedLanes.delete(t.plate):boardCollapsedLanes.add(t.plate);
       renderBoard();
     };
     lane.querySelector('.lane-toggle').onclick=async(e)=>{
       e.stopPropagation();
       await toggleLorry(t.plate, !isOn);
+    };
+    lane.querySelector('.lane-max-btn').onclick=(e)=>{
+      e.stopPropagation();
+      boardMaximizedPlate = maximized ? null : t.plate;
+      renderBoard();
     };
     const body=lane.querySelector('.board-lane-body');
     if(!list.length) body.innerHTML='<div class="board-empty">Drop DOs here</div>';
