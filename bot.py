@@ -1066,7 +1066,7 @@ def _postcode_to_state(postcode) -> str:
               (_POSTCODE_TO_STATE) → hardcoded POSTCODE_STATE_RANGES fallback."""
     try:
         pc = int(str(postcode).strip().split()[0])
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, IndexError):
         return ""
     # 1. Exact postcode from the planning sheet (operator-maintained)
     _st = _POSTCODE_TO_STATE.get(pc)
