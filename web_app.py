@@ -346,6 +346,27 @@ def _guard():
             return _with_cookie({"error": "auth_required"}, _sid(), 401)
 
 
+@app.errorhandler(Exception)
+def _api_error_handler(e):
+    """An unhandled exception in any /api/* endpoint used to fall through to
+    Flask's default HTML error page — the frontend's `.json()` call on that
+    HTML then threw its own confusing "Unexpected token '<'" error, hiding
+    the real problem completely (e.g. the /api/master-grid crash this was
+    added for). Every /api/* endpoint now always gets back real JSON with
+    the failing file:line, matching _handle_excel_upload's on-screen error
+    convention, instead of a blank/broken screen."""
+    if not request.path.startswith("/api/"):
+        raise e
+    import traceback
+    traceback.print_exc()
+    code = getattr(e, "code", 500) if hasattr(e, "code") else 500
+    _tb = traceback.extract_tb(e.__traceback__)
+    _loc = f" ({_tb[-1].filename.split(chr(92))[-1].split('/')[-1]}:{_tb[-1].lineno} in {_tb[-1].name})" if _tb else ""
+    return _with_cookie({
+        "error": f"Server error: {type(e).__name__}: {e}{_loc}",
+    }, _sid(), code if isinstance(code, int) and 400 <= code < 600 else 500)
+
+
 @app.route("/auth", methods=["POST"])
 def auth():
     sid = _sid()
