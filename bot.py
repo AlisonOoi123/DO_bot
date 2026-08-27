@@ -3570,6 +3570,26 @@ def assign_specific_dos(sess, plate: str, do_numbers: list) -> dict:
     return {"ok": True, "assigned": len(selected), "plate": plate, "weight": round(new_w, 3)}
 
 
+def _unknown_plate_diag(fleet_df, plate: str) -> str:
+    """Extra detail for an 'unknown_plate' error — since this shouldn't
+    normally happen for a plate the board itself just showed a lane for,
+    surface WHY the lookup failed instead of leaving it a mystery."""
+    if fleet_df is None:
+        return " (diagnostics: engine.all_lorries is None — the session's engine wasn't built correctly.)"
+    try:
+        n = len(fleet_df)
+        cols = list(fleet_df.columns)
+        if "LORRY" not in cols:
+            return f" (diagnostics: all_lorries has {n} row(s) but no LORRY column — columns: {cols}.)"
+        plates = sorted(str(p).strip().upper() for p in fleet_df["LORRY"])
+        close = [p for p in plates if plate[:4] in p or p[:4] in plate] if plate else []
+        return (f" (diagnostics: all_lorries has {n} plate(s); "
+                + (f"similar: {', '.join(close[:5])}; " if close else "")
+                + f"first few: {', '.join(plates[:8])}.)")
+    except Exception as e:
+        return f" (diagnostics unavailable: {type(e).__name__}: {e}.)"
+
+
 def board_move(sess, do_number: str, plate) -> dict:
     """Board UI: drag-and-drop one DO onto a lorry (plate), or back to the
     unassigned pool (plate falsy). Never blocks on a rule violation — the
@@ -3597,7 +3617,8 @@ def board_move(sess, do_number: str, plate) -> dict:
         _fleet_df = getattr(engine, "all_lorries", None) if engine is not None else None
         if _fleet_df is None or _fleet_df[_fleet_df["LORRY"] == plate].empty:
             return {"error": "unknown_plate",
-                    "message": f"{plate} is not a known lorry. Check the spelling."}
+                    "message": f"{plate} is not a known lorry. Check the spelling."
+                                + _unknown_plate_diag(_fleet_df, plate)}
         warnings = _check_manual_placement(it, plate, engine, sess)
         _user = sess.get("user_id")
         if _user and plate in get_unavailable_plates_for(_user):
@@ -3630,7 +3651,8 @@ def board_move_route(sess, route: str, plate) -> dict:
     _fleet_df = getattr(engine, "all_lorries", None) if engine is not None else None
     if _fleet_df is None or _fleet_df[_fleet_df["LORRY"] == plate].empty:
         return {"error": "unknown_plate",
-                "message": f"{plate} is not a known lorry. Check the spelling."}
+                "message": f"{plate} is not a known lorry. Check the spelling."
+                            + _unknown_plate_diag(_fleet_df, plate)}
 
     _known_plates = set()
     if _fleet_df is not None:
