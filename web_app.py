@@ -389,7 +389,7 @@ def _api_error_handler(e):
     the failing file:line, matching _handle_excel_upload's on-screen error
     convention, instead of a blank/broken screen."""
     if not request.path.startswith("/api/"):
-        raise e
+        return e
     import traceback
     traceback.print_exc()
     code = getattr(e, "code", 500) if hasattr(e, "code") else 500
@@ -1245,8 +1245,9 @@ _PAGE = r"""<!doctype html>
     border:1px solid var(--line);border-radius:20px;padding:4px 12px;font-weight:600;
     font-family:ui-monospace,Menlo,monospace}
   .board-assigned-stat b{color:var(--ok)}
-  .board-grid{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:16px}
-  @media (max-width:860px){ .board-grid{grid-template-columns:1fr} }
+  .board-grid{display:grid;grid-template-columns:minmax(280px,380px) 1px 1fr;gap:16px}
+  .board-divider{background:var(--line);border-radius:1px}
+  @media (max-width:860px){ .board-grid{grid-template-columns:1fr} .board-divider{display:none} }
   .board-pool,.board-lanes-wrap{min-width:0}
   .board-pool-label{font-size:11px;letter-spacing:.08em;color:var(--muted);
     font-weight:700;text-transform:uppercase;margin:2px 2px 10px}
@@ -1502,8 +1503,13 @@ _PAGE = r"""<!doctype html>
     <div class="board-grid">
       <section class="board-pool" data-zone="">
         <div class="board-pool-label" id="board-pool-label">UNASSIGNED</div>
+        <div class="board-lanes-tools">
+          <button class="mini-btn" id="board-pool-collapse-all">Collapse all routes</button>
+          <button class="mini-btn" id="board-pool-expand-all">Expand all</button>
+        </div>
         <div id="board-routes"></div>
       </section>
+      <div class="board-divider"></div>
       <div class="board-lanes-wrap">
         <div class="board-lanes-tools">
           <button class="mini-btn" id="board-collapse-all">Collapse all lorries</button>
@@ -2084,7 +2090,7 @@ function renderResult(r){
     // PAST_DATE (dated before today, not auto-assigned) and any other
     // reasoned skip live in this same list — the Date column is what makes
     // "why is this here" legible instead of needing a separate section.
-    html+=`<div class="lorry unassigned"><h3>⚠️ Unassigned (${r.unassigned.length})</h3>`;
+    html+=`<div class="lorry unassigned"><h3 class="collapsible">⚠️ Unassigned (${r.unassigned.length})</h3>`;
     html+=`<div class="scroll"><table><thead><tr><th>DO</th><th>Route</th><th>Customer</th><th class="w">Weight</th><th>Date</th><th>Reason</th></tr></thead><tbody>`;
     r.unassigned.forEach(d=>{ html+=`<tr><td>${esc(d.do)}</td><td>${esc(d.route)}</td><td>${esc(d.customer)}</td><td class="w">${d.weight.toFixed(3)}T</td><td>${esc(d.date||'')}</td><td>${esc(d.reason||'')}</td></tr>`; });
     html+=`</tbody></table></div></div>`;
@@ -2297,6 +2303,11 @@ $('#board-collapse-all').onclick=()=>{
   renderBoard();
 };
 $('#board-expand-all').onclick=()=>{ boardCollapsedLanes.clear(); renderBoard(); };
+$('#board-pool-collapse-all').onclick=()=>{ boardOpenRoutes.clear(); renderBoard(); };
+$('#board-pool-expand-all').onclick=()=>{
+  if(BOARD) BOARD.routes.forEach(rt=>boardOpenRoutes.add(rt.route));
+  renderBoard();
+};
 
 function startBoardDrag(e,doId){
   e.preventDefault(); e.stopPropagation();
