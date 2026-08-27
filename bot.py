@@ -3249,9 +3249,10 @@ def _handle_lorry_status_upload(phone, sess, df: "pd.DataFrame") -> list:
 
 # Slight-overload allowance for the rescue pass: a lorry may be filled up to
 # this fraction of its rated TON when the only alternative is leaving a DO
-# unassigned. 1.15 = up to 15% over. Mirrors the manual planner, who slightly
-# overloads small lorries rather than dropping urban DOs.
-SLIGHT_OVERLOAD = 1.20
+# unassigned. 1.05 = up to 5% over, per explicit request (anything heavier
+# is too serious an overload). Mirrors the manual planner, who slightly
+# overloads small lorries rather than dropping urban DOs — but only a little.
+SLIGHT_OVERLOAD = 1.05
 
 
 def _is_urban_do(it) -> bool:
