@@ -1855,7 +1855,6 @@ _PAGE = r"""<!doctype html>
   <!-- Step 5: drag-and-drop board -->
   <div class="card hidden" id="card-board">
     <div class="board-top">
-      <p class="step-title" style="margin:0">Board · drag DOs onto a lorry, or let AI assign</p>
       <span class="board-assigned-stat" id="board-assigned-stat"></span>
       <div class="board-plan-row" id="board-plan-row">
         <label class="board-plan-field">Assign for
