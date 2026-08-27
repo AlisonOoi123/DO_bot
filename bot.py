@@ -303,18 +303,25 @@ def _parse_remarks_days(remarks: str) -> set[int] | None:
 
 
 def _row_trip_session(remarks: str) -> str | None:
-    """Detect an explicit AM/PM trip-timing note in a REMARKS string.
+    """Detect an explicit trip-number note in a REMARKS string.
 
-    Returns "MORNING", "AFTERNOON", or None (no trip-timing note — this DO
-    isn't restricted to either half of the day, so it's fine on both).
+    Returns "1", "2", "3", "4", or None (no trip-timing note — this DO
+    isn't restricted to any particular trip, so it's fine on all of them).
+    Trips 1/2 keep the original MORNING/AFTERNOON-style phrasing (a lorry's
+    first vs second run of the day); 3/4 are newer, explicit "TRIP 3"/
+    "TRIP 4" notes for lorries running more than two trips a day.
     """
     if not remarks or str(remarks).strip().lower() in ("nan", "none", ""):
         return None
     txt = str(remarks).strip().upper()
     if re.search(r'\bMORNING\s+TRIP\b|\bAM\s+FIRST\s+TRIP\b|\bAM\s+TRIP\b', txt):
-        return "MORNING"
+        return "1"
     if re.search(r'\bAFTERNOON\s+TRIP\b|\bPM\s+TRIP\b', txt):
-        return "AFTERNOON"
+        return "2"
+    if re.search(r'\bTRIP\s*3\b', txt):
+        return "3"
+    if re.search(r'\bTRIP\s*4\b', txt):
+        return "4"
     return None
 
 
@@ -4056,7 +4063,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _today_date - _td_cutoff(days=_etd_days_for_cutoff)
             if _etd_days_for_cutoff else _today_date
         )
-        _trip_session = sess.get("trip_session")   # "MORNING" / "AFTERNOON" / None (any)
+        _trip_session = sess.get("trip_session")   # "1"/"2"/"3"/"4" / None (any)
         # Lorry tonnage lookup for enforcing REMARKS size caps on pre-filled rows.
         _prefill_cap_map: dict[str, float] = {}
         _eng_pf = sess.get("engine")
@@ -4100,9 +4107,9 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _remarks_raw = "" if pd.isna(_remarks_cell) else str(_remarks_cell).strip()
 
             # Trip-session filter: only excludes a DO when the user picked a
-            # specific half-day (Morning/Afternoon) AND the REMARKS explicitly
-            # say the OTHER half. No trip-timing note in REMARKS → assign
-            # either way (not restricted).
+            # specific trip (1/2/3/4) AND the REMARKS explicitly say a
+            # DIFFERENT trip. No trip-timing note in REMARKS → assign on any
+            # trip (not restricted).
             _is_wrong_trip = False
             if _is_mine and _trip_session:
                 _row_session = _row_trip_session(_remarks_raw)
@@ -7965,8 +7972,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                              if _etd_days_for_cutoff else "before today")
             header += f"\n🗓️ _{_past_date_count} DO(s) dated {_cutoff_note} — left unassigned; assign these manually if still needed._"
         if _wrong_trip_count:
-            _other_trip = "AFTERNOON" if _trip_session == "MORNING" else "MORNING"
-            header += f"\n🕐 _{_wrong_trip_count} DO(s) marked {_other_trip} TRIP in REMARKS — left unassigned (you picked the {_trip_session} trip)._"
+            header += f"\n🕐 _{_wrong_trip_count} DO(s) marked for a different trip in REMARKS — left unassigned (you picked Trip {_trip_session})._"
         if _remarks_skip_count:
             header += f"\n📅 _{_remarks_skip_count} DO(s) skipped — REMARKS indicate delivery not due today._"
         if _not_today_count:

@@ -779,15 +779,15 @@ def api_assign_specific():
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/trip-session", methods=["POST"])
 def api_trip_session():
-    """Which half of the day to assign for. "any" (default) applies no
-    filter; "morning"/"afternoon" excludes DOs whose REMARKS explicitly say
-    the other trip (a REMARKS with no trip-timing note is unaffected)."""
+    """Which trip of the day to assign for. "any" (default) applies no
+    filter; "1"/"2"/"3"/"4" excludes DOs whose REMARKS explicitly say a
+    different trip (a REMARKS with no trip-timing note is unaffected)."""
     sid = _sid()
     sess = bot.get_session(sid)
     session = str((request.json or {}).get("session", "any")).strip().lower()
-    if session not in ("any", "morning", "afternoon"):
+    if session not in ("any", "1", "2", "3", "4"):
         return _with_cookie({"ok": False, "error": "Invalid session."}, sid, 400)
-    sess["trip_session"] = None if session == "any" else session.upper()
+    sess["trip_session"] = None if session == "any" else session
     return _with_cookie({"ok": True, "session": session}, sid)
 
 
@@ -1421,8 +1421,10 @@ _PAGE = r"""<!doctype html>
       <div>
         <p class="tp-section-label" style="margin-bottom:6px">Trip:</p>
         <button class="btn tp-trip-btn active" id="tp-trip-any" style="width:auto" data-tptrip="any">Any</button>
-        <button class="btn secondary tp-trip-btn" id="tp-trip-morning" style="width:auto" data-tptrip="morning">Morning</button>
-        <button class="btn secondary tp-trip-btn" id="tp-trip-afternoon" style="width:auto" data-tptrip="afternoon">Afternoon</button>
+        <button class="btn secondary tp-trip-btn" id="tp-trip-1" style="width:auto" data-tptrip="1">1</button>
+        <button class="btn secondary tp-trip-btn" id="tp-trip-2" style="width:auto" data-tptrip="2">2</button>
+        <button class="btn secondary tp-trip-btn" id="tp-trip-3" style="width:auto" data-tptrip="3">3</button>
+        <button class="btn secondary tp-trip-btn" id="tp-trip-4" style="width:auto" data-tptrip="4">4</button>
       </div>
     </div>
     <div class="tp-fetch-row hidden" id="tp-fetch-row">
@@ -1887,7 +1889,7 @@ document.querySelectorAll('.tp-day-btn').forEach(b=>{
 });
 
 function setTripActive(session){
-  ['any','morning','afternoon'].forEach(s=>{
+  ['any','1','2','3','4'].forEach(s=>{
     $('#tp-trip-'+s).classList.toggle('active', s===session);
   });
 }
