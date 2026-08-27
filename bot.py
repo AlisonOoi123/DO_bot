@@ -715,7 +715,7 @@ def _load_schedule(user: str) -> dict[int, set[str]]:
 
 
 def _scheduled_prefixes_for_upload(user: str, trip_day: str = "today") -> set[str] | None:
-    """Return route prefixes scheduled for the target day (today or tomorrow).
+    """Return route prefixes scheduled for the target day.
 
     These come from the SCHD(abi/vivian) sheet's day column — only routes
     explicitly scheduled for that weekday are returned.  Routes that belong
@@ -728,14 +728,7 @@ def _scheduled_prefixes_for_upload(user: str, trip_day: str = "today") -> set[st
     if not schedule:
         return None
 
-    from datetime import timedelta as _timedelta
-    target_date = datetime.now().date()
-    if trip_day == "tomorrow":
-        target_date += _timedelta(days=1)
-        while target_date.weekday() == 6:
-            target_date += _timedelta(days=1)
-
-    target_wd = target_date.weekday()   # 0=Mon … 6=Sun
+    target_wd = _resolve_trip_day_date(trip_day).weekday()   # 0=Mon … 6=Sun
     return schedule.get(target_wd, set())
 
 
@@ -3039,41 +3032,65 @@ def _handle_user_id(phone, sess, text):
     return _fleet_and_trip_prompt(sess, user)
 
 
-def _handle_trip_day(phone, sess, text):
-    """Handle Today / Tomorrow selection after login."""
-    cmd = text.lower().strip()
-    if cmd in ("trip_day_today", "today"):
-        trip_day = "today"
-    elif cmd in ("trip_day_tomorrow", "tomorrow"):
-        trip_day = "tomorrow"
-    else:
-        from datetime import timedelta as _td
-        _today_name    = datetime.now().strftime("%A")
-        _tomorrow_date = datetime.now().date() + _td(days=1)
-        while _tomorrow_date.weekday() == 6:
-            _tomorrow_date += _td(days=1)
-        _tomorrow_name = _tomorrow_date.strftime("%A")
-        return [{
-            "_type": "buttons",
-            "body": "Please select which day's DOs to plan:",
-            "buttons": [
-                {"id": "trip_day_today",    "title": f"Today ({_today_name[:3]})"},
-                {"id": "trip_day_tomorrow", "title": f"Tomorrow ({_tomorrow_name[:3]})"},
-                {"id": "clear daily log",   "title": "🗑️ Clear Today Log"},
-            ],
-        }]
-
-    sess["trip_day"] = trip_day
-    sess["state"]   = "AWAIT_EXCEL"
-
-    from datetime import timedelta as _td
+def _resolve_trip_day_date(trip_day: str):
+    """Turn a trip_day value ('today', 'tomorrow', or an ISO 'YYYY-MM-DD'
+    date the web app's calendar sent) into an actual date. 'tomorrow' skips
+    Sunday (non-operating day) the way the original Today/Tomorrow buttons
+    always did; an explicit calendar date is used exactly as picked — the
+    user chose it deliberately, so no day gets silently skipped."""
+    from datetime import date as _date, timedelta as _td
     if trip_day == "today":
-        _day_label = datetime.now().strftime("%A, %d %b")
+        return datetime.now().date()
+    if trip_day == "tomorrow":
+        d = datetime.now().date() + _td(days=1)
+        while d.weekday() == 6:
+            d += _td(days=1)
+        return d
+    try:
+        return _date.fromisoformat(str(trip_day))
+    except (ValueError, TypeError):
+        return datetime.now().date()
+
+
+def _handle_trip_day(phone, sess, text):
+    """Handle day selection after login — 'today'/'tomorrow' (WhatsApp
+    buttons) or an explicit ISO date string 'YYYY-MM-DD' (web app calendar,
+    letting the user plan for any future day, not just tomorrow).
+    sess["trip_day"] is always stored as the resolved ISO date string, so
+    every downstream reader (_scheduled_prefixes_for_upload, the schedule
+    notice below) just parses one date instead of branching on the label."""
+    from datetime import date as _date
+    cmd = text.strip()
+    cmd_lower = cmd.lower()
+    if cmd_lower in ("trip_day_today", "today", "trip_day_tomorrow", "tomorrow"):
+        _target_date = _resolve_trip_day_date(
+            "today" if "today" in cmd_lower else "tomorrow")
     else:
-        _d = datetime.now().date() + _td(days=1)
-        while _d.weekday() == 6:
-            _d += _td(days=1)
-        _day_label = _d.strftime("%A, %d %b")
+        try:
+            _target_date = _date.fromisoformat(cmd)
+        except ValueError:
+            from datetime import timedelta as _td
+            _today_name    = datetime.now().strftime("%A")
+            _tomorrow_date = datetime.now().date() + _td(days=1)
+            while _tomorrow_date.weekday() == 6:
+                _tomorrow_date += _td(days=1)
+            _tomorrow_name = _tomorrow_date.strftime("%A")
+            return [{
+                "_type": "buttons",
+                "body": "Please select which day's DOs to plan:",
+                "buttons": [
+                    {"id": "trip_day_today",    "title": f"Today ({_today_name[:3]})"},
+                    {"id": "trip_day_tomorrow", "title": f"Tomorrow ({_tomorrow_name[:3]})"},
+                    {"id": "clear daily log",   "title": "🗑️ Clear Today Log"},
+                ],
+            }]
+
+    if _target_date < datetime.now().date():
+        return ["❌ Can't plan for a date that's already passed — pick today or a future date."]
+
+    sess["trip_day"] = _target_date.isoformat()
+    sess["state"]   = "AWAIT_EXCEL"
+    _day_label = _target_date.strftime("%A, %d %b")
 
     return [
         f"✅ Planning for *{_day_label}*.\n\n"
@@ -4284,17 +4301,11 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Build schedule notice for the user
         _sched_notice = []
         if _sched_prefixes is not None:
-            from datetime import timedelta as _td
             _day_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-            if _trip_day == "today":
-                _tgt_date = datetime.now().date()
-            else:
-                _tgt_date = datetime.now().date() + _td(days=1)
-                while _tgt_date.weekday() == 6:
-                    _tgt_date += _td(days=1)
+            _tgt_date = _resolve_trip_day_date(_trip_day)
             _tgt_wd = _tgt_date.weekday()
             _sched_notice.append(
-                f"📅 Schedule filter — assigning *{_trip_day}* ({_day_names[_tgt_wd]}). "
+                f"📅 Schedule filter — assigning *{_day_names[_tgt_wd]}, {_tgt_date.strftime('%d %b')}*. "
                 f"Routes: {', '.join(sorted(_sched_prefixes)) if _sched_prefixes else 'none scheduled'}."
             )
             if _not_today_count:

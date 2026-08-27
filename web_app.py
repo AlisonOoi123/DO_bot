@@ -608,6 +608,10 @@ def api_master_grid():
 
 @app.route("/api/day", methods=["POST"])
 def api_day():
+    """day: "today"/"tomorrow", or an ISO date string ("YYYY-MM-DD") from the
+    web app's calendar picker — which day's DOs to plan for. This is purely
+    which SCHD-sheet weekday to filter routes against; it never filters DOs
+    by their own DATE column."""
     sid = _sid()
     sess = bot.get_session(sid)
     day = (request.json or {}).get("day", "today")
@@ -615,16 +619,42 @@ def api_day():
     # user is asked whether to assign them anyway (see /api/dos + /api/offschedule).
     sess.pop("_ignore_schedule", None)
     msgs = bot._handle_trip_day(sid, sess, str(day))
-    return _with_cookie({
+    is_error = bool(msgs) and str(msgs[0]).strip().startswith("❌")
+    resp = {
         "messages": msgs,
         "state": sess.get("state"),
-        "ok": sess.get("state") in ("AWAIT_EXCEL", "AWAIT_TRIP_DAY"),
-    }, sid)
+        "ok": not is_error and sess.get("state") in ("AWAIT_EXCEL", "AWAIT_TRIP_DAY"),
+    }
+    if is_error:
+        resp["error"] = msgs[0]
+    return _with_cookie(resp, sid)
 
 
-def _run_dos_upload(sid: str, sess: dict, fb: bytes) -> dict:
-    """Shared by /api/dos (manual upload) and /api/dos-fetch/use (direct from
-    the live DB fetch) — same engine call, same response shape."""
+def _reset_items_to_unassigned(sess: dict) -> None:
+    """Send every already-assigned item back to the pool.
+
+    _handle_excel_upload always runs its full two-pass bin-packing optimiser
+    internally — that's unchanged and untouched. The user wants Fetch to only
+    fetch (everything lands in Unassigned), with the actual fitting deferred
+    until they explicitly click AI Assign. Rather than risk surgery on that
+    ~4000-line assignment routine, this undoes its result at the web layer:
+    it's safe because _handle_excel_upload never writes to the persistent
+    daily-assignment log itself (record_assignments_today only fires later,
+    from the confirm/export step) — so nothing outside sess["items"] needs
+    undoing. Clicking AI Assign re-runs _handle_excel_upload from scratch
+    (see /api/board/ai-assign), which naturally produces a full, correct
+    assignment regardless of this reset."""
+    for it in sess.get("items", []) or []:
+        lorry = it.get("LORRY")
+        if lorry and lorry not in _SENTINELS:
+            it["LORRY"] = "NO_LORRY"
+
+
+def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -> dict:
+    """Shared by /api/dos (manual upload), /api/dos-fetch/use (direct from the
+    live DB fetch), and /api/board/ai-assign (explicit re-assign). Fetch/
+    upload land every DO in Unassigned (assign_now=False) — the AI only
+    actually fits lorries when the user clicks AI Assign (assign_now=True)."""
     msgs = bot._handle_excel_upload(sid, sess, fb)
     # If some DOs aren't on the chosen day's route schedule, the engine parks in
     # AWAIT_OTHER_USER_REPLY and expects a YES/NO. Surface that as a question
@@ -638,6 +668,8 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes) -> dict:
                 "day": sess.get("trip_day", "today"),
             },
         }
+    if not assign_now:
+        _reset_items_to_unassigned(sess)
     result = _result_json(sess) if sess.get("items") else None
     resp = {"messages": msgs, "state": sess.get("state"), "result": result}
     # bot.py's error messages consistently lead with "❌" — surface that as a
@@ -732,6 +764,9 @@ def api_offschedule():
     sess = bot.get_session(sid)
     assign = bool((request.json or {}).get("assign"))
     msgs = bot._handle_other_user_reply(sid, sess, "YES" if assign else "NO")
+    # Same "land in Unassigned, don't auto-fit" rule as the initial fetch —
+    # this resolves what's IN SCOPE, not whether the AI has fitted it yet.
+    _reset_items_to_unassigned(sess)
     result = _result_json(sess) if sess.get("items") else None
     return _with_cookie({
         "messages": msgs,
@@ -932,7 +967,7 @@ def api_board_ai_assign():
     file_bytes = sess.get("_upload_bytes")
     if not file_bytes:
         return _with_cookie({"error": "No DO file on record for this session — upload or fetch one first."}, sid, 400)
-    outcome = _run_dos_upload(sid, sess, file_bytes)
+    outcome = _run_dos_upload(sid, sess, file_bytes, assign_now=True)
     outcome["board"] = _board_json(sess) if sess.get("items") else None
     return _with_cookie(outcome, sid)
 
@@ -1224,10 +1259,8 @@ _PAGE = r"""<!doctype html>
   .tp-toggle-chip[data-tphome="STAGING"]{border-color:var(--stage);
     background:color-mix(in srgb, var(--stage) 16%, var(--card2))}
   .tp-toggle-chip[data-tphome="STAGING"].tp-broken{border-color:var(--bad)}
-  .tp-day-row{display:flex;align-items:center;gap:24px;flex-wrap:wrap;margin-top:14px;
-    padding-top:14px;border-top:1px solid var(--line)}
-  .tp-day-btn,.tp-trip-btn{opacity:.55}
-  .tp-day-btn.active,.tp-trip-btn.active{opacity:1}
+  .tp-trip-btn{opacity:.55}
+  .tp-trip-btn.active{opacity:1}
   .tp-fetch-row{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
   .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;
     box-sizing:border-box;width:100%;min-height:150px;gap:6px;
@@ -1270,6 +1303,15 @@ _PAGE = r"""<!doctype html>
   .board-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
   .board-top .btn{width:auto}
   .board-top .btn-ai{background:linear-gradient(135deg,var(--brand),#a855f7);color:#fff}
+  .board-plan-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .board-plan-field{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
+    font-weight:600;background:var(--card2);border:1px solid var(--line);border-radius:20px;
+    padding:4px 12px}
+  .board-plan-field input[type=date]{padding:4px 6px;border-radius:6px;border:1px solid var(--line);
+    background:var(--card);color:var(--ink);font-size:12.5px;font-family:inherit}
+  .board-plan-trip-btns{display:flex;gap:5px}
+  .board-plan-trip-btns .tp-trip-btn{padding:5px 10px;font-size:12px}
+  .board-plan-warn{font-size:12px;font-weight:700;color:var(--warn);white-space:nowrap}
   .board-assigned-stat{font-size:12.5px;color:var(--muted);background:var(--card2);
     border:1px solid var(--line);border-radius:20px;padding:4px 12px;font-weight:600;
     font-family:ui-monospace,Menlo,monospace}
@@ -1387,10 +1429,10 @@ _PAGE = r"""<!doctype html>
   <div class="card" id="card-login">
     <span class="tp-badge">TRUCK PLANNING</span>
     <h1 class="tp-h1">Loading Board</h1>
-    <p class="tp-sub">Pick a planner, set the ETD window, then Fetch &amp; Assign.
-      Drag a card onto a lorry, or click AI Assign to re-run the algorithm.
-      Bar shows MUATAN capacity — amber means inside the +10% naik allowance, red means
-      over the limit.</p>
+    <p class="tp-sub">Pick a planner, set the ETD window, then Fetch DOs — everything
+      lands in Unassigned first. Drag a card onto a lorry yourself, or click AI Assign
+      to let the algorithm fit them. Bar shows MUATAN capacity — amber means inside the
+      +10% naik allowance, red means over the limit.</p>
     <div class="tp-tabs" id="users"><span class="spin"></span></div>
     <div class="msg hidden" id="login-msg"></div>
     <div class="tp-etd-row hidden" id="tp-etd-row">
@@ -1412,23 +1454,8 @@ _PAGE = r"""<!doctype html>
       </div>
       <div class="tp-toggle-grid" data-tpzone="MINE" id="tp-toggle-grid"></div>
     </div>
-    <div class="tp-day-row hidden" id="tp-day-row">
-      <div>
-        <p class="tp-section-label" style="margin-bottom:6px">3&#41; Assign for:</p>
-        <button class="btn tp-day-btn active" id="tp-day-today" style="width:auto" data-tpday="today">Today</button>
-        <button class="btn secondary tp-day-btn" id="tp-day-tomorrow" style="width:auto" data-tpday="tomorrow">Tomorrow</button>
-      </div>
-      <div>
-        <p class="tp-section-label" style="margin-bottom:6px">Trip:</p>
-        <button class="btn tp-trip-btn active" id="tp-trip-any" style="width:auto" data-tptrip="any">Any</button>
-        <button class="btn secondary tp-trip-btn" id="tp-trip-1" style="width:auto" data-tptrip="1">1</button>
-        <button class="btn secondary tp-trip-btn" id="tp-trip-2" style="width:auto" data-tptrip="2">2</button>
-        <button class="btn secondary tp-trip-btn" id="tp-trip-3" style="width:auto" data-tptrip="3">3</button>
-        <button class="btn secondary tp-trip-btn" id="tp-trip-4" style="width:auto" data-tptrip="4">4</button>
-      </div>
-    </div>
     <div class="tp-fetch-row hidden" id="tp-fetch-row">
-      <button class="btn" id="btn-fetch-assign" style="width:auto">📥 Fetch &amp; Assign</button>
+      <button class="btn" id="btn-fetch-assign" style="width:auto">📥 Fetch DOs</button>
     </div>
   </div>
 
@@ -1531,6 +1558,21 @@ _PAGE = r"""<!doctype html>
     <div class="board-top">
       <p class="step-title" style="margin:0">Board · drag DOs onto a lorry, or let AI assign</p>
       <span class="board-assigned-stat" id="board-assigned-stat"></span>
+      <div class="board-plan-row" id="board-plan-row">
+        <label class="board-plan-field">Assign for
+          <input type="date" id="tp-day-date">
+        </label>
+        <span class="board-plan-warn hidden" id="tp-day-late-warn" title="It's after 2pm — deliveries planned for today may be tight. Consider planning for tomorrow instead.">⚠️ After 2pm</span>
+        <span class="board-plan-field" style="border:none;padding:0;background:none">Trip
+          <span class="board-plan-trip-btns">
+            <button class="btn tp-trip-btn active" id="tp-trip-any" style="width:auto" data-tptrip="any">Any</button>
+            <button class="btn secondary tp-trip-btn" id="tp-trip-1" style="width:auto" data-tptrip="1">1</button>
+            <button class="btn secondary tp-trip-btn" id="tp-trip-2" style="width:auto" data-tptrip="2">2</button>
+            <button class="btn secondary tp-trip-btn" id="tp-trip-3" style="width:auto" data-tptrip="3">3</button>
+            <button class="btn secondary tp-trip-btn" id="tp-trip-4" style="width:auto" data-tptrip="4">4</button>
+          </span>
+        </span>
+      </div>
       <button class="btn btn-ai" id="btn-board-ai" style="margin-left:auto">🤖 AI Assign</button>
       <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
       <button class="btn secondary" id="btn-board-table">📋 Table view</button>
@@ -1714,7 +1756,6 @@ async function autoLoadPlanner(user, autoFetch){
   hideAll();
   show('#tp-etd-row', false);
   show('#tp-toggle-section', false);
-  show('#tp-day-row', false);
   show('#tp-fetch-row', false);
   try{
     setMsg('#login-msg', 'Loading '+user+"'s lorries… ", false);
@@ -1747,10 +1788,10 @@ async function autoLoadPlanner(user, autoFetch){
       }
     }
 
-    // Default to Today / Any trip (matches prior behaviour) — the row below
-    // lets the user switch explicitly before fetching.
-    setDayActive('today');
-    const dd = await jpost('/api/day',{day:'today'});
+    // Default to Today / Any trip (matches prior behaviour) — the board's
+    // own Assign-for/Trip controls let the user switch before re-fetching.
+    setDayDate(_todayISO());
+    const dd = await jpost('/api/day',{day:_todayISO()});
     if(!dd.ok){ setMsg('#login-msg', dd.messages||'Could not set trip day', true); return; }
     setTripActive('any');
     await jpost('/api/trip-session',{session:'any'});
@@ -1759,7 +1800,6 @@ async function autoLoadPlanner(user, autoFetch){
     _loadSavedEtdDays();
     show('#tp-etd-row', true);
     show('#tp-toggle-section', true);
-    show('#tp-day-row', true);
     show('#tp-fetch-row', true);
     await loadLorryToggles();
     if(autoFetch) await fetchAndAssign();
@@ -1877,16 +1917,39 @@ document.addEventListener('pointerup', async e=>{
   if(BOARD) await loadBoard();
 });
 
-function setDayActive(day){
-  $('#tp-day-today').classList.toggle('active', day==='today');
-  $('#tp-day-tomorrow').classList.toggle('active', day==='tomorrow');
+// ---- Assign-for date (calendar) — which SCHD weekday to plan against.
+// Deliberately NOT a filter on the DOs' own DATE column (see /api/day).
+function _todayISO(){
+  const d = new Date();
+  return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,10);
 }
-document.querySelectorAll('.tp-day-btn').forEach(b=>{
-  b.onclick = async()=>{
-    setDayActive(b.dataset.tpday);
-    await jpost('/api/day', {day: b.dataset.tpday});
-  };
-});
+function updateLateWarning(){
+  const inp = $('#tp-day-date'), warn = $('#tp-day-late-warn');
+  if(!inp || !warn) return;
+  const isToday = inp.value === _todayISO();
+  const isLate = new Date().getHours() >= 14;
+  warn.classList.toggle('hidden', !(isToday && isLate));
+}
+function setDayDate(dateStr){
+  const inp = $('#tp-day-date');
+  if(inp) inp.value = dateStr;
+  updateLateWarning();
+}
+const _dayDateInput = $('#tp-day-date');
+if(_dayDateInput){
+  _dayDateInput.min = _todayISO();   // can't pick a backdated date
+  _dayDateInput.addEventListener('change', async()=>{
+    const val = _dayDateInput.value;
+    if(!val) return;
+    updateLateWarning();
+    const dd = await jpost('/api/day', {day: val});
+    if(!dd.ok){
+      boardToast(dd.error || (dd.messages && dd.messages[0]) || 'Could not set that date');
+      setDayDate(_todayISO());
+      await jpost('/api/day', {day: _todayISO()});
+    }
+  });
+}
 
 function setTripActive(session){
   ['any','1','2','3','4'].forEach(s=>{
@@ -2244,7 +2307,7 @@ function boardCardEl(o){
       <div class="b-top"><span class="b-id">${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
-      ${o.remarks?`<div class="b-meta" style="color:var(--warn)">${esc(o.remarks)}</div>`:''}
+      ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
       ${o.reason?`<div class="b-meta" style="color:var(--bad)">${esc(o.reason)}</div>`:''}
       ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
     </div>`;
@@ -2584,8 +2647,8 @@ async function boot(){
     _loadSavedEtdDays();
     show('#tp-etd-row', true);
     show('#tp-toggle-section', true);
-    show('#tp-day-row', true);
     show('#tp-fetch-row', true);
+    setDayDate(_todayISO());
     await loadLorryToggles();
     showBoard();
     return;

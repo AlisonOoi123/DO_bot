@@ -239,6 +239,14 @@ REMARKS_SIZE_ALIASES: dict[str, float | None] = {
     "LORI BESAR TIDAK BOLEH":    5.0,   # big lorry can't enter → small only
     "LORRY BESAR TIDAK BOLEH":   5.0,
     "LORI BESAR TAK BOLEH":      5.0,
+    "LORRY BESAR TAK BOLEH":     5.0,
+    # "X BOLEH" is texting-shorthand for "tak/tidak boleh" (X = "tak") — same
+    # "big lorry can't enter" restriction, just abbreviated. Real remark seen:
+    # "LORI BESAR X BOLEH MASUK". Without this, that phrase only matched the
+    # bare "LORI BESAR" entry below (cap=None), so the DO got NO size cap at
+    # all — even when SHIP_DETAIL explicitly gave a MAX N TON to use instead.
+    "LORI BESAR X BOLEH":        5.0,
+    "LORRY BESAR X BOLEH":       5.0,
     "BIG LORRY":                 None,
     "LORI BESAR":                None,
     "LORRY BESAR":               None,
