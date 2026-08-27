@@ -447,6 +447,57 @@ def _board_json(sess) -> dict:
     }
 
 
+def _snapshot_rows(sess) -> list[dict]:
+    """Build the 'Snapshot' export rows — one per lorry in this planner's
+    current fleet, matching the external tracking-sheet format (NO / LORRY /
+    DRIVER / MUATAN(KG) / JUMLAH (KEDAI) / ISI (KG) / LAGI BOLEH MASUK (KG) /
+    DONE / AREA / PERCENTAGE OF DELIVERY / REMARKS).
+
+    MUATAN(KG) is sourced from the same holder-based fleet capacity
+    (_fleet_lists) the board itself uses for utilisation %, so it always
+    matches "the LORRY DAILY PLANNING we use" rather than any raw sheet
+    column. DRIVER and REMARKS are left blank — no reliable source for
+    either exists in this system yet.
+    """
+    _fl = _fleet_lists(sess)
+    caps = {l["plate"]: l["capacity"] for l in _fl["lorries"]}
+    items = sess.get("items", []) or []
+
+    per_lorry: dict[str, dict] = {p: {"isi": 0.0, "codes": set(), "routes": set()} for p in caps}
+    for it in items:
+        lorry = it.get("LORRY")
+        if lorry in _SENTINELS or lorry in _NOT_MINE_TODAY:
+            continue
+        g = per_lorry.setdefault(lorry, {"isi": 0.0, "codes": set(), "routes": set()})
+        g["isi"] += float(it.get("WEIGHT", 0) or 0)
+        code = str(it.get("CODE", "")).strip()
+        if code:
+            g["codes"].add(code)
+        route = str(it.get("ROUTE", "")).strip()
+        if route:
+            g["routes"].add(route)
+
+    rows = []
+    for i, plate in enumerate(sorted(per_lorry.keys()), start=1):
+        g = per_lorry[plate]
+        muatan_kg = round((caps.get(plate) or 0) * 1000, 1)
+        isi_kg = round(g["isi"] * 1000, 1)
+        rows.append({
+            "NO": i,
+            "LORRY": plate,
+            "DRIVER": "",
+            "MUATAN(KG)": muatan_kg,
+            "JUMLAH (KEDAI)": len(g["codes"]),
+            "ISI (KG)": isi_kg,
+            "LAGI BOLEH MASUK (KG)": round(muatan_kg - isi_kg, 1),
+            "DONE": "✓" if g["codes"] else "",
+            "AREA": ", ".join(sorted(g["routes"])),
+            "PERCENTAGE OF DELIVERY": round(100.0 * isi_kg / muatan_kg, 1) if muatan_kg else 0.0,
+            "REMARKS": "",
+        })
+    return rows
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API endpoints — each drives the existing engine handler for the current step.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1181,6 +1232,34 @@ def api_download():
             data = None
     if not data:
         return _with_cookie({"error": "Nothing to download yet."}, sid, 400)
+
+    # Append a second "Snapshot" sheet (lorry status format) computed fresh
+    # from the current session state, so it reflects any board edits made
+    # since the export bytes were last built.
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Font
+        snap_rows = _snapshot_rows(sess)
+        if snap_rows:
+            wb = load_workbook(io.BytesIO(data))
+            if "Snapshot" in wb.sheetnames:
+                del wb["Snapshot"]
+            ws = wb.create_sheet("Snapshot")
+            headers = list(snap_rows[0].keys())
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for r in snap_rows:
+                ws.append([r[h] for h in headers])
+            for col_idx, h in enumerate(headers, start=1):
+                ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = max(12, len(h) + 2)
+            buf = io.BytesIO()
+            wb.save(buf)
+            data = buf.getvalue()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
     return send_file(
         io.BytesIO(data),
         as_attachment=True,
