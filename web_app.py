@@ -160,16 +160,18 @@ def _file_bytes():
 # ─────────────────────────────────────────────────────────────────────────────
 _SENTINELS = {"NO_LORRY", "NO_ELIGIBLE_LORRY", "SPLIT", "SKIPPED",
               "OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE",
-              "WRONG_TRIP", "PAST_DATE", "", None}
+              "WRONG_TRIP", "PAST_DATE", "NOT_PICKED", "", None}
 
 # Not actionable by the logged-in planner at all today — not "their" route
 # (OTHER_USER), not their scheduled day (NOT_TODAY), outsourced (OUT_SOURCE),
-# explicitly skipped (REMARKS_SKIP), or the wrong half-day (WRONG_TRIP).
-# _result_json (table view) has always kept these out of the actionable
-# "unassigned" list, showing only a count via dos_other/skipped_other —
-# _board_json must apply the same exclusion or a planner's board pool ends
-# up showing the OTHER planner's routes as if they were theirs to work on.
-_NOT_MINE_TODAY = {"OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP"}
+# explicitly skipped (REMARKS_SKIP), the wrong half-day (WRONG_TRIP), or
+# unchecked by the user on the Picking List (NOT_PICKED). _result_json
+# (table view) has always kept these out of the actionable "unassigned"
+# list, showing only a count via dos_other/skipped_other — _board_json must
+# apply the same exclusion or a planner's board pool ends up showing the
+# OTHER planner's routes (or DOs they deliberately excluded) as if they
+# were theirs to work on today.
+_NOT_MINE_TODAY = {"OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP", "NOT_PICKED"}
 
 
 def _result_json(sess) -> dict:
@@ -525,6 +527,7 @@ def api_state():
         "state": sess.get("state", "IDLE"),
         "user": sess.get("user_id"),
         "email": bot.get_session(base).get("_email"),
+        "needs_picking": bool(sess.get("_picking_pending")),
         "result": _result_json(sess) if sess.get("items") else None,
     }, base)
 
@@ -585,6 +588,7 @@ def api_login():
             "needs_master": False,
             "already_active": True,
             "has_items": bool(sess.get("items")),
+            "needs_picking": bool(sess.get("_picking_pending")),
             "trip_day": sess.get("trip_day"),
             "trip_session": sess.get("trip_session"),
         }, base)
@@ -784,6 +788,12 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -
         }
     if not assign_now:
         _reset_items_to_unassigned(sess)
+        # Marks "fetched, waiting on the Picking List" — cleared by
+        # /api/picking-list/confirm once the user actually confirms their
+        # picks. Distinguishes this from "picks confirmed, board ready" so
+        # switching planner tabs and back (see _planner_already_active)
+        # restores to the right screen instead of skipping the picking step.
+        sess["_picking_pending"] = True
     result = _result_json(sess) if sess.get("items") else None
     resp = {"messages": msgs, "state": sess.get("state"), "result": result}
     # bot.py's error messages consistently lead with "❌" — surface that as a
@@ -801,6 +811,9 @@ def api_dos():
     fb = _file_bytes()
     if fb is None:
         return _with_cookie({"error": "No file uploaded."}, sid, 400)
+    # A fresh upload is a fresh picking decision — previous Picking List
+    # unchecks shouldn't silently carry over onto different data.
+    sess.pop("_unpicked_dos", None)
     return _with_cookie(_run_dos_upload(sid, sess, fb), sid)
 
 
@@ -867,7 +880,61 @@ def api_dos_fetch_use():
     data = sess.get("_fetched_do_bytes")
     if not data:
         return _with_cookie({"error": "Nothing fetched yet — click Fetch DOs first."}, sid, 400)
+    # A fresh fetch is a fresh picking decision — previous Picking List
+    # unchecks shouldn't silently carry over onto today's newly-pulled DOs.
+    sess.pop("_unpicked_dos", None)
     return _with_cookie(_run_dos_upload(sid, sess, data), sid)
+
+
+@app.route("/api/picking-list")
+def api_picking_list():
+    """The current planner's own actionable DOs (same scope as the board
+    pool — route-owned, on-schedule, right trip), shaped for the Picking
+    List checklist: every DO the engine would otherwise consider, each
+    already-unpicked DO (from a previous confirm this session) reported as
+    unchecked, everything else checked by default."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    items = sess.get("items", []) or []
+    unpicked = sess.get("_unpicked_dos") or set()
+    rows = []
+    for it in items:
+        lorry = it.get("LORRY")
+        # A DO already excluded for a DIFFERENT reason (other user's route,
+        # off-schedule, outsourced, wrong trip) isn't this planner's to pick
+        # either way — only list what NOT_PICKED itself could still affect.
+        if lorry in _NOT_MINE_TODAY and lorry != "NOT_PICKED":
+            continue
+        do_num = str(it.get("DO NUMBER", ""))
+        rows.append({
+            "do": do_num,
+            "code": str(it.get("CODE", "")),
+            "customer": str(it.get("CUSTOMER NAME", "")),
+            "route": str(it.get("ROUTE", "")),
+            "weight": round(float(it.get("WEIGHT", 0) or 0), 3),
+            "date": str(it.get("DATE", "")),
+            "checked": do_num not in unpicked,
+        })
+    return _with_cookie({"rows": rows}, sid)
+
+
+@app.route("/api/picking-list/confirm", methods=["POST"])
+def api_picking_list_confirm():
+    """Save which DOs the user unchecked and re-run the fetch/parse — bot.py
+    drops those rows before building sess["items"] at all (see
+    _handle_excel_upload), so the exclusion survives every later re-run (AI
+    Assign, Reassign) too, not just this one response. That's why it's
+    stored on the session rather than just filtered client-side."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    file_bytes = sess.get("_upload_bytes")
+    if not file_bytes:
+        return _with_cookie({"error": "No DO file on record for this session — fetch or upload one first."}, sid, 400)
+    unpicked = (request.json or {}).get("unpicked", []) or []
+    sess["_unpicked_dos"] = {str(d).strip() for d in unpicked}
+    resp = _run_dos_upload(sid, sess, file_bytes, assign_now=False)
+    sess["_picking_pending"] = False   # confirmed — board is now the destination
+    return _with_cookie(resp, sid)
 
 
 @app.route("/api/offschedule", methods=["POST"])
@@ -881,6 +948,7 @@ def api_offschedule():
     # Same "land in Unassigned, don't auto-fit" rule as the initial fetch —
     # this resolves what's IN SCOPE, not whether the AI has fitted it yet.
     _reset_items_to_unassigned(sess)
+    sess["_picking_pending"] = True   # next stop is the Picking List, not the board
     result = _result_json(sess) if sess.get("items") else None
     return _with_cookie({
         "messages": msgs,
@@ -1669,6 +1737,29 @@ _PAGE = r"""<!doctype html>
     <button class="btn back" data-back="dos">← Back (re-upload DO file)</button>
   </div>
 
+  <!-- Step 4c: picking list — review the fetched DOs, uncheck any not needed today -->
+  <div class="card hidden" id="card-picking">
+    <p class="step-title" style="margin-bottom:2px">Picking List</p>
+    <p style="font-size:13px;color:var(--muted);margin:0 0 14px">
+      All of today's DOs are checked by default. Uncheck any you don't need to assign today, then continue.
+    </p>
+    <div class="row" style="margin-bottom:10px;align-items:center">
+      <button class="mini-btn" id="picking-select-all">Select all</button>
+      <button class="mini-btn" id="picking-deselect-all">Deselect all</button>
+      <span id="picking-count" style="margin-left:auto;font-size:12.5px;color:var(--muted);font-weight:600"></span>
+    </div>
+    <div class="msg hidden" id="picking-msg"></div>
+    <div class="scroll" style="max-height:60vh">
+      <table>
+        <thead><tr><th style="width:32px"></th><th>DO</th><th>Code</th><th>Customer</th><th>Route</th><th class="w">Weight</th><th>Date</th></tr></thead>
+        <tbody id="picking-rows"></tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn" id="picking-next" style="width:auto">Next →</button>
+    </div>
+  </div>
+
   <!-- Step 5: drag-and-drop board -->
   <div class="card hidden" id="card-board">
     <div class="board-top">
@@ -1792,7 +1883,7 @@ async function fpost(url,file){ const fd=new FormData(); fd.append('file',file);
 let selUser=null, masterFile=null, selDay=null, needsMaster=false;
 // #card-login is now the always-visible planner-tabs bar, not a wizard step —
 // it's deliberately left out of ALL_CARDS so hideAll()/goTo() never hide it.
-const ALL_CARDS=['#card-master','#card-day','#card-dos','#card-offsched','#card-board','#card-result'];
+const ALL_CARDS=['#card-master','#card-day','#card-dos','#card-offsched','#card-picking','#card-board','#card-result'];
 function hideAll(){ ALL_CARDS.forEach(id=>show(id,false)); }
 function clearMsgs(){ ['#login-msg','#master-msg','#day-msg','#dos-msg','#offsched-msg','#board-msg'].forEach(id=>setMsg(id,null)); }
 
@@ -1894,7 +1985,8 @@ async function autoLoadPlanner(user, autoFetch){
       show('#tp-toggle-section', true);
       show('#tp-fetch-row', true);
       await loadLorryToggles();
-      if(dl.has_items){ showBoard(); }
+      if(dl.needs_picking){ await showPickingList(); }
+      else if(dl.has_items){ showBoard(); }
       return;
     }
 
@@ -2147,7 +2239,7 @@ async function fetchAndAssign(){
       return;
     }
     setMsg('#login-msg', null);
-    showBoard();
+    await showPickingList();
   } finally {
     btn.disabled = false;
   }
@@ -2267,7 +2359,7 @@ function handleDosResponse(d){
     show('#card-dos',false); show('#card-offsched',true);
     return true;
   }
-  if(d.result){ show('#card-dos',false); showBoard(); return true; }
+  if(d.result){ show('#card-dos',false); showPickingList(); return true; }
   return false;
 }
 
@@ -2307,7 +2399,7 @@ $('#btn-dos-fetch-use').onclick=useFetchedDos;
 async function answerOffsched(assign){
   setMsg('#offsched-msg', assign?'Assigning off-schedule DOs… ':'Finalising… ');
   const d=await jpost('/api/offschedule',{assign});
-  if(d.result){ show('#card-offsched',false); showBoard(); }
+  if(d.result){ show('#card-offsched',false); showPickingList(); }
   else { setMsg('#offsched-msg', d.messages||d.error||'Something went wrong',true); }
 }
 document.getElementById('offsched-yes').onclick=()=>answerOffsched(true);
@@ -2380,6 +2472,62 @@ let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set();
 let boardMaximizedPlate=null;
 let boardDrag=null, boardGhost=null;
 let routeDragCandidate=null, routeDrag=null, routeGhost=null, routeDragJustHappened=false;
+
+// ---- Picking List — review the fetched/assigned-scope DOs, uncheck any
+// not needed today, before landing on the board. ----
+let PICKING_ROWS = [];
+async function showPickingList(){
+  hideAll();
+  document.body.classList.remove('board-active');
+  show('#card-picking', true);
+  setMsg('#picking-msg', 'Loading… ', false);
+  const d = await (await fetch('/api/picking-list')).json();
+  if(d.error){ setMsg('#picking-msg', d.error, true); return; }
+  setMsg('#picking-msg', null);
+  renderPickingList(d.rows || []);
+}
+function renderPickingList(rows){
+  PICKING_ROWS = rows;
+  const tbody = $('#picking-rows');
+  tbody.innerHTML = rows.map(r=>`
+    <tr>
+      <td><input type="checkbox" class="picking-cb" data-do="${esc(r.do)}" ${r.checked?'checked':''}></td>
+      <td>${esc(r.do)}</td>
+      <td>${esc(r.code)}</td>
+      <td>${esc(r.customer)}</td>
+      <td>${esc(r.route)}</td>
+      <td class="w">${r.weight.toFixed(3)}T</td>
+      <td>${esc(r.date)}</td>
+    </tr>`).join('');
+  tbody.querySelectorAll('.picking-cb').forEach(cb=>{ cb.onchange = updatePickingCount; });
+  updatePickingCount();
+}
+function updatePickingCount(){
+  const total = PICKING_ROWS.length;
+  const checked = $('#picking-rows').querySelectorAll('.picking-cb:checked').length;
+  $('#picking-count').textContent = `${checked} of ${total} selected`;
+}
+$('#picking-select-all').onclick = ()=>{
+  $('#picking-rows').querySelectorAll('.picking-cb').forEach(cb=>cb.checked=true);
+  updatePickingCount();
+};
+$('#picking-deselect-all').onclick = ()=>{
+  $('#picking-rows').querySelectorAll('.picking-cb').forEach(cb=>cb.checked=false);
+  updatePickingCount();
+};
+$('#picking-next').onclick = async()=>{
+  const btn = $('#picking-next');
+  btn.disabled = true;
+  try{
+    const unpicked = [...$('#picking-rows').querySelectorAll('.picking-cb')]
+      .filter(cb=>!cb.checked).map(cb=>cb.dataset.do);
+    setMsg('#picking-msg', 'Assigning… ', false);
+    const d = await jpost('/api/picking-list/confirm', {unpicked});
+    if(d.error){ setMsg('#picking-msg', d.error, true); return; }
+    setMsg('#picking-msg', null);
+    showBoard();
+  } finally { btn.disabled = false; }
+};
 
 function showBoard(){
   hideAll(); show('#card-board',true);
@@ -2794,7 +2942,7 @@ async function boot(){
     show('#tp-fetch-row', true);
     setDayDate(_todayISO());
     await loadLorryToggles();
-    showBoard();
+    if(d.needs_picking){ await showPickingList(); } else { showBoard(); }
     return;
   }
   if(validUsers.length){ autoLoadPlanner(validUsers[0]); }

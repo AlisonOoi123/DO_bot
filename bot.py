@@ -3984,6 +3984,22 @@ def _handle_excel_upload(phone, sess, file_bytes):
 
         raw = df.dropna(subset=["ROUTE", "DO NUMBER"]).copy()
         raw = raw.reset_index(drop=True)
+
+        # Picking List: drop rows the user explicitly unchecked (see
+        # /api/picking-list/confirm) before anything downstream ever sees
+        # them — simplest and safest way to make the exclusion stick.
+        # Tagging them with a new sentinel value instead would need
+        # threading through over a dozen separate hardcoded sentinel-string
+        # lists scattered through the rest of this function (auto-assign
+        # eligibility, geo-validity, item counts, ...), any one of which
+        # missed would silently let an unchecked DO get assigned anyway.
+        # Persists on the session so it's re-applied on every re-run (AI
+        # Assign, Reassign), not just the initial fetch.
+        _unpicked_dos = sess.get("_unpicked_dos")
+        if _unpicked_dos:
+            raw = raw[~raw["DO NUMBER"].astype(str).str.strip().isin(_unpicked_dos)]
+            raw = raw.reset_index(drop=True)
+
         # Store format flag so export knows not to touch DATE
         sess["is_new_format"] = IS_NEW_FORMAT
 
