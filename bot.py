@@ -7858,7 +7858,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return [f"❌ Failed to read the Excel file: {e}\nPlease re-upload."]
+        # nssm-run services often don't have a visible console for print_exc()
+        # to land on — put the failing file:line right in the message shown
+        # on screen so it's diagnosable without server log access.
+        _tb = traceback.extract_tb(e.__traceback__)
+        _loc = f" ({_tb[-1].filename.split(chr(92))[-1].split('/')[-1]}:{_tb[-1].lineno} in {_tb[-1].name})" if _tb else ""
+        return [f"❌ Failed to process the DO file: {type(e).__name__}: {e}{_loc}\n"
+                "Please screenshot this and send it back."]
 
 def _handle_other_user_reply(phone, sess, text: str) -> list[str]:
     """Handle user's YES/NO reply about assigning their own off-schedule DOs."""
