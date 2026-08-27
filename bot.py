@@ -1434,9 +1434,14 @@ def refresh_eligible_from_toggle(sess) -> None:
         return
     _off = get_unavailable_plates_for(user)
     _assignable = [(p, t) for p, t in full_fleet if str(p).strip().upper() not in _off]
+    # Explicit columns matter even (especially) when _assignable is empty —
+    # pd.DataFrame([]) with no rows has NO columns at all, so every plate
+    # toggled off would leave eligible_lorries schema-less and crash the
+    # first thing that tries to read LORRY/TON/USER from it.
     engine.eligible_lorries = pd.DataFrame(
         [{"LORRY": p, "TON": t, "USER": user, "Status": "Available"}
-         for p, t in sorted(_assignable)]
+         for p, t in sorted(_assignable)],
+        columns=["LORRY", "TON", "USER", "Status"]
     )
 
 
@@ -2784,10 +2789,15 @@ def _handle_master_upload(phone, sess, file_bytes):
     _toggled_off = get_unavailable_plates_for(user)
     _assignable_fleet = [(p, t) for p, t in my_fleet if p.upper() not in _toggled_off] if _toggled_off else my_fleet
 
-    # Replace the engine's eligible fleet with TODAY's availability for this user.
+    # Replace the engine's eligible fleet with TODAY's availability for this
+    # user. Explicit columns matter even when _assignable_fleet is empty (all
+    # of today's plates toggled off) — pd.DataFrame([]) with no rows has NO
+    # columns at all, leaving eligible_lorries schema-less and crashing the
+    # first thing that reads LORRY/TON/USER from it.
     sess["engine"].eligible_lorries = pd.DataFrame(
         [{"LORRY": p, "TON": t, "USER": user, "Status": "Available"}
-         for p, t in sorted(_assignable_fleet)]
+         for p, t in sorted(_assignable_fleet)],
+        columns=["LORRY", "TON", "USER", "Status"]
     )
     sess["_master_uploaded"] = True
     sess["state"] = "AWAIT_TRIP_DAY"
