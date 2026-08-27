@@ -4244,6 +4244,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "ETD":           str(row.get("ETD", "")).strip(),
                 "STATE":         _state_from_row(row),   # destination state from file
                 "CITY":          str(row.get("CITY", "")).strip(),
+                "DISTANCE":      str(row.get("DISTANCE", "")).strip(),
                 "REMARKS":       _remarks_raw,
                 "GPS_LAT":       _gps_lat,
                 "GPS_LON":       _gps_lon,

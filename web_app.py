@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import io
+from datetime import datetime
 
 import pandas as pd
 from flask import (
@@ -353,6 +354,7 @@ def _board_json(sess) -> dict:
             "route": route,
             "customer": str(it.get("CUSTOMER NAME", "")),
             "weight": weight,
+            "distance": str(it.get("DISTANCE", "")),
             "date": str(it.get("DATE", "")),
             "remarks": str(_rm) if pd.notna(_rm := it.get("REMARKS")) else "",
             "lorry": assigned_plate,
@@ -365,8 +367,26 @@ def _board_json(sess) -> dict:
         elif assigned_plate not in caps and assigned_plate in _all_caps:
             caps[assigned_plate] = _all_caps[assigned_plate]
 
+    # Aging breakdown for the unassigned pool: how many unassigned DOs are
+    # more than N days past their own DATE — cumulative thresholds (a DO
+    # 10 days old counts toward over3, over5, AND over7), so each number
+    # answers "how many are at least this stale" on its own.
+    _aging = {"over3": 0, "over5": 0, "over7": 0}
+    _today_ts = pd.Timestamp(datetime.now().date())
+    for _o in orders:
+        if _o["lorry"]:
+            continue
+        _dt = pd.to_datetime(_o["date"], dayfirst=True, errors="coerce")
+        if pd.isna(_dt):
+            continue
+        _age = (_today_ts - _dt).days
+        if _age > 7: _aging["over7"] += 1
+        if _age > 5: _aging["over5"] += 1
+        if _age > 3: _aging["over3"] += 1
+
     return {
         "orders": orders,
+        "aging": _aging,
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
         "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates}
                     for p, c in sorted(caps.items())],
@@ -1337,6 +1357,10 @@ _PAGE = r"""<!doctype html>
   .board-route-body{display:none;flex-direction:column;gap:6px;padding:2px 8px 8px}
   .board-route.open .board-route-body{display:flex}
   .board-lanes-tools{display:flex;gap:8px;margin-bottom:10px}
+  .board-pool-aging{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .board-pool-aging .aging-pill{font-size:11px;font-weight:700;color:var(--bad);
+    background:color-mix(in srgb, var(--bad) 14%, var(--card2));border:1px solid var(--bad);
+    border-radius:20px;padding:3px 10px}
   .mini-btn{background:var(--card2);border:1px solid var(--line);color:var(--muted);
     border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer}
   .mini-btn:hover{color:var(--ink);border-color:var(--brand)}
@@ -1392,6 +1416,8 @@ _PAGE = r"""<!doctype html>
     color:var(--brand);font-size:12px}
   .board-card .b-code{font-family:ui-monospace,Menlo,monospace;font-weight:700;
     color:var(--ink);font-size:12px}
+  .board-card .b-dist{font-family:ui-monospace,Menlo,monospace;font-weight:600;
+    color:var(--muted);font-size:11px}
   .board-card .b-kg{margin-left:auto;font-family:ui-monospace,Menlo,monospace;
     font-weight:700;font-size:12px;color:var(--ok);flex-shrink:0}
   .board-card .b-delete{display:inline-flex;align-items:center;justify-content:center;
@@ -1585,6 +1611,7 @@ _PAGE = r"""<!doctype html>
           <button class="mini-btn" id="board-pool-collapse-all">Collapse all routes</button>
           <button class="mini-btn" id="board-pool-expand-all">Expand all</button>
         </div>
+        <div class="board-pool-aging" id="board-pool-aging"></div>
         <div id="board-routes"></div>
       </section>
       <div class="board-divider"></div>
@@ -2304,7 +2331,7 @@ function boardCardEl(o){
   el.innerHTML=`
     <span class="b-stripe" style="background:${color}"></span>
     <div class="b-body">
-      <div class="b-top"><span class="b-id">${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
+      <div class="b-top"><span class="b-id">${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}${o.distance?`<span class="b-dist">${esc(o.distance)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
@@ -2358,6 +2385,13 @@ function renderBoard(){
     wrap.appendChild(div);
   });
   $('#board-pool-label').textContent=`UNASSIGNED · ${totalUn} DO${totalUn===1?'':'s'}`;
+  const _aging=BOARD.aging||{};
+  const _agingParts=[
+    _aging.over7?`<span class="aging-pill">More than 7 days: ${_aging.over7} DO${_aging.over7===1?'':'s'}</span>`:'',
+    _aging.over5?`<span class="aging-pill">More than 5 days: ${_aging.over5} DO${_aging.over5===1?'':'s'}</span>`:'',
+    _aging.over3?`<span class="aging-pill">More than 3 days: ${_aging.over3} DO${_aging.over3===1?'':'s'}</span>`:'',
+  ].filter(Boolean);
+  $('#board-pool-aging').innerHTML=_agingParts.join('');
   const totalAssigned = BOARD.orders.filter(o=>o.lorry).length;
   $('#board-assigned-stat').innerHTML = `Assigned <b>${totalAssigned}</b> / ${BOARD.orders.length} DO${BOARD.orders.length===1?'':'s'}`;
 
@@ -2369,7 +2403,8 @@ function renderBoard(){
     const maximized = t.plate===boardMaximizedPlate;
     const list=boardOrdersOnLorry(t.plate);
     const load=boardSumKg(list);
-    const pct=t.capacity?Math.min(100,Math.round(load/t.capacity*100)):0;
+    const pctReal=t.capacity?Math.round(load/t.capacity*100):0;
+    const pct=Math.min(100,pctReal);   // bar fill stays capped at 100%; text below shows the real number
     const over=t.capacity && load>t.capacity;
     const fillClass= over?'over': pct>=85?'hi':'';
     const collapsed=!maximized && boardCollapsedLanes.has(t.plate);
@@ -2384,7 +2419,7 @@ function renderBoard(){
         <button class="lane-toggle${isOn?'':' off'}" title="${isOn?'Available today — click to turn off':'Not available today — click to turn on'}"></button>
         <button class="lane-max-btn" title="${maximized?'Minimize':'Maximize — focus assigning on this lorry'}">${maximized?'&#10529;':'&#10530;'}</button>
         <span class="board-lane-count">${list.length} DO${list.length===1?'':'s'}</span>
-        <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</span>
+        <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}${t.capacity!=null?' &middot; '+pctReal+'%':''}</span>
       </div>
       <div class="board-lane-naik">naik limit ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</div>
       <div class="board-cap-track"><div class="board-cap-fill ${fillClass}" style="width:${pct}%"></div></div>
