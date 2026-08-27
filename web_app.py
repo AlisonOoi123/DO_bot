@@ -915,6 +915,18 @@ def api_picking_list():
             "date": str(it.get("DATE", "")),
             "checked": do_num not in unpicked,
         })
+    # Date first (earliest-due first), then DO number, then customer code,
+    # then route code — a stable, predictable reading order for the
+    # checklist rather than whatever order the engine happened to build
+    # items in. Date is parsed for the sort key only (dayfirst, matching
+    # every other date parse in this app) so e.g. "5-1-2026" sorts before
+    # "12-1-2026"; an unparseable date sorts last rather than breaking the
+    # whole sort.
+    def _picking_sort_key(r):
+        _dt = pd.to_datetime(r["date"], dayfirst=True, errors="coerce")
+        _date_key = _dt if pd.notna(_dt) else pd.Timestamp.max
+        return (_date_key, r["do"], r["code"], r["route"])
+    rows.sort(key=_picking_sort_key)
     return _with_cookie({"rows": rows}, sid)
 
 
