@@ -1549,13 +1549,22 @@ async function autoLoadPlanner(user, autoFetch){
       const dm = await (await fetch('/api/master-default')).json();
       if(dm.error){ setMsg('#login-msg', dm.error, true); return; }
       const dg = await jpost('/api/master-grid',{rows: dm.rows||[]});
+      if(dg.error){
+        // A real server error (crash) — surface it right here, in the same
+        // screen every user sees, instead of silently switching to the old
+        // editable-grid layout (that's for a genuine data conflict below,
+        // not a bug — switching layouts on a crash just hides the error).
+        setMsg('#login-msg', dg.error, true);
+        return;
+      }
       if(!dg.ok){
-        // Rare: e.g. the same plate marked Available for two planners today.
-        // Needs a human to fix — drop into the editable grid instead of
-        // guessing which planner should keep it.
+        // Genuine data issue: e.g. the same plate marked Available for two
+        // planners today, or no Available lorries found at all. Needs a
+        // human to fix — drop into the editable grid so they can, instead
+        // of guessing which planner should keep a conflicting plate.
         setMsg('#login-msg', null);
         show('#card-master', true); loadMasterGrid();
-        setMsg('#master-msg', dg.messages||dg.error||'Please review and continue.', true);
+        setMsg('#master-msg', dg.messages||'Please review and continue.', true);
         return;
       }
     }

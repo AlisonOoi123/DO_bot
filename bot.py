@@ -1290,7 +1290,17 @@ def get_unavailable_plates_for(user: str) -> set:
     eligible fleet when it's (re)built at login."""
     user = user.strip().upper()
     state = _load_lorry_toggle()
-    return {p for p, us in state.get("off_for", {}).items() if user in us}
+    off_for = state.get("off_for", {})
+    if not isinstance(off_for, dict):
+        return set()
+    out = set()
+    for p, us in off_for.items():
+        try:
+            if user in us:
+                out.add(p)
+        except TypeError:
+            continue   # malformed entry (e.g. not a list) — ignore it, don't crash login
+    return out
 
 
 def set_plate_toggle(plate: str, user: str, on: bool) -> None:
