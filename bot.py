@@ -1294,8 +1294,78 @@ def _load_lorry_toggle() -> dict:
 
 def _save_lorry_toggle(state: dict):
     state["off_for"] = {p: sorted(set(us)) for p, us in state.get("off_for", {}).items() if us}
+    if not isinstance(state.get("holder"), dict):
+        state["holder"] = {}
     with open(LORRY_TOGGLE_PATH, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def get_plate_holder(plate: str, default_owner: str) -> str:
+    """Who has this plate for today: 'ABI', 'VIVIAN', or 'STAGING' (parked
+    in the shared staging pool, unclaimed by either). default_owner is the
+    plate's own owner from the master file ('SPARE' for a shared plate, or
+    the planner it normally belongs to) — used only when nothing has been
+    explicitly dragged/claimed today. A SPARE plate defaults to STAGING; any
+    other plate defaults to its own owner, never STAGING, unless a planner
+    has voluntarily parked it there."""
+    plate = plate.strip().upper()
+    state = _load_lorry_toggle()
+    holder_map = state.get("holder")
+    if isinstance(holder_map, dict):
+        override = holder_map.get(plate)
+        if override in ("ABI", "VIVIAN", "STAGING"):
+            return override
+    default_owner = str(default_owner).strip().upper()
+    return "STAGING" if default_owner == "SPARE" else default_owner
+
+
+def set_plate_holder(plate: str, new_holder: str) -> None:
+    """Move a plate to a new holder for today: 'ABI', 'VIVIAN', or
+    'STAGING'. Used by the staging-station drag-and-drop — claiming a plate
+    from staging, or releasing one of your own plates into staging so the
+    other planner (or you, later) can pick it up."""
+    plate = plate.strip().upper()
+    new_holder = new_holder.strip().upper()
+    if new_holder not in ("ABI", "VIVIAN", "STAGING"):
+        return
+    state = _load_lorry_toggle()
+    holder_map = state.get("holder")
+    if not isinstance(holder_map, dict):
+        holder_map = {}
+    holder_map[plate] = new_holder
+    state["holder"] = holder_map
+    _save_lorry_toggle(state)
+
+
+def set_staging_plate_broken(plate: str, broken: bool) -> None:
+    """Mark a staging-pool plate broken/fixed for BOTH planners at once —
+    distinct from the per-planner on/off toggle, since a plate sitting
+    unclaimed in staging isn't "mine" to switch off for just myself; broken
+    needs to be visible (and enforced) for whichever planner claims it
+    next. Bypasses set_plate_toggle's SPARE mutual-exclusion side effect
+    (which would otherwise fight itself when applied to both planners in
+    sequence)."""
+    plate = plate.strip().upper()
+    state = _load_lorry_toggle()
+    off_for = state.setdefault("off_for", {})
+    plate_off = set(off_for.get(plate, []))
+    if broken:
+        plate_off |= set(_MASTER_FILE_USERS)
+    else:
+        plate_off -= set(_MASTER_FILE_USERS)
+    off_for[plate] = sorted(plate_off)
+    _save_lorry_toggle(state)
+
+
+def is_staging_plate_broken(plate: str) -> bool:
+    plate = plate.strip().upper()
+    state = _load_lorry_toggle()
+    off_for = state.get("off_for", {})
+    plate_off = off_for.get(plate, []) if isinstance(off_for, dict) else []
+    try:
+        return set(_MASTER_FILE_USERS) <= set(plate_off)
+    except TypeError:
+        return False
 
 
 def get_unavailable_plates_for(user: str) -> set:
@@ -1354,24 +1424,16 @@ def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
         return {"error": "not_logged_in", "message": "Please pick a planner first."}
     plate = plate.strip().upper()
     set_plate_toggle(plate, user, on)
+    # Rebuild eligible_lorries (and _my_zone_fleet/_staging_fleet) from the
+    # current holder + toggle state — a plate only actually reappears here
+    # if this planner is its current holder (own plate, or a SPARE/staged
+    # one they've claimed); one outside their fleet, or currently held by
+    # the other planner, is never a valid drop target, toggle or not.
+    refresh_eligible_from_toggle(sess)
 
-    el = engine.eligible_lorries
     unassigned_count = 0
     refilled_count = 0
     if on:
-        if "LORRY" in el.columns and plate not in set(el["LORRY"].str.upper()):
-            # Only re-add a plate that actually belongs to this planner's own
-            # fleet (own lorries + shared SPARE) — captured in _full_fleet
-            # before any toggle-filtering. A plate outside that fleet (e.g.
-            # BIG/SELAYANG, or the other planner's own lorry) is never a valid
-            # drop target for this user, toggle or not.
-            _fleet_tons = {str(p).strip().upper(): t for p, t in sess.get("_full_fleet") or []}
-            _ton = _fleet_tons.get(plate)
-            if _ton is not None:
-                engine.eligible_lorries = pd.concat([
-                    el, pd.DataFrame([{"LORRY": plate, "TON": _ton, "USER": user, "Status": "Available"}])
-                ], ignore_index=True)
-
         # Try to restore whatever this plate was carrying when it got turned
         # off — only DOs that are still sitting unassigned AND still fit
         # capacity-wise. These DOs were already validated as compatible
@@ -1409,8 +1471,6 @@ def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
                     do["TOTAL_TON"] = round(sum(x["WEIGHT"] for x in do["ITEMS"]), 3)
                 sess.pop("export_bytes", None)
     else:
-        if "LORRY" in el.columns:
-            engine.eligible_lorries = el[el["LORRY"].str.upper() != plate].reset_index(drop=True)
         _evicted_dos = []
         for it in sess.get("items", []) or []:
             if str(it.get("LORRY", "")).strip().upper() == plate:
@@ -1428,25 +1488,44 @@ def toggle_lorry_availability(sess, plate: str, on: bool) -> dict:
 
 
 def refresh_eligible_from_toggle(sess) -> None:
-    """Rebuild engine.eligible_lorries from this session's full fleet, applying
-    today's LIVE on/off toggle state fresh.
+    """Rebuild engine.eligible_lorries — and this session's board-visible
+    fleet views (_my_zone_fleet, _staging_fleet) — from LIVE holder/toggle
+    state, fresh, every time.
 
-    A toggle mutates eligible_lorries directly for whichever session actually
-    clicked it, but a shared SPARE plate's other planner may already have a
-    session open with its own (now-stale) eligible_lorries snapshot — e.g.
-    ABI turns WA6899M on right as VIVIAN is mid-setup; VIVIAN's session never
-    saw that write. Calling this right before an assignment run makes the
-    eligible fleet always reflect the current toggle state (including
-    another planner's claim on a shared SPARE) regardless of when either
-    session last touched it, so two planners can't both get handed the same
-    SPARE lorry by assigning at the same time."""
+    A toggle or a staging claim/release mutates state directly for whichever
+    session actually clicked it, but the OTHER planner may already have a
+    session open with its own (now-stale) snapshot — e.g. ABI claims
+    WA6899M right as VIVIAN is mid-setup; VIVIAN's session never saw that
+    write. Calling this right before an assignment run (or after any
+    toggle/claim/release) makes the eligible fleet always reflect the
+    current state regardless of when either session last touched it, so two
+    planners can't both get handed the same SPARE lorry, or both think a
+    plate the other just claimed is still theirs to use.
+
+    _my_zone_fleet = plates this planner currently holds (on or off — the
+    board still shows an off one, just dimmed with a working switch).
+    _staging_fleet = plates parked in the shared, unclaimed pool this
+    planner could drag into their own zone. A plate the OTHER planner holds
+    appears in neither — it's simply not visible on this planner's screen."""
     engine = sess.get("engine")
     user = sess.get("user_id")
     full_fleet = sess.get("_full_fleet")
+    owners = sess.get("_plate_default_owner") or {}
     if engine is None or not user or full_fleet is None:
         return
     _off = get_unavailable_plates_for(user)
-    _assignable = [(p, t) for p, t in full_fleet if str(p).strip().upper() not in _off]
+    _my_zone, _staging = [], []
+    for p, t in full_fleet:
+        pu = str(p).strip().upper()
+        holder = get_plate_holder(pu, owners.get(pu, user))
+        if holder == user:
+            _my_zone.append((p, t))
+        elif holder == "STAGING":
+            _staging.append((p, t))
+        # else: held by the other planner — not shown on this session at all
+    sess["_my_zone_fleet"] = _my_zone
+    sess["_staging_fleet"] = _staging
+    _assignable = [(p, t) for p, t in _my_zone if str(p).strip().upper() not in _off]
     # Explicit columns matter even (especially) when _assignable is empty —
     # pd.DataFrame([]) with no rows has NO columns at all, so every plate
     # toggled off would leave eligible_lorries schema-less and crash the
@@ -1456,6 +1535,57 @@ def refresh_eligible_from_toggle(sess) -> None:
          for p, t in sorted(_assignable)],
         columns=["LORRY", "TON", "USER", "Status"]
     )
+
+
+def claim_or_release_plate(sess, plate: str, action: str) -> dict:
+    """Staging-station drag-and-drop: 'claim' pulls an unclaimed plate from
+    staging into this planner's own zone; 'release' parks one of this
+    planner's own plates into staging for the other planner (or themselves,
+    later) to pick up. Only the 4 SPARE plates start in staging, but ANY
+    plate — including a planner's own — can be voluntarily released there."""
+    user = sess.get("user_id")
+    engine = sess.get("engine")
+    if not user or engine is None:
+        return {"error": "not_logged_in", "message": "Please pick a planner first."}
+    plate = plate.strip().upper()
+    owners = sess.get("_plate_default_owner") or {}
+    full_fleet = sess.get("_full_fleet") or []
+    _known = {str(p).strip().upper() for p, _ in full_fleet}
+    if plate not in _known:
+        return {"error": "unknown_plate",
+                "message": f"{plate} isn't part of your fleet or the staging pool."}
+    current = get_plate_holder(plate, owners.get(plate, user))
+    if action == "claim":
+        if current != "STAGING":
+            return {"error": "not_available",
+                    "message": f"{plate} is currently with {current}, not in staging."}
+        set_plate_holder(plate, user)
+    elif action == "release":
+        if current != user:
+            return {"error": "not_yours",
+                    "message": f"{plate} isn't currently yours to release."}
+        set_plate_holder(plate, "STAGING")
+    else:
+        return {"error": "bad_action", "message": "action must be 'claim' or 'release'."}
+    refresh_eligible_from_toggle(sess)
+    return {"ok": True, "plate": plate, "action": action}
+
+
+def toggle_staging_broken(sess, plate: str, broken: bool) -> dict:
+    """Mark a plate currently parked in staging broken/fixed for both
+    planners at once — a staging plate isn't "mine" to switch off just for
+    myself, and a broken lorry needs to stay visibly broken no matter which
+    planner looks at (or later claims) it."""
+    user = sess.get("user_id")
+    if not user:
+        return {"error": "not_logged_in", "message": "Please pick a planner first."}
+    plate = plate.strip().upper()
+    owners = sess.get("_plate_default_owner") or {}
+    if get_plate_holder(plate, owners.get(plate, user)) != "STAGING":
+        return {"error": "not_staged", "message": f"{plate} isn't in staging right now."}
+    set_staging_plate_broken(plate, broken)
+    refresh_eligible_from_toggle(sess)
+    return {"ok": True, "plate": plate, "broken": broken}
 
 
 def _spare_plates(engine) -> set:
@@ -2789,29 +2919,34 @@ def _handle_master_upload(phone, sess, file_bytes):
         clear_specific_plates_from_log(_mine_in_log)
     sess["unavailable"] = set(get_assigned_today()) | set(get_broken_lorries())
 
-    # Keep the FULL per-user fleet (before toggle-filtering) so the board can
-    # still render a lane — with a working switch — for a plate the user has
-    # toggled OFF. Only `eligible_lorries` (used for actual AI assignment)
-    # gets toggle-filtered below.
+    # Keep the FULL per-user fleet (own + SPARE, before holder/toggle
+    # filtering) so the board can still render a lane — with a working
+    # switch — for a plate the user has toggled OFF, and so staging
+    # claim/release has the complete candidate list to work from.
     sess["_full_fleet"] = list(my_fleet)
 
-    # A lorry this planner has toggled OFF today (board's on/off switch) is
-    # excluded from the ASSIGNABLE fleet — for a SPARE plate, turning it ON
-    # for the OTHER planner already forces it into this set (see
-    # set_plate_toggle), so it drops out here too.
-    _toggled_off = get_unavailable_plates_for(user)
-    _assignable_fleet = [(p, t) for p, t in my_fleet if p.upper() not in _toggled_off] if _toggled_off else my_fleet
+    # Each plate's OWN default owner (SPARE if shared with the other
+    # planner, else whichever single planner it belongs to) — the baseline
+    # the staging station's holder overrides layer on top of. Derived from
+    # per_user rather than re-parsing the file: a SPARE row was duplicated
+    # into BOTH planners' lists by _parse_master_lorry, so a plate in both
+    # is SPARE; a plate in only one list belongs to that one.
+    _abi_plates = {p.upper() for p, _ in per_user.get("ABI", [])}
+    _vivian_plates = {p.upper() for p, _ in per_user.get("VIVIAN", [])}
+    def _default_owner(p):
+        p = p.upper()
+        if p in _abi_plates and p in _vivian_plates:
+            return "SPARE"
+        if p in _abi_plates:
+            return "ABI"
+        if p in _vivian_plates:
+            return "VIVIAN"
+        return user
+    sess["_plate_default_owner"] = {p.upper(): _default_owner(p) for p, _ in my_fleet}
 
-    # Replace the engine's eligible fleet with TODAY's availability for this
-    # user. Explicit columns matter even when _assignable_fleet is empty (all
-    # of today's plates toggled off) — pd.DataFrame([]) with no rows has NO
-    # columns at all, leaving eligible_lorries schema-less and crashing the
-    # first thing that reads LORRY/TON/USER from it.
-    sess["engine"].eligible_lorries = pd.DataFrame(
-        [{"LORRY": p, "TON": t, "USER": user, "Status": "Available"}
-         for p, t in sorted(_assignable_fleet)],
-        columns=["LORRY", "TON", "USER", "Status"]
-    )
+    # Builds eligible_lorries plus this session's _my_zone_fleet/
+    # _staging_fleet board views from the live holder + on/off toggle state.
+    refresh_eligible_from_toggle(sess)
     sess["_master_uploaded"] = True
     sess["state"] = "AWAIT_TRIP_DAY"
     _cleared_note = (f"\n🗑️ Cleared *{user}*'s previous log ({len(_mine_in_log)} "

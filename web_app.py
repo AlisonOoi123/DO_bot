@@ -261,32 +261,41 @@ def _board_json(sess) -> dict:
             return None
         return v if pd.notna(v) and v not in (float("inf"), float("-inf")) else None
 
-    # Board lanes = the logged-in planner's OWN fleet (own lorries + shared
-    # SPARE) only — not the whole company's. Lanes are sourced from the FULL
-    # fleet (sess["_full_fleet"], captured before toggle-filtering), not from
-    # engine.eligible_lorries, so a plate the planner has toggled OFF still
-    # shows a lane (with a working switch) instead of disappearing. A plate
-    # that already has a DO on it from elsewhere (e.g. a manual table-view
-    # assignment onto a BIG/SELAYANG plate) still gets a lane so that
-    # assignment stays visible, even though it's not itself a drop target.
-    caps = {}
-    _full_fleet = sess.get("_full_fleet")
-    if _full_fleet:
-        for p, t in _full_fleet:
+    # Board lanes = the logged-in planner's OWN CURRENTLY-HELD fleet only —
+    # own plates plus any SPARE/staged one they've actually claimed for
+    # today, not the whole company's, and not a plate the other planner
+    # currently holds. Sourced from sess["_my_zone_fleet"] (computed by
+    # bot.refresh_eligible_from_toggle from live holder + toggle state), not
+    # engine.eligible_lorries directly, so a plate the planner has toggled
+    # OFF still shows a lane (with a working switch) instead of
+    # disappearing. A plate that already has a DO on it from elsewhere (e.g.
+    # a manual table-view assignment onto a BIG/SELAYANG plate) still gets a
+    # lane so that assignment stays visible, even though it's not itself a
+    # drop target.
+    def _caps_from_pairs(pairs):
+        out = {}
+        for p, t in pairs or []:
             try:
                 v = float(t)
             except (TypeError, ValueError):
                 continue
             if pd.notna(v) and v not in (float("inf"), float("-inf")):
-                caps[str(p).strip().upper()] = v
-    elif engine is not None and getattr(engine, "eligible_lorries", None) is not None:
-        try:
-            for _, r in engine.eligible_lorries.iterrows():
-                v = _finite_ton(r)
-                if v is not None:
-                    caps[str(r["LORRY"]).strip().upper()] = v
-        except Exception:
-            caps = {}
+                out[str(p).strip().upper()] = v
+        return out
+
+    caps = _caps_from_pairs(sess.get("_my_zone_fleet"))
+    if not caps and sess.get("_my_zone_fleet") is None:
+        # Fallback only if the holder-aware fleet was never computed for
+        # this session (shouldn't normally happen post-login).
+        if engine is not None and getattr(engine, "eligible_lorries", None) is not None:
+            try:
+                for _, r in engine.eligible_lorries.iterrows():
+                    v = _finite_ton(r)
+                    if v is not None:
+                        caps[str(r["LORRY"]).strip().upper()] = v
+            except Exception:
+                caps = {}
+    staging_caps = _caps_from_pairs(sess.get("_staging_fleet"))
     _off_plates = set()
     try:
         _off_plates = bot.get_unavailable_plates_for(sess.get("user_id") or "")
@@ -331,6 +340,12 @@ def _board_json(sess) -> dict:
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
         "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates}
                     for p, c in sorted(caps.items())],
+        # Shared staging pool: plates parked unclaimed (the 4 SPARE plates
+        # by default, or anything either planner has voluntarily released)
+        # that this planner could drag into their own lane list above.
+        # Never used for assignment until claimed — see claim_or_release_plate.
+        "staging": [{"plate": p, "capacity": c, "broken": bot.is_staging_plate_broken(p)}
+                    for p, c in sorted(staging_caps.items())],
     }
 
 
@@ -744,14 +759,16 @@ def api_trip_session():
 
 @app.route("/api/lorry-toggles")
 def api_lorry_toggles():
-    """This planner's own fleet with today's on/off state — used by the setup
-    screen so lorries can be turned off BEFORE fetching/assigning, not just
-    from the board afterwards. Works even before any DOs are loaded."""
+    """This planner's own fleet + the shared staging pool, with today's
+    on/off and claim state — used by the setup screen so lorries can be
+    turned off/claimed BEFORE fetching/assigning, not just from the board
+    afterwards. Works even before any DOs are loaded."""
     sid = _sid()
     sess = bot.get_session(sid)
     if not sess.get("engine"):
-        return _with_cookie({"lorries": []}, sid)
-    return _with_cookie({"lorries": _board_json(sess)["lorries"]}, sid)
+        return _with_cookie({"lorries": [], "staging": []}, sid)
+    _b = _board_json(sess)
+    return _with_cookie({"lorries": _b["lorries"], "staging": _b["staging"]}, sid)
 
 
 @app.route("/api/board")
@@ -813,6 +830,45 @@ def api_board_toggle_lorry():
     if not plate:
         return _with_cookie({"error": "Missing 'plate'."}, sid, 400)
     outcome = bot.toggle_lorry_availability(sess, plate, on)
+    if not outcome.get("ok"):
+        return _with_cookie(outcome, sid, 400)
+    outcome["board"] = _board_json(sess)
+    return _with_cookie(outcome, sid)
+
+
+@app.route("/api/board/claim-plate", methods=["POST"])
+def api_board_claim_plate():
+    """Staging-station drag-and-drop: pull an unclaimed plate from the
+    shared staging pool into this planner's own lane list ('claim'), or
+    park one of this planner's own plates into staging for the other
+    planner to pick up ('release')."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    body = request.json or {}
+    plate = str(body.get("plate", "")).strip()
+    action = body.get("action")
+    if not plate or action not in ("claim", "release"):
+        return _with_cookie({"error": "Missing 'plate' or invalid 'action'."}, sid, 400)
+    outcome = bot.claim_or_release_plate(sess, plate, action)
+    if not outcome.get("ok"):
+        return _with_cookie(outcome, sid, 400)
+    outcome["board"] = _board_json(sess)
+    return _with_cookie(outcome, sid)
+
+
+@app.route("/api/board/staging-broken", methods=["POST"])
+def api_board_staging_broken():
+    """Mark a staging-pool plate broken/fixed — visible to both planners at
+    once, since a plate parked unclaimed in staging isn't "mine" to switch
+    off just for myself."""
+    sid = _sid()
+    sess = bot.get_session(sid)
+    body = request.json or {}
+    plate = str(body.get("plate", "")).strip()
+    broken = bool(body.get("broken"))
+    if not plate:
+        return _with_cookie({"error": "Missing 'plate'."}, sid, 400)
+    outcome = bot.toggle_staging_broken(sess, plate, broken)
     if not outcome.get("ok"):
         return _with_cookie(outcome, sid, 400)
     outcome["board"] = _board_json(sess)
@@ -1094,7 +1150,26 @@ _PAGE = r"""<!doctype html>
     border:1px solid var(--line);background:var(--card2);color:var(--ink);font-size:14px}
   .tp-section-label{font-size:13.5px;color:var(--muted);margin:0 0 8px}
   .tp-toggle-section{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
-  .tp-toggle-grid{display:flex;flex-wrap:wrap;gap:8px}
+  .tp-toggle-grid{display:flex;flex-wrap:wrap;gap:8px;min-height:40px;border-radius:10px;
+    transition:box-shadow .12s}
+  .tp-toggle-grid.tpzone-active{box-shadow:0 0 0 2px rgba(56,189,248,.45)}
+  .tp-staging-station{background:var(--card2);border:1px dashed var(--line);border-radius:12px;
+    padding:12px;margin-bottom:14px;transition:box-shadow .12s,border-color .12s}
+  .tp-staging-station.tpzone-active{border-color:var(--brand);box-shadow:0 0 0 2px rgba(56,189,248,.35)}
+  .tp-staging-label{font-size:12px;font-weight:700;letter-spacing:.04em;color:var(--muted);
+    margin-bottom:8px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .tp-staging-hint{font-size:11px;font-weight:400;color:var(--muted);opacity:.75}
+  .tp-staging-grid{display:flex;flex-wrap:wrap;gap:8px;min-height:36px}
+  .tp-staging-grid:empty::after{content:'Nothing parked here right now';color:var(--muted);
+    font-size:12.5px;font-style:italic;opacity:.6}
+  .tp-toggle-chip{cursor:grab;touch-action:none}
+  .tp-toggle-chip.tp-dragging{opacity:.35}
+  .tp-toggle-chip.tp-broken{border-color:var(--bad)}
+  .tp-toggle-chip .tp-broken-tag{color:var(--bad);font-size:10px;font-weight:700;margin-left:2px}
+  .tp-chip-ghost{position:fixed;transform:translate(-50%,-120%);display:flex;gap:6px;
+    align-items:center;background:var(--card2);border:1px solid var(--brand);border-radius:8px;
+    padding:7px 12px;pointer-events:none;box-shadow:0 8px 24px rgba(0,0,0,.4);
+    font-size:12.5px;font-family:ui-monospace,Menlo,monospace;z-index:999}
   .tp-toggle-chip{display:flex;align-items:center;gap:7px;padding:7px 10px;border-radius:8px;
     border:1px solid var(--line);background:var(--card2);font-size:12.5px;
     font-family:ui-monospace,Menlo,monospace}
@@ -1270,8 +1345,15 @@ _PAGE = r"""<!doctype html>
       </label>
     </div>
     <div class="tp-toggle-section hidden" id="tp-toggle-section">
-      <p class="tp-section-label">2&#41; Lorries available today &mdash; turn off any not running:</p>
-      <div class="tp-toggle-grid" id="tp-toggle-grid"></div>
+      <p class="tp-section-label">2&#41; Lorries available today &mdash; drag a plate into Staging to share it,
+        drag one out to claim it, or turn off any not running:</p>
+      <div class="tp-staging-station" data-tpzone="STAGING" id="tp-staging-station">
+        <div class="tp-staging-label">🅿️ STAGING STATION
+          <span class="tp-staging-hint">shared &mdash; drag a plate here to lend it, drag one out to claim it</span>
+        </div>
+        <div class="tp-staging-grid" id="tp-staging-grid"></div>
+      </div>
+      <div class="tp-toggle-grid" data-tpzone="MINE" id="tp-toggle-grid"></div>
     </div>
     <div class="tp-day-row hidden" id="tp-day-row">
       <div>
@@ -1622,27 +1704,102 @@ async function autoLoadPlanner(user, autoFetch){
   }
 }
 
+let LAST_TOGGLES = null;
+
+function tpChipHtml(l, zone){
+  if(zone==='STAGING'){
+    const broken = !!l.broken;
+    return `<span class="tp-toggle-chip${broken?' tp-broken':''}" data-plate="${esc(l.plate)}" data-tphome="STAGING">`+
+      `<button class="lane-toggle${broken?' off':''}" title="${broken?'Marked broken — click to mark fixed':'Working — click to mark broken'}"></button>`+
+      `${esc(l.plate)}${broken?'<span class="tp-broken-tag">BROKEN</span>':''}</span>`;
+  }
+  const on = l.on !== false;
+  return `<span class="tp-toggle-chip" data-plate="${esc(l.plate)}" data-tphome="MINE">`+
+    `<button class="lane-toggle${on?'':' off'}" title="${on?'Available — click to turn off':'Not available — click to turn on'}"></button>`+
+    `${esc(l.plate)}</span>`;
+}
+
 async function loadLorryToggles(){
   const d = await (await fetch('/api/lorry-toggles', {credentials:'same-origin'})).json();
+  LAST_TOGGLES = d;
+  renderLorryToggles();
+}
+
+function renderLorryToggles(){
+  const d = LAST_TOGGLES;
   const grid = $('#tp-toggle-grid');
-  if(!d.lorries || !d.lorries.length){ grid.innerHTML = '<span style="color:var(--muted);font-size:12.5px">No lorries loaded yet.</span>'; return; }
-  grid.innerHTML = d.lorries.map(l=>{
-    const on = l.on !== false;
-    return `<span class="tp-toggle-chip" data-plate="${esc(l.plate)}">`+
-      `<button class="lane-toggle${on?'':' off'}" title="${on?'Available — click to turn off':'Not available — click to turn on'}"></button>`+
-      `${esc(l.plate)}</span>`;
-  }).join('');
-  grid.querySelectorAll('.tp-toggle-chip').forEach(chip=>{
-    chip.querySelector('.lane-toggle').onclick = async()=>{
+  const stagingGrid = $('#tp-staging-grid');
+  if(!d || (!d.lorries?.length && !d.staging?.length)){
+    grid.innerHTML = '<span style="color:var(--muted);font-size:12.5px">No lorries loaded yet.</span>';
+    stagingGrid.innerHTML = '';
+    return;
+  }
+  grid.innerHTML = (d.lorries||[]).map(l=>tpChipHtml(l,'MINE')).join('');
+  stagingGrid.innerHTML = (d.staging||[]).map(l=>tpChipHtml(l,'STAGING')).join('');
+
+  document.querySelectorAll('#tp-toggle-grid .tp-toggle-chip, #tp-staging-grid .tp-toggle-chip').forEach(chip=>{
+    const home = chip.dataset.tphome;
+    chip.querySelector('.lane-toggle').onclick = async(e)=>{
+      e.stopPropagation();
       const btn = chip.querySelector('.lane-toggle');
       const turningOn = btn.classList.contains('off');
-      // Shared with the board's own lane switches — so whichever one the
-      // user clicks, both this grid AND the board (if already showing)
-      // reflect the change immediately, not just on next reload.
-      await toggleLorry(chip.dataset.plate, turningOn);
+      if(home==='STAGING'){
+        await jpost('/api/board/staging-broken', {plate: chip.dataset.plate, broken: !turningOn});
+        if(BOARD) await loadBoard(); else await loadLorryToggles();
+      } else {
+        // Shared with the board's own lane switches — so whichever one the
+        // user clicks, both this grid AND the board (if already showing)
+        // reflect the change immediately, not just on next reload.
+        await toggleLorry(chip.dataset.plate, turningOn);
+      }
     };
+    chip.addEventListener('pointerdown', e=>{
+      if(e.target.closest('.lane-toggle')) return;
+      startChipDrag(e, chip.dataset.plate, home);
+    });
   });
 }
+
+// ---- Staging-station drag-and-drop (own pointer-based mechanism, shared
+// zones marked with data-tpzone="MINE"/"STAGING" on the two containers) ----
+let chipDrag=null, chipGhost=null;
+function startChipDrag(e, plate, fromZone){
+  e.preventDefault();
+  chipDrag = {plate, fromZone};
+  chipGhost = document.createElement('div');
+  chipGhost.className = 'tp-chip-ghost';
+  chipGhost.textContent = plate;
+  document.body.appendChild(chipGhost);
+  moveChipGhost(e.clientX, e.clientY);
+  document.querySelectorAll(`#tp-toggle-grid .tp-toggle-chip[data-plate="${plate}"], #tp-staging-grid .tp-toggle-chip[data-plate="${plate}"]`)
+    .forEach(c=>c.classList.add('tp-dragging'));
+}
+function moveChipGhost(x,y){ if(chipGhost){ chipGhost.style.left=x+'px'; chipGhost.style.top=y+'px'; } }
+document.addEventListener('pointermove', e=>{
+  if(!chipDrag) return;
+  moveChipGhost(e.clientX, e.clientY);
+  document.querySelectorAll('.tpzone-active').forEach(el=>el.classList.remove('tpzone-active'));
+  const z = document.elementsFromPoint(e.clientX, e.clientY).find(el=>el.closest?.('[data-tpzone]'));
+  const zoneEl = z ? z.closest('[data-tpzone]') : null;
+  if(zoneEl) zoneEl.classList.add('tpzone-active');
+});
+document.addEventListener('pointerup', async e=>{
+  if(!chipDrag) return;
+  const {plate, fromZone} = chipDrag;
+  chipDrag = null;
+  if(chipGhost){ chipGhost.remove(); chipGhost=null; }
+  document.querySelectorAll('.tpzone-active').forEach(el=>el.classList.remove('tpzone-active'));
+  document.querySelectorAll('.tp-dragging').forEach(el=>el.classList.remove('tp-dragging'));
+  const z = document.elementsFromPoint(e.clientX, e.clientY).find(el=>el.closest?.('[data-tpzone]'));
+  const zoneEl = z ? z.closest('[data-tpzone]') : null;
+  const toZone = zoneEl ? zoneEl.dataset.tpzone : null;
+  if(!toZone || toZone===fromZone) return;   // dropped nowhere, or back where it came from
+  const action = toZone==='MINE' ? 'claim' : 'release';
+  const d = await jpost('/api/board/claim-plate', {plate, action});
+  if(!d.ok){ boardToast(d.message||d.error||'Move failed'); await loadLorryToggles(); return; }
+  await loadLorryToggles();
+  if(BOARD) await loadBoard();
+});
 
 function setDayActive(day){
   $('#tp-day-today').classList.toggle('active', day==='today');
