@@ -185,6 +185,29 @@ def _load_user_route_prefixes(user: str) -> set | None:
         print(f"[_load_user_route_prefixes] Failed for {user}: {type(e).__name__}: {e}")
         return None
 
+
+def _route_belongs_to_user(pfx: str, user: str, abi_prefixes: set | None) -> bool:
+    """Whether route-prefix *pfx* is this user's route today.
+
+    ABI's 'ABI ROUTE' sheet is the one that actually gets kept up to date
+    as new route codes are added — VIVIAN's own 'VIVIAN ROUTE' sheet has
+    drifted behind it in practice (a new route added to ABI's sheet but
+    never mirrored to VIVIAN's), so checking VIVIAN against her OWN sheet
+    as a whitelist meant any route missing from it got excluded as
+    OTHER_USER, sometimes leaving her with nothing at all. VIVIAN's
+    coverage is instead defined as the complement of ABI's list — anything
+    not explicitly ABI's is treated as hers. abi_prefixes=None (ABI's sheet
+    itself unreadable) means no filtering at all — everyone sees everyone.
+    """
+    if abi_prefixes is None:
+        return True
+    user = user.strip().upper()
+    if user == "ABI":
+        return pfx in abi_prefixes
+    if user == "VIVIAN":
+        return pfx not in abi_prefixes
+    return True
+
 # _SCHD_DAY_MAP and _REMARKS_KEYWORD_DAY imported from assignment_config
 
 def _parse_remarks_days(remarks: str) -> set[int] | None:
@@ -3988,8 +4011,10 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # Route-code filtering: only assign rows whose route prefix belongs to
         # the logged-in user.  Rows for other users are kept in items (so they
         # appear in the export) but pre-marked as OTHER_USER so they get a
-        # blank LICENSE in the exported file.
-        _user_prefixes = _load_user_route_prefixes(sess.get("user_id", ""))
+        # blank LICENSE in the exported file.  See _route_belongs_to_user —
+        # ABI's route sheet is authoritative; VIVIAN owns whatever's left.
+        _abi_route_prefixes = _load_user_route_prefixes("ABI")
+        _upload_user = sess.get("user_id", "")
 
         # ── Schedule filter ──────────────────────────────────────────────────
         # User explicitly chose "Today" or "Tomorrow" at login.
@@ -4049,7 +4074,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
             _is_mine     = True
             _is_today    = True
 
-            if _user_prefixes and pfx and pfx not in _user_prefixes:
+            if pfx and not _route_belongs_to_user(pfx, _upload_user, _abi_route_prefixes):
                 _is_mine = False
                 _other_user_count += 1
 
