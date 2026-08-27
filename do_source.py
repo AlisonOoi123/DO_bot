@@ -175,8 +175,19 @@ ROUTE_MAP = {
     94: 'PK08 --> Taiping',
 }
 
-DRN_LIST = [25, 26, 27, 28, 29, 30, 31, 32, 37, 39, 40, 41, 45, 60, 61, 66, 67,
+# DRN_0 codes to fetch from the DB — restricted to routes either planner
+# actually handles (matches the two ROUTE sheets in LORRY DAILY PLANNING.xlsx),
+# not every DRN_0 value that exists (e.g. East Malaysia/other-state codes
+# neither ABI nor VIVIAN runs stay excluded). The query only ever fetched
+# ABI's codes (2026-08-27 fix) — VIVIAN's route sheet exists but her DOs were
+# never even pulled from the DB, so no amount of downstream route-ownership
+# filtering could produce anything for her. Widening this list to include
+# her known routes too is the actual fix; ABI's codes are unchanged.
+_ABI_DRN = [25, 26, 27, 28, 29, 30, 31, 32, 37, 39, 40, 41, 45, 60, 61, 66, 67,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 84, 85]
+_VIVIAN_DRN = [2, 3, 4, 5, 6, 23, 24, 33, 34, 35, 36, 68, 78, 79, 80, 81, 82,
+               83, 86, 87, 88, 89, 90, 92, 93, 94]
+DRN_LIST = sorted(set(_ABI_DRN) | set(_VIVIAN_DRN))
 
 # Set by fetch_delivery_report() on every call — a stage-by-stage row count
 # breakdown, so a 0-row result can be explained (which filter zeroed it out)
