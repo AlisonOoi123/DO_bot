@@ -9550,7 +9550,7 @@ def _export_result_inner(sess) -> list[str]:
         _add_date = _resolve_trip_day_date(sess.get("trip_day")).strftime("%-d/%-m/%Y")
     except Exception:
         _add_date = ""
-    _trip_label = str(sess.get("trip_session") or "Any")
+    _trip_label = str(sess.get("trip_session") or "1")
     if "TRIP" in out_df.columns:   # rare: the old per-lorry AM/PM TRIP marker
         out_df = out_df.drop(columns=["TRIP"])   # survived _orig_cols — ours wins
     _date_loc = out_df.columns.get_loc("DATE") + 1 if "DATE" in out_df.columns else 1

@@ -386,6 +386,7 @@ def _board_json(sess) -> dict:
     orders = []
     routes: dict[str, dict] = {}
     manual_only: dict[str, dict] = {}
+    _effective_mo_codes = _effective_manual_only_codes(sess)
     for it in items:
         lorry = it.get("LORRY")
         if lorry in _NOT_MINE_TODAY:
@@ -399,7 +400,7 @@ def _board_json(sess) -> dict:
         # all for a pool card the AI deliberately skipped rather than one it
         # just couldn't fit anywhere (NO_LORRY etc. show no reason tag).
         _reason = lorry if lorry in _SENTINELS and lorry not in ("NO_LORRY", "", None) else ""
-        _is_manual_only = code.strip().upper() in _MANUAL_ONLY_CODES
+        _is_manual_only = code.strip().upper() in _effective_mo_codes
         orders.append({
             "do": str(it.get("DO NUMBER", "")),
             "code": code,
@@ -842,13 +843,31 @@ def _reset_items_to_unassigned(sess: dict) -> None:
 _MANUAL_ONLY_CODES = {c.strip().upper() for c in MANUAL_ONLY_CUSTOMER_CODES}
 
 
+def _effective_manual_only_codes(sess: dict) -> set[str]:
+    """The base MANUAL_ONLY_CUSTOMER_CODES set, adjusted by this planner
+    session's own drag-and-drop overrides: dragging a manual-only group's
+    header out to the Unassigned pool releases it (False) so AI Assign may
+    fit it again; dragging any single DO onto the Manual Assign Only zone
+    flags its whole customer code (True) even if it isn't in the base
+    config. Overrides are per-session — they don't touch assignment_config.py."""
+    codes = set(_MANUAL_ONLY_CODES)
+    for code, forced in (sess.get("_manual_only_override") or {}).items():
+        if forced:
+            codes.add(code)
+        else:
+            codes.discard(code)
+    return codes
+
+
 def _force_manual_only_unassigned(sess: dict) -> None:
-    """DOs for MANUAL_ONLY_CUSTOMER_CODES must never carry a real plate —
-    even a fresh AI Assign run has to leave them for the planner to place by
-    hand. Same "undo at the web layer" approach as _reset_items_to_unassigned,
-    applied unconditionally (not just when deferring AI assignment)."""
+    """DOs for the effective manual-only customer codes must never carry a
+    real plate — even a fresh AI Assign run has to leave them for the
+    planner to place by hand. Same "undo at the web layer" approach as
+    _reset_items_to_unassigned, applied unconditionally (not just when
+    deferring AI assignment)."""
+    codes = _effective_manual_only_codes(sess)
     for it in sess.get("items", []) or []:
-        if str(it.get("CODE", "")).strip().upper() not in _MANUAL_ONLY_CODES:
+        if str(it.get("CODE", "")).strip().upper() not in codes:
             continue
         lorry = it.get("LORRY")
         if lorry and lorry not in _SENTINELS:
@@ -986,6 +1005,7 @@ def api_picking_list():
     sess = bot.get_session(sid)
     items = sess.get("items", []) or []
     unpicked = sess.get("_unpicked_dos") or set()
+    _effective_mo_codes = _effective_manual_only_codes(sess)
     rows = []
     for it in items:
         lorry = it.get("LORRY")
@@ -1004,7 +1024,7 @@ def api_picking_list():
             "weight": round(float(it.get("WEIGHT", 0) or 0), 3),
             "date": str(it.get("DATE", "")),
             "checked": do_num not in unpicked,
-            "special": code.strip().upper() in _MANUAL_ONLY_CODES,
+            "special": code.strip().upper() in _effective_mo_codes,
         })
     # Date first (earliest-due first), then DO number, then customer code,
     # then route code — a stable, predictable reading order for the
@@ -1100,15 +1120,16 @@ def api_assign_specific():
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/trip-session", methods=["POST"])
 def api_trip_session():
-    """Which trip of the day to assign for. "any" (default) applies no
-    filter; "1"/"2"/"3"/"4" excludes DOs whose REMARKS explicitly say a
-    different trip (a REMARKS with no trip-timing note is unaffected)."""
+    """Which trip of the day to assign for — always exactly one of
+    "1"/"2"/"3"/"4" (no "Any" option, by explicit request): excludes DOs
+    whose REMARKS explicitly say a different trip (a REMARKS with no
+    trip-timing note is unaffected)."""
     sid = _active_user_sid()
     sess = bot.get_session(sid)
-    session = str((request.json or {}).get("session", "any")).strip().lower()
-    if session not in ("any", "1", "2", "3", "4"):
+    session = str((request.json or {}).get("session", "1")).strip().lower()
+    if session not in ("1", "2", "3", "4"):
         return _with_cookie({"ok": False, "error": "Invalid session."}, sid, 400)
-    sess["trip_session"] = None if session == "any" else session
+    sess["trip_session"] = session
     return _with_cookie({"ok": True, "session": session}, sid)
 
 
@@ -1169,6 +1190,63 @@ def api_board_move_route():
         return _with_cookie(outcome, sid, 400)
     outcome["board"] = _board_json(sess)
     return _with_cookie(outcome, sid)
+
+
+@app.route("/api/board/mark-manual-only", methods=["POST"])
+def api_board_mark_manual_only():
+    """Drag a single DO card onto the 'MANUAL ASSIGN ONLY' zone: flags its
+    whole customer code as manual-only for this session — every DO sharing
+    that code (even ones already on a lorry) moves into the section
+    together, and AI Assign won't touch any of them until the group is
+    dragged back out to Unassigned."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    do_num = str((request.json or {}).get("do", "")).strip()
+    if not do_num:
+        return _with_cookie({"error": "Missing 'do'."}, sid, 400)
+    code = None
+    for it in sess.get("items", []) or []:
+        if str(it.get("DO NUMBER", "")).strip() == do_num:
+            code = str(it.get("CODE", "")).strip().upper()
+            break
+    if not code:
+        return _with_cookie({"ok": False, "error": "DO not found on this board."}, sid, 404)
+    overrides = sess.setdefault("_manual_only_override", {})
+    overrides[code] = True
+    for it in sess.get("items", []) or []:
+        if str(it.get("CODE", "")).strip().upper() != code:
+            continue
+        lorry = it.get("LORRY")
+        if lorry and lorry not in _SENTINELS:
+            it["LORRY"] = "NO_LORRY"
+    return _with_cookie({"ok": True, "code": code, "board": _board_json(sess)}, sid)
+
+
+@app.route("/api/board/move-code", methods=["POST"])
+def api_board_move_code():
+    """Drag a whole 'MANUAL ASSIGN ONLY' customer group by its header:
+    dropped on the Unassigned pool it releases the code (AI Assign may fit
+    it normally again); dropped on a lorry lane it manually assigns every
+    one of that code's DOs to that plate (a manual edit like any other —
+    a later AI Assign can still overwrite it). Either way the code is no
+    longer force-excluded, since the planner just placed it deliberately."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    body = request.json or {}
+    code = str(body.get("code", "")).strip().upper()
+    plate = body.get("lorry")
+    if not code:
+        return _with_cookie({"error": "Missing 'code'."}, sid, 400)
+    overrides = sess.setdefault("_manual_only_override", {})
+    overrides[code] = False
+    moved = 0
+    for it in sess.get("items", []) or []:
+        if str(it.get("CODE", "")).strip().upper() != code:
+            continue
+        it["LORRY"] = plate if plate else "NO_LORRY"
+        sess.setdefault("assigned", {})[str(it.get("DO NUMBER", ""))] = it["LORRY"]
+        moved += 1
+    return _with_cookie({"ok": True, "moved": moved, "board": _board_json(sess)}, sid)
 
 
 @app.route("/api/board/toggle-lorry", methods=["POST"])
@@ -1727,6 +1805,10 @@ _PAGE = r"""<!doctype html>
   .board-lane.collapsed .board-cap-track{margin-bottom:0}
   .board-lane.collapsed .board-lane-body,.board-lane.collapsed .board-lane-naik{display:none}
   .board-lane.zone-active{border-color:var(--brand);box-shadow:0 0 0 2px rgba(56,189,248,.35)}
+  .board-mo-zone{border-radius:10px;transition:box-shadow .15s}
+  .board-mo-zone.zone-active{box-shadow:0 0 0 2px #f59e0b}
+  .board-mo-zone .board-empty{border:1px dashed var(--line);border-radius:10px;
+    padding:14px;text-align:center;color:var(--muted);font-size:12.5px}
   .board-lane-head{display:flex;align-items:baseline;gap:7px;margin-bottom:2px;
     cursor:pointer;flex-wrap:wrap}
   .board-lane-chev{font-size:9px;color:var(--muted);transition:transform .15s;align-self:center}
@@ -1969,8 +2051,7 @@ _PAGE = r"""<!doctype html>
         <span class="board-plan-warn hidden" id="tp-day-late-warn" title="It's after 2pm — deliveries planned for today may be tight. Consider planning for tomorrow instead.">⚠️ After 2pm</span>
         <span class="board-plan-field" style="border:none;padding:0;background:none">Trip
           <span class="board-plan-trip-btns">
-            <button class="btn tp-trip-btn active" id="tp-trip-any" style="width:auto" data-tptrip="any">Any</button>
-            <button class="btn secondary tp-trip-btn" id="tp-trip-1" style="width:auto" data-tptrip="1">1</button>
+            <button class="btn tp-trip-btn active" id="tp-trip-1" style="width:auto" data-tptrip="1">1</button>
             <button class="btn secondary tp-trip-btn" id="tp-trip-2" style="width:auto" data-tptrip="2">2</button>
             <button class="btn secondary tp-trip-btn" id="tp-trip-3" style="width:auto" data-tptrip="3">3</button>
             <button class="btn secondary tp-trip-btn" id="tp-trip-4" style="width:auto" data-tptrip="4">4</button>
@@ -2176,7 +2257,7 @@ async function autoLoadPlanner(user, autoFetch){
       // of re-running the whole setup wizard, which would wipe it.
       setMsg('#login-msg', null);
       setDayDate(dl.trip_day || _todayISO());
-      setTripActive(dl.trip_session || 'any');
+      setTripActive(dl.trip_session || '1');
       _loadSavedEtdDays();
       show('#tp-etd-row', true);
       show('#tp-toggle-section', true);
@@ -2218,8 +2299,8 @@ async function autoLoadPlanner(user, autoFetch){
     setDayDate(_todayISO());
     const dd = await jpost('/api/day',{day:_todayISO()});
     if(!dd.ok){ setMsg('#login-msg', dd.messages||'Could not set trip day', true); return; }
-    setTripActive('any');
-    await jpost('/api/trip-session',{session:'any'});
+    setTripActive('1');
+    await jpost('/api/trip-session',{session:'1'});
 
     setMsg('#login-msg', null);
     _loadSavedEtdDays();
@@ -2377,7 +2458,7 @@ if(_dayDateInput){
 }
 
 function setTripActive(session){
-  ['any','1','2','3','4'].forEach(s=>{
+  ['1','2','3','4'].forEach(s=>{
     $('#tp-trip-'+s).classList.toggle('active', s===session);
   });
 }
@@ -2841,25 +2922,31 @@ function renderBoard(){
     };
     _head.addEventListener('pointerdown', e=>{
       if(e.target.closest('.board-route-chev')) return;
-      routeDragCandidate={route:rt.route, startX:e.clientX, startY:e.clientY, count:list.length, weight:rt.weight};
+      routeDragCandidate={kind:'route', key:rt.route, startX:e.clientX, startY:e.clientY, count:list.length, weight:rt.weight};
     });
     const body=div.querySelector('.board-route-body');
     list.forEach(o=>body.appendChild(boardCardEl(o)));
     wrap.appendChild(div);
   });
-  // Manual-assign-only customers (MANUAL_ONLY_CUSTOMER_CODES) — AI Assign
-  // never touches these; shown as their own section below the normal
-  // route groups so the planner remembers to place them by hand.
+  // Manual-assign-only customers (MANUAL_ONLY_CUSTOMER_CODES, plus any this
+  // session has dragged in/out) — AI Assign never touches these; shown as
+  // their own drop zone below the normal route groups so the planner
+  // remembers to place them by hand. Drag a single DO onto this zone to
+  // flag its whole customer code; drag a group's header back onto the
+  // Unassigned pool to release it for AI Assign again.
   const moGroups=BOARD.manual_only||[];
-  if(moGroups.length){
-    const hdr=document.createElement('div');
-    hdr.className='board-pool-section-hdr';
-    hdr.textContent='MANUAL ASSIGN ONLY';
-    wrap.appendChild(hdr);
-  }
+  const moWrap=document.createElement('div');
+  moWrap.dataset.zone='MO';
+  moWrap.className='board-mo-zone';
+  const hdr=document.createElement('div');
+  hdr.className='board-pool-section-hdr';
+  hdr.textContent='MANUAL ASSIGN ONLY';
+  moWrap.appendChild(hdr);
+  let moCount=0;
   moGroups.forEach(mo=>{
     const list=boardOrdersManualOnly(mo.code);
     if(!list.length) return;
+    moCount+=list.length;
     totalUn+=list.length;
     const key='MO:'+mo.code;
     const div=document.createElement('div');
@@ -2872,14 +2959,27 @@ function renderBoard(){
         <span class="board-route-meta">${list.length} DO &middot; ${fmtT(mo.weight)}</span>
       </div>
       <div class="board-route-body"></div>`;
-    div.querySelector('.board-route-head').onclick=()=>{
+    const _moHead=div.querySelector('.board-route-head');
+    _moHead.onclick=()=>{
+      if(routeDragJustHappened){ routeDragJustHappened=false; return; }
       boardOpenRoutes.has(key)?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
       renderBoard();
     };
+    _moHead.addEventListener('pointerdown', e=>{
+      if(e.target.closest('.board-route-chev')) return;
+      routeDragCandidate={kind:'mo', key:mo.code, startX:e.clientX, startY:e.clientY, count:list.length, weight:mo.weight};
+    });
     const body=div.querySelector('.board-route-body');
     list.forEach(o=>body.appendChild(boardCardEl(o)));
-    wrap.appendChild(div);
+    moWrap.appendChild(div);
   });
+  if(!moCount){
+    const empty=document.createElement('div');
+    empty.className='board-empty';
+    empty.textContent='Drag a DO here to exclude it from AI Assign';
+    moWrap.appendChild(empty);
+  }
+  wrap.appendChild(moWrap);
   $('#board-pool-label').textContent=`UNASSIGNED · ${totalUn} DO${totalUn===1?'':'s'}`;
   const _aging=BOARD.aging||{};
   const _agingParts=[
@@ -2979,11 +3079,11 @@ document.addEventListener('pointermove', e=>{
   if(routeDragCandidate && !routeDrag){
     const dx=e.clientX-routeDragCandidate.startX, dy=e.clientY-routeDragCandidate.startY;
     if(Math.hypot(dx,dy) > 6){
-      routeDrag={route:routeDragCandidate.route};
+      routeDrag={kind:routeDragCandidate.kind, key:routeDragCandidate.key};
       routeGhost=document.createElement('div');
       routeGhost.className='board-ghost';
-      routeGhost.innerHTML=`<span style="color:var(--brand);font-weight:700;font-family:ui-monospace,Menlo,monospace">${esc(routeDrag.route)}</span>`+
-        `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">whole route</span>`+
+      routeGhost.innerHTML=`<span style="color:var(--brand);font-weight:700;font-family:ui-monospace,Menlo,monospace">${esc(routeDrag.key)}</span>`+
+        `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${routeDrag.kind==='mo'?'whole customer':'whole route'}</span>`+
         `<span style="color:var(--muted);flex-shrink:0">${routeDragCandidate.count} DO &middot; ${fmtT(routeDragCandidate.weight)}</span>`;
       document.body.appendChild(routeGhost);
     }
@@ -2992,7 +3092,9 @@ document.addEventListener('pointermove', e=>{
     moveBoardGhost(e.clientX,e.clientY,routeGhost);
     document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
     const z=boardZoneAt(e.clientX,e.clientY);
-    if(z && z.dataset.zone) z.classList.add('zone-active');   // lorry lanes only, not the pool
+    // Whole-route drags only land on a lorry lane; whole-customer (manual-
+    // only) drags may also land on the Unassigned pool zone ('') to release it.
+    if(z && (z.dataset.zone || routeDrag.kind==='mo')) z.classList.add('zone-active');
     return;
   }
   if(!boardDrag) return;
@@ -3005,14 +3107,26 @@ document.addEventListener('pointerup', async e=>{
   if(routeDragCandidate || routeDrag){
     const wasDragging=!!routeDrag;
     const z=wasDragging?boardZoneAt(e.clientX,e.clientY):null;
-    const route=routeDrag?routeDrag.route:null;
+    const dragKind=routeDrag?routeDrag.kind:null;
+    const dragKey=routeDrag?routeDrag.key:null;
     routeDragCandidate=null; routeDrag=null;
     if(routeGhost){ routeGhost.remove(); routeGhost=null; }
     document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
     if(wasDragging){
       routeDragJustHappened=true;
-      if(z && z.dataset.zone){ await moveBoardRoute(route, z.dataset.zone); }
-      else { renderBoard(); }
+      if(dragKind==='mo'){
+        // Dropped back on its own zone ('MO') is a no-op; the pool ('') or
+        // any lorry plate both release the code (see /api/board/move-code).
+        if(z && z.dataset.zone!==undefined && z.dataset.zone!=='MO'){
+          await moveBoardCode(dragKey, z.dataset.zone || null);
+        } else {
+          renderBoard();
+        }
+      } else if(z && z.dataset.zone){
+        await moveBoardRoute(dragKey, z.dataset.zone);
+      } else {
+        renderBoard();
+      }
     }
     return;
   }
@@ -3023,7 +3137,8 @@ document.addEventListener('pointerup', async e=>{
   if(boardGhost){ boardGhost.remove(); boardGhost=null; }
   document.querySelectorAll('.zone-active').forEach(el=>el.classList.remove('zone-active'));
   if(!z){ renderBoard(); return; }
-  const zone=z.dataset.zone;  // '' = pool, else a plate
+  const zone=z.dataset.zone;  // '' = pool, 'MO' = manual-assign-only, else a plate
+  if(zone==='MO'){ await markManualOnly(doId); return; }
   await moveBoardCard(doId, zone || null);
 });
 
@@ -3035,6 +3150,22 @@ async function moveBoardRoute(route, plate){
   } else {
     boardToast(`${route}: ${d.moved} DO(s) moved to ${plate}.`);
   }
+  if(d.board){ BOARD=d.board; }
+  renderBoard();
+}
+
+async function moveBoardCode(code, plate){
+  const d=await jpost('/api/board/move-code',{code, lorry:plate});
+  if(!d.ok){ boardToast(d.message||d.error||'Move failed'); await loadBoard(); return; }
+  boardToast(plate ? `${code}: ${d.moved} DO(s) moved to ${plate}.` : `${code}: released — AI Assign can place it now.`);
+  if(d.board){ BOARD=d.board; }
+  renderBoard();
+}
+
+async function markManualOnly(doId){
+  const d=await jpost('/api/board/mark-manual-only',{do:doId});
+  if(!d.ok){ boardToast(d.message||d.error||'Move failed'); await loadBoard(); return; }
+  boardToast(`${d.code}: moved to Manual Assign Only.`);
   if(d.board){ BOARD=d.board; }
   renderBoard();
 }
