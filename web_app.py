@@ -1259,6 +1259,25 @@ def api_board_move_code():
     return _with_cookie({"ok": True, "moved": moved, "board": _board_json(sess)}, sid)
 
 
+@app.route("/api/board/drop-lane", methods=["POST"])
+def api_board_drop_lane():
+    """Drop every DO currently assigned to one lorry back into Unassigned in
+    one click, instead of removing cards one at a time."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    plate = str((request.json or {}).get("lorry", "")).strip()
+    if not plate:
+        return _with_cookie({"error": "Missing 'lorry'."}, sid, 400)
+    dropped = 0
+    for it in sess.get("items", []) or []:
+        if it.get("LORRY") != plate:
+            continue
+        it["LORRY"] = "NO_LORRY"
+        sess.setdefault("assigned", {})[str(it.get("DO NUMBER", ""))] = "NO_LORRY"
+        dropped += 1
+    return _with_cookie({"ok": True, "dropped": dropped, "board": _board_json(sess)}, sid)
+
+
 @app.route("/api/board/toggle-lorry", methods=["POST"])
 def api_board_toggle_lorry():
     """Flip a lorry's on/off availability for today. Off means it's not
@@ -1456,19 +1475,17 @@ def api_download():
     )
 
 
-def _print_html(sess) -> str | None:
-    """Printable driver hand-off document: page 1 is the lorry-status
-    summary (same shape/formulas as the Snapshot export sheet — DRIVER left
-    blank), then one page per lorry that actually has DOs assigned, each
-    listing only that lorry's own DOs with the SAME full column set as the
-    main Download export (NO/DATE/ADD/TRIP/DO NUMBER/.../SALES REP) — the
-    export bytes are the single source of truth for both, so the two never
-    drift apart. Idle/unused lorries are skipped entirely. Returns None if
-    there's nothing to export yet."""
-    import html as _html
-
-    def esc(v) -> str:
-        return _html.escape(str(v), quote=True)
+def _print_excel_bytes(sess) -> bytes | None:
+    """Excel driver hand-off workbook: sheet 1 is the lorry-status summary
+    (same shape/formulas as the Snapshot export sheet — DRIVER left blank,
+    assigned lorries only), then one sheet per lorry that actually has DOs
+    assigned, each with the SAME full column set as the main Download
+    export (NO/DATE/ADD/TRIP/DO NUMBER/.../SALES REP) filtered to that
+    plate's own rows — the export bytes are the single source of truth for
+    both, so the two never drift apart. Idle/unused lorries are skipped
+    entirely. Returns None if there's nothing to export yet."""
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font
 
     data = sess.get("export_bytes")
     if not data:
@@ -1486,60 +1503,49 @@ def _print_html(sess) -> str | None:
         export_df["DRIVER"] = ""   # always blank on the print sheet
     columns = list(export_df.columns)
 
-    by_plate: dict[str, list] = {}
+    by_plate: dict[str, "pd.DataFrame"] = {}
     if "LICENSE" in export_df.columns:
         _blank = {"", "nan", "none", "no_lorry", "split", "skipped"}
-        for _, row in export_df.iterrows():
-            plate = str(row.get("LICENSE", "")).strip()
-            if plate.lower() in _blank:
-                continue
-            by_plate.setdefault(plate, []).append(row)
+        plate_col = export_df["LICENSE"].astype(str).str.strip()
+        mask = ~plate_col.str.lower().isin(_blank)
+        for plate, g in export_df[mask].groupby(plate_col[mask]):
+            by_plate[str(plate)] = g
 
     snap_rows = [r for r in _snapshot_rows(sess) if r["DONE"] == "✓"]
 
-    parts = ["""<!doctype html><html><head><meta charset="utf-8"><title>Print — Lorry Assignment</title>
-<style>
-  @page { size: A4 landscape; margin: 10mm; }
-  * { box-sizing: border-box; }
-  body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0; }
-  .sheet { page-break-after: always; padding: 4mm 0; }
-  .sheet:last-child { page-break-after: auto; }
-  h1 { font-size: 16px; margin: 0 0 10px; }
-  .meta { font-size: 12px; color: #444; margin-bottom: 10px; }
-  table { width: 100%; border-collapse: collapse; font-size: 9px; }
-  th, td { border: 1px solid #333; padding: 3px 4px; text-align: left; white-space: nowrap; }
-  th { background: #eee; font-weight: 700; }
-  td.num, th.num { text-align: right; }
-</style></head><body>"""]
-
-    # Page 1 — lorry status summary (same columns as the Snapshot export sheet).
-    parts.append('<div class="sheet"><h1>LORRY DAILY STATUS</h1>')
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "LORRY DAILY STATUS"
     if snap_rows:
         headers = list(snap_rows[0].keys())
-        parts.append("<table><thead><tr>" + "".join(f"<th>{esc(h)}</th>" for h in headers) + "</tr></thead><tbody>")
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
         for r in snap_rows:
-            parts.append("<tr>" + "".join(f"<td>{esc(r[h])}</td>" for h in headers) + "</tr>")
-        parts.append("</tbody></table>")
-    else:
-        parts.append("<p>No lorries with assigned DOs.</p>")
-    parts.append("</div>")
+            ws.append([r[h] for h in headers])
+        for col_idx, h in enumerate(headers, start=1):
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = max(12, len(h) + 2)
 
-    # One page per lorry with assigned DOs — same columns as the main export.
+    _used_names = {"LORRY DAILY STATUS"}
     for plate in sorted(by_plate.keys()):
-        rows = by_plate[plate]
-        parts.append('<div class="sheet">')
-        parts.append(f"<h1>LORRY: {esc(plate)}</h1>")
-        parts.append(f'<div class="meta">{len(rows)} DO{"s" if len(rows) != 1 else ""}</div>')
-        parts.append("<table><thead><tr>" + "".join(f"<th>{esc(c)}</th>" for c in columns) + "</tr></thead><tbody>")
-        for row in rows:
-            parts.append("<tr>" + "".join(
-                f"<td>{esc(row[c]) if pd.notna(row[c]) else ''}</td>" for c in columns
-            ) + "</tr>")
-        parts.append("</tbody></table></div>")
+        name = re.sub(r'[\\/*?:\[\]]', '_', plate)[:31] or "PLATE"
+        base_name, i = name, 1
+        while name in _used_names:
+            i += 1
+            name = f"{base_name[:28]}_{i}"
+        _used_names.add(name)
+        pws = wb.create_sheet(name)
+        pws.append(columns)
+        for cell in pws[1]:
+            cell.font = Font(bold=True)
+        for _, row in by_plate[plate].iterrows():
+            pws.append([None if pd.isna(row[c]) else row[c] for c in columns])
+        for col_idx, h in enumerate(columns, start=1):
+            pws.column_dimensions[pws.cell(row=1, column=col_idx).column_letter].width = max(10, min(30, len(str(h)) + 2))
 
-    parts.append("<script>window.onload=function(){window.print();};</script>")
-    parts.append("</body></html>")
-    return "".join(parts)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 @app.route("/api/board/print")
@@ -1548,10 +1554,15 @@ def api_board_print():
     sess = bot.get_session(sid)
     if not sess.get("items"):
         return _with_cookie({"error": "No board to print yet — fetch or upload DOs first."}, sid, 400)
-    html = _print_html(sess)
-    if html is None:
+    xbytes = _print_excel_bytes(sess)
+    if xbytes is None:
         return _with_cookie({"error": "Nothing to print yet."}, sid, 400)
-    return Response(html, mimetype="text/html")
+    return send_file(
+        io.BytesIO(xbytes),
+        as_attachment=True,
+        download_name="Lorry_Print.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.route("/api/reset", methods=["POST"])
@@ -1944,6 +1955,11 @@ _PAGE = r"""<!doctype html>
     width:22px;height:22px;flex-shrink:0;cursor:pointer;font-size:12px;line-height:1;
     display:inline-flex;align-items:center;justify-content:center}
   .lane-max-btn:hover{color:var(--ink);border-color:var(--brand)}
+  .lane-drop-btn{background:none;border:1px solid var(--line);border-radius:6px;color:var(--muted);
+    width:22px;height:22px;flex-shrink:0;cursor:pointer;font-size:12px;line-height:1;
+    display:inline-flex;align-items:center;justify-content:center}
+  .lane-drop-btn:hover:not(:disabled){color:var(--bad);border-color:var(--bad)}
+  .lane-drop-btn:disabled{opacity:.3;cursor:not-allowed}
   .board-lanes.has-maximized{grid-template-columns:1fr}
   .board-lane-maximized{padding:20px;min-height:60vh}
   .board-lane-maximized .board-lane-plate{font-size:20px}
@@ -2168,7 +2184,7 @@ _PAGE = r"""<!doctype html>
       </div>
       <div class="board-top-actions">
         <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
-        <button class="btn secondary" id="btn-board-print">🖨️ Print</button>
+        <a class="dl" href="/api/board/print"><button class="btn secondary" id="btn-board-print">🖨️ Print</button></a>
         <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
         <button class="btn secondary hidden" id="btn-board-table">📋 Table view</button>
       </div>
@@ -3178,6 +3194,7 @@ function renderBoard(){
         <span class="board-lane-plate">${esc(t.plate)}</span>
         <button class="lane-toggle${isOn?'':' off'}" title="${isOn?'Available today — click to turn off':'Not available today — click to turn on'}"></button>
         <button class="lane-max-btn" title="${maximized?'Minimize':'Maximize — focus assigning on this lorry'}">${maximized?'&#10529;':'&#10530;'}</button>
+        <button class="lane-drop-btn" title="Drop all of this lorry's DOs back to Unassigned" ${list.length?'':'disabled'}>&#128465;</button>
         <span class="board-lane-count">${list.length} DO${list.length===1?'':'s'}</span>
         <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}${t.capacity!=null?' &middot; '+pctReal+'%':''}</span>
       </div>
@@ -3185,7 +3202,7 @@ function renderBoard(){
       <div class="board-cap-track"><div class="board-cap-fill ${fillClass}" style="width:${pct}%"></div></div>
       <div class="board-lane-body"></div>`;
     lane.querySelector('.board-lane-head').onclick=(e)=>{
-      if(e.target.closest('.lane-toggle') || e.target.closest('.lane-max-btn')) return;
+      if(e.target.closest('.lane-toggle') || e.target.closest('.lane-max-btn') || e.target.closest('.lane-drop-btn')) return;
       collapsed?boardCollapsedLanes.delete(t.plate):boardCollapsedLanes.add(t.plate);
       renderBoard();
     };
@@ -3197,6 +3214,12 @@ function renderBoard(){
       e.stopPropagation();
       boardMaximizedPlate = maximized ? null : t.plate;
       renderBoard();
+    };
+    lane.querySelector('.lane-drop-btn').onclick=async(e)=>{
+      e.stopPropagation();
+      if(!list.length) return;
+      if(!confirm(`Drop all ${list.length} DO(s) from ${t.plate} back to Unassigned?`)) return;
+      await dropLane(t.plate);
     };
     const body=lane.querySelector('.board-lane-body');
     if(!list.length) body.innerHTML='<div class="board-empty">Drop DOs here</div>';
@@ -3347,6 +3370,14 @@ async function moveBoardCard(doId, plate){
   renderBoard();
 }
 
+async function dropLane(plate){
+  const d=await jpost('/api/board/drop-lane',{lorry:plate});
+  if(!d.ok){ boardToast(d.message||d.error||'Drop failed'); await loadBoard(); return; }
+  boardToast(`${plate}: ${d.dropped} DO(s) dropped back to Unassigned.`);
+  if(d.board){ BOARD=d.board; }
+  renderBoard();
+}
+
 async function toggleLorry(plate, on){
   const d=await jpost('/api/board/toggle-lorry',{plate, on});
   if(!d.ok){ boardToast(d.message||d.error||'Toggle failed'); await loadBoard(); return; }
@@ -3375,7 +3406,6 @@ async function aiAssign(){
   } finally { btn.disabled=false; }
 }
 $('#btn-board-ai').onclick=aiAssign;
-$('#btn-board-print').onclick=()=>{ window.open('/api/board/print', '_blank'); };
 
 async function refetchDOs(){
   const btn=$('#btn-board-back'); btn.disabled=true;
