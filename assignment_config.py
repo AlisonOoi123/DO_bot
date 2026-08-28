@@ -310,6 +310,16 @@ ROUTE_PREFERRED_LORRY: dict[str, list[str]] = {
     # Only hard constraint: LORRY_STRICT_ROUTE above (BQU3875/WA6899M → PH only).
 }
 
+# ── Manual-assignment-only customers ──────────────────────────────────────────
+# DOs for these customer codes are never touched by AI Assign — they're
+# always left in the unassigned pool (shown in their own labelled section,
+# separate from the normal route groups, on both the board and the Picking
+# List) for the planner to assign by hand. By explicit request.
+MANUAL_ONLY_CUSTOMER_CODES: dict[str, str] = {
+    "A172-E": "AEON CO. (M) BHD",
+    "B070-E": "BABA PRODUCTS (M) SDN BHD",
+}
+
 
 # ── Route intelligence maps (used by lorry_engine.py) ────────────────────────
 CLUSTER_MAP: dict[str, str] = {

@@ -36,6 +36,7 @@ from flask import (
 
 import bot   # the existing engine — reused as-is
 import do_source   # live DO fetch from the ERP DB — see do_source.py
+from assignment_config import MANUAL_ONLY_CUSTOMER_CODES
 
 app = Flask(__name__)
 
@@ -384,11 +385,13 @@ def _board_json(sess) -> dict:
 
     orders = []
     routes: dict[str, dict] = {}
+    manual_only: dict[str, dict] = {}
     for it in items:
         lorry = it.get("LORRY")
         if lorry in _NOT_MINE_TODAY:
             continue
         route = str(it.get("ROUTE", ""))
+        code = str(it.get("CODE", ""))
         assigned_plate = lorry if lorry and lorry not in _SENTINELS else None
         weight = float(it.get("WEIGHT", 0) or 0)
         weight = round(weight, 3) if pd.notna(weight) else 0.0
@@ -396,9 +399,10 @@ def _board_json(sess) -> dict:
         # all for a pool card the AI deliberately skipped rather than one it
         # just couldn't fit anywhere (NO_LORRY etc. show no reason tag).
         _reason = lorry if lorry in _SENTINELS and lorry not in ("NO_LORRY", "", None) else ""
+        _is_manual_only = code.strip().upper() in _MANUAL_ONLY_CODES
         orders.append({
             "do": str(it.get("DO NUMBER", "")),
-            "code": str(it.get("CODE", "")),
+            "code": code,
             "route": route,
             "customer": str(it.get("CUSTOMER NAME", "")),
             "weight": weight,
@@ -407,8 +411,18 @@ def _board_json(sess) -> dict:
             "remarks": str(_rm) if pd.notna(_rm := it.get("REMARKS")) else "",
             "lorry": assigned_plate,
             "reason": _reason,
+            "manualOnly": _is_manual_only,
         })
-        if assigned_plate is None:
+        if assigned_plate is None and _is_manual_only:
+            _mo_code = code.strip().upper()
+            mo = manual_only.setdefault(_mo_code, {
+                "code": code,
+                "customer": MANUAL_ONLY_CUSTOMER_CODES.get(_mo_code, str(it.get("CUSTOMER NAME", ""))),
+                "dos": 0, "weight": 0.0,
+            })
+            mo["dos"] += 1
+            mo["weight"] = round(mo["weight"] + weight, 3)
+        elif assigned_plate is None:
             rt = routes.setdefault(route, {"route": route, "dos": 0, "weight": 0.0})
             rt["dos"] += 1
             rt["weight"] = round(rt["weight"] + weight, 3)
@@ -432,10 +446,16 @@ def _board_json(sess) -> dict:
         if _age > 5: _aging["over5"] += 1
         if _age > 3: _aging["over3"] += 1
 
+    _mo_order = list(MANUAL_ONLY_CUSTOMER_CODES.keys())
     return {
         "orders": orders,
         "aging": _aging,
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
+        "manual_only": sorted(
+            manual_only.values(),
+            key=lambda m: _mo_order.index(m["code"].strip().upper())
+            if m["code"].strip().upper() in _mo_order else 999,
+        ),
         "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates}
                     for p, c in sorted(caps.items())],
         # Shared staging pool: plates parked unclaimed (the 4 SPARE plates
@@ -819,6 +839,22 @@ def _reset_items_to_unassigned(sess: dict) -> None:
             it["LORRY"] = "NO_LORRY"
 
 
+_MANUAL_ONLY_CODES = {c.strip().upper() for c in MANUAL_ONLY_CUSTOMER_CODES}
+
+
+def _force_manual_only_unassigned(sess: dict) -> None:
+    """DOs for MANUAL_ONLY_CUSTOMER_CODES must never carry a real plate —
+    even a fresh AI Assign run has to leave them for the planner to place by
+    hand. Same "undo at the web layer" approach as _reset_items_to_unassigned,
+    applied unconditionally (not just when deferring AI assignment)."""
+    for it in sess.get("items", []) or []:
+        if str(it.get("CODE", "")).strip().upper() not in _MANUAL_ONLY_CODES:
+            continue
+        lorry = it.get("LORRY")
+        if lorry and lorry not in _SENTINELS:
+            it["LORRY"] = "NO_LORRY"
+
+
 def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -> dict:
     """Shared by /api/dos (manual upload), /api/dos-fetch/use (direct from the
     live DB fetch), and /api/board/ai-assign (explicit re-assign). Fetch/
@@ -838,6 +874,7 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -
     # pass had already computed silently stayed on the board.
     if sess.get("state") == "AWAIT_OTHER_USER_REPLY":
         msgs = bot._handle_other_user_reply(sid, sess, "NO")
+    _force_manual_only_unassigned(sess)
     if not assign_now:
         _reset_items_to_unassigned(sess)
         # Marks "fetched, waiting on the Picking List" — cleared by
@@ -958,14 +995,16 @@ def api_picking_list():
         if lorry in _NOT_MINE_TODAY and lorry != "NOT_PICKED":
             continue
         do_num = str(it.get("DO NUMBER", ""))
+        code = str(it.get("CODE", ""))
         rows.append({
             "do": do_num,
-            "code": str(it.get("CODE", "")),
+            "code": code,
             "customer": str(it.get("CUSTOMER NAME", "")),
             "route": str(it.get("ROUTE", "")),
             "weight": round(float(it.get("WEIGHT", 0) or 0), 3),
             "date": str(it.get("DATE", "")),
             "checked": do_num not in unpicked,
+            "special": code.strip().upper() in _MANUAL_ONLY_CODES,
         })
     # Date first (earliest-due first), then DO number, then customer code,
     # then route code — a stable, predictable reading order for the
@@ -973,11 +1012,12 @@ def api_picking_list():
     # items in. Date is parsed for the sort key only (dayfirst, matching
     # every other date parse in this app) so e.g. "5-1-2026" sorts before
     # "12-1-2026"; an unparseable date sorts last rather than breaking the
-    # whole sort.
+    # whole sort. MANUAL_ONLY_CUSTOMER_CODES rows always sort to the very
+    # end, in their own section, regardless of date.
     def _picking_sort_key(r):
         _dt = pd.to_datetime(r["date"], dayfirst=True, errors="coerce")
         _date_key = _dt if pd.notna(_dt) else pd.Timestamp.max
-        return (_date_key, r["do"], r["code"], r["route"])
+        return (r["special"], _date_key, r["do"], r["code"], r["route"])
     rows.sort(key=_picking_sort_key)
     return _with_cookie({"rows": rows}, sid)
 
@@ -1618,6 +1658,9 @@ _PAGE = r"""<!doctype html>
   th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
   td.w{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
   .scroll{overflow-x:auto}
+  .picking-section-divider td{font-size:11px;letter-spacing:.06em;color:#f59e0b;
+    font-weight:700;text-transform:uppercase;padding:14px 8px 8px;
+    border-top:1px dashed var(--line)}
   .lorry.collapsed .scroll{display:none}
   .lorry h3.collapsible{cursor:pointer}
   .unassigned h3{color:var(--bad)}
@@ -1652,6 +1695,9 @@ _PAGE = r"""<!doctype html>
   .board-pool,.board-lanes-wrap{min-width:0}
   .board-pool-label{font-size:11px;letter-spacing:.08em;color:var(--muted);
     font-weight:700;text-transform:uppercase;margin:2px 2px 10px}
+  .board-pool-section-hdr{font-size:11px;letter-spacing:.08em;color:#f59e0b;
+    font-weight:700;text-transform:uppercase;margin:14px 2px 10px;
+    border-top:1px dashed var(--line);padding-top:12px}
   .board-route{border:1px solid var(--line);border-radius:10px;margin-bottom:8px;
     overflow:hidden;background:var(--card2)}
   .board-route-head{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer}
@@ -2640,7 +2686,13 @@ async function showPickingList(){
 function renderPickingList(rows){
   PICKING_ROWS = rows;
   const tbody = $('#picking-rows');
-  tbody.innerHTML = rows.map(r=>`
+  let html='', sawSpecial=false;
+  rows.forEach(r=>{
+    if(r.special && !sawSpecial){
+      sawSpecial=true;
+      html+=`<tr class="picking-section-divider"><td colspan="7">MANUAL ASSIGN ONLY — not auto-assigned by AI, place these by hand</td></tr>`;
+    }
+    html+=`
     <tr>
       <td><input type="checkbox" class="picking-cb" data-do="${esc(r.do)}" ${r.checked?'checked':''}></td>
       <td>${esc(r.date)}</td>
@@ -2649,7 +2701,9 @@ function renderPickingList(rows){
       <td>${esc(r.customer)}</td>
       <td>${esc(r.route)}</td>
       <td class="w">${r.weight.toFixed(3)}T</td>
-    </tr>`).join('');
+    </tr>`;
+  });
+  tbody.innerHTML = html;
   tbody.querySelectorAll('.picking-cb').forEach(cb=>{ cb.onchange = updatePickingCount; });
   updatePickingCount();
 }
@@ -2716,7 +2770,8 @@ async function loadBoard(){
   renderBoard();
 }
 
-function boardOrdersInPool(route){ return BOARD.orders.filter(o=>o.route===route && !o.lorry); }
+function boardOrdersInPool(route){ return BOARD.orders.filter(o=>o.route===route && !o.lorry && !o.manualOnly); }
+function boardOrdersManualOnly(code){ return BOARD.orders.filter(o=>o.code===code && !o.lorry && o.manualOnly); }
 function boardOrdersOnLorry(plate){ return BOARD.orders.filter(o=>o.lorry===plate); }
 function boardSumKg(list){ return list.reduce((s,o)=>s+o.weight,0); }
 function fmtT(w){ return w.toFixed(3)+'T'; }
@@ -2792,6 +2847,39 @@ function renderBoard(){
     list.forEach(o=>body.appendChild(boardCardEl(o)));
     wrap.appendChild(div);
   });
+  // Manual-assign-only customers (MANUAL_ONLY_CUSTOMER_CODES) — AI Assign
+  // never touches these; shown as their own section below the normal
+  // route groups so the planner remembers to place them by hand.
+  const moGroups=BOARD.manual_only||[];
+  if(moGroups.length){
+    const hdr=document.createElement('div');
+    hdr.className='board-pool-section-hdr';
+    hdr.textContent='MANUAL ASSIGN ONLY';
+    wrap.appendChild(hdr);
+  }
+  moGroups.forEach(mo=>{
+    const list=boardOrdersManualOnly(mo.code);
+    if(!list.length) return;
+    totalUn+=list.length;
+    const key='MO:'+mo.code;
+    const div=document.createElement('div');
+    div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
+    div.innerHTML=`
+      <div class="board-route-head">
+        <span class="board-route-chev">&#9654;</span>
+        <span class="board-route-dot" style="background:#f59e0b"></span>
+        <span class="board-route-code">${esc(mo.code)} - ${esc(mo.customer)}</span>
+        <span class="board-route-meta">${list.length} DO &middot; ${fmtT(mo.weight)}</span>
+      </div>
+      <div class="board-route-body"></div>`;
+    div.querySelector('.board-route-head').onclick=()=>{
+      boardOpenRoutes.has(key)?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
+      renderBoard();
+    };
+    const body=div.querySelector('.board-route-body');
+    list.forEach(o=>body.appendChild(boardCardEl(o)));
+    wrap.appendChild(div);
+  });
   $('#board-pool-label').textContent=`UNASSIGNED · ${totalUn} DO${totalUn===1?'':'s'}`;
   const _aging=BOARD.aging||{};
   const _agingParts=[
@@ -2859,7 +2947,10 @@ $('#board-collapse-all').onclick=()=>{
 $('#board-expand-all').onclick=()=>{ boardCollapsedLanes.clear(); renderBoard(); };
 $('#board-pool-collapse-all').onclick=()=>{ boardOpenRoutes.clear(); renderBoard(); };
 $('#board-pool-expand-all').onclick=()=>{
-  if(BOARD) BOARD.routes.forEach(rt=>boardOpenRoutes.add(rt.route));
+  if(BOARD){
+    BOARD.routes.forEach(rt=>boardOpenRoutes.add(rt.route));
+    (BOARD.manual_only||[]).forEach(mo=>boardOpenRoutes.add('MO:'+mo.code));
+  }
   renderBoard();
 };
 
