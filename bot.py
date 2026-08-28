@@ -9539,6 +9539,24 @@ def _export_result_inner(sess) -> list[str]:
                 out_df[_c] = ""
         out_df = out_df[[_c for _c in _orig_cols if _c in out_df.columns]]
 
+    # ── ADD / TRIP columns (by explicit request) ───────────────────────────
+    # ADD = the "Assign for" date picked in the board header — the actual
+    # delivery run date (NOT each row's own DATE, which is when the DO was
+    # raised). TRIP = which Trip (Any/1/2/3/4) the planner selected for this
+    # run. Always inserted as columns C/D (right after DATE, before DO
+    # NUMBER), regardless of the uploaded file's own column layout — added
+    # here, after the _orig_cols restriction above, so they're never dropped.
+    try:
+        _add_date = _resolve_trip_day_date(sess.get("trip_day")).strftime("%-d/%-m/%Y")
+    except Exception:
+        _add_date = ""
+    _trip_label = str(sess.get("trip_session") or "Any")
+    if "TRIP" in out_df.columns:   # rare: the old per-lorry AM/PM TRIP marker
+        out_df = out_df.drop(columns=["TRIP"])   # survived _orig_cols — ours wins
+    _date_loc = out_df.columns.get_loc("DATE") + 1 if "DATE" in out_df.columns else 1
+    out_df.insert(_date_loc, "TRIP", _trip_label)
+    out_df.insert(_date_loc, "ADD", _add_date)
+
     buf = io.BytesIO()
     out_df.to_excel(buf, index=False, engine="openpyxl")
 
