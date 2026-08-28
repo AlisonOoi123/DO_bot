@@ -1446,6 +1446,108 @@ def api_download():
     )
 
 
+def _print_html(sess) -> str:
+    """Printable driver hand-off document: page 1 is the lorry-status
+    summary (same shape/formulas as the Snapshot export sheet — DRIVER left
+    blank), then one page per lorry that actually has DOs assigned, each
+    listing only that lorry's own DOs. Idle/unused lorries are skipped
+    entirely — this is only for what's actually going out today."""
+    import html as _html
+
+    def esc(v) -> str:
+        return _html.escape(str(v), quote=True)
+
+    snap_rows = [r for r in _snapshot_rows(sess) if r["DONE"] == "✓"]
+
+    items = sess.get("items", []) or []
+    by_plate: dict[str, list] = {}
+    for it in items:
+        lorry = it.get("LORRY")
+        if not lorry or lorry in _SENTINELS:
+            continue
+        by_plate.setdefault(lorry, []).append(it)
+
+    def _do_sort_key(it):
+        _dt = pd.to_datetime(str(it.get("DATE", "")), dayfirst=True, errors="coerce")
+        _date_key = _dt if pd.notna(_dt) else pd.Timestamp.max
+        return (_date_key, str(it.get("DO NUMBER", "")))
+
+    fl = _fleet_lists(sess)
+    caps = {l["plate"]: l["capacity"] for l in fl["lorries"]}
+
+    parts = ["""<!doctype html><html><head><meta charset="utf-8"><title>Print — Lorry Assignment</title>
+<style>
+  @page { size: A4 landscape; margin: 12mm; }
+  * { box-sizing: border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0; }
+  .sheet { page-break-after: always; padding: 4mm 0; }
+  .sheet:last-child { page-break-after: auto; }
+  h1 { font-size: 16px; margin: 0 0 10px; }
+  h2 { font-size: 14px; margin: 0 0 4px; }
+  .meta { font-size: 12px; color: #444; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th, td { border: 1px solid #333; padding: 4px 6px; text-align: left; }
+  th { background: #eee; font-weight: 700; }
+  td.num, th.num { text-align: right; }
+  .done { text-align: center; font-weight: 700; }
+</style></head><body>"""]
+
+    # Page 1 — lorry status summary (same columns as the Snapshot export sheet).
+    parts.append('<div class="sheet"><h1>LORRY DAILY STATUS</h1>')
+    if snap_rows:
+        headers = list(snap_rows[0].keys())
+        parts.append("<table><thead><tr>" + "".join(f"<th>{esc(h)}</th>" for h in headers) + "</tr></thead><tbody>")
+        for r in snap_rows:
+            parts.append("<tr>" + "".join(f"<td>{esc(r[h])}</td>" for h in headers) + "</tr>")
+        parts.append("</tbody></table>")
+    else:
+        parts.append("<p>No lorries with assigned DOs.</p>")
+    parts.append("</div>")
+
+    # One page per lorry with assigned DOs.
+    for plate in sorted(by_plate.keys()):
+        dos = sorted(by_plate[plate], key=_do_sort_key)
+        cap = caps.get(plate)
+        total_w = sum(float(it.get("WEIGHT", 0) or 0) for it in dos)
+        parts.append('<div class="sheet">')
+        parts.append(f"<h1>LORRY: {esc(plate)}</h1>")
+        parts.append(
+            f'<div class="meta">DRIVER: ______________________ &nbsp;&nbsp; '
+            f'CAPACITY: {cap:.2f}T &nbsp;&nbsp; TOTAL: {total_w:.3f}T '
+            f'({len(dos)} DO{"s" if len(dos) != 1 else ""})</div>'
+            if cap is not None else
+            f'<div class="meta">DRIVER: ______________________ &nbsp;&nbsp; '
+            f'TOTAL: {total_w:.3f}T ({len(dos)} DO{"s" if len(dos) != 1 else ""})</div>'
+        )
+        parts.append(
+            "<table><thead><tr><th>NO</th><th>DO NUMBER</th><th>CODE</th>"
+            "<th>CUSTOMER NAME</th><th>ROUTE</th><th class=\"num\">WEIGHT (KG)</th>"
+            "<th>REMARKS</th></tr></thead><tbody>"
+        )
+        for i, it in enumerate(dos, start=1):
+            weight_kg = round(float(it.get("WEIGHT", 0) or 0) * 1000, 1)
+            parts.append(
+                f"<tr><td>{i}</td><td>{esc(it.get('DO NUMBER',''))}</td>"
+                f"<td>{esc(it.get('CODE',''))}</td><td>{esc(it.get('CUSTOMER NAME',''))}</td>"
+                f"<td>{esc(it.get('ROUTE',''))}</td><td class=\"num\">{weight_kg}</td>"
+                f"<td>{esc(it.get('REMARKS','') or '')}</td></tr>"
+            )
+        parts.append("</tbody></table></div>")
+
+    parts.append("<script>window.onload=function(){window.print();};</script>")
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+@app.route("/api/board/print")
+def api_board_print():
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    if not sess.get("items"):
+        return _with_cookie({"error": "No board to print yet — fetch or upload DOs first."}, sid, 400)
+    return Response(_print_html(sess), mimetype="text/html")
+
+
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
     sid = _active_user_sid()
@@ -1901,7 +2003,7 @@ _PAGE = r"""<!doctype html>
     <div class="msg hidden" id="login-msg"></div>
     <div class="tp-etd-row hidden" id="tp-etd-row">
       <label for="etd-days-input">1&#41; ETD window: &plusmn;
-        <input type="number" id="etd-days-input" min="0" step="1" value="2" placeholder="ALL"> day(s) &mdash; 0 or blank = all
+        <input type="number" id="etd-days-input" min="0" step="1" value="0" placeholder="ALL"> day(s) &mdash; 0 or blank = all
       </label>
     </div>
     <div class="tp-toggle-section hidden" id="tp-toggle-section">
@@ -2060,6 +2162,7 @@ _PAGE = r"""<!doctype html>
       </div>
       <div class="board-top-actions">
         <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
+        <button class="btn secondary" id="btn-board-print">🖨️ Print</button>
         <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
         <button class="btn secondary hidden" id="btn-board-table">📋 Table view</button>
       </div>
@@ -2224,11 +2327,10 @@ function showBoardWithError(msg){
   setMsg('#board-msg', msg, true);
 }
 
-function _loadSavedEtdDays(){
-  try{
-    const v = localStorage.getItem('etdWindowDays');
-    if(v!==null && v!=='') $('#etd-days-input').value = v;
-  }catch(e){}
+function _resetEtdDays(){
+  // Always defaults to 0 (= all) on every login/restore — by explicit
+  // request it must never remember a previously-typed ETD window.
+  $('#etd-days-input').value = '0';
 }
 
 // Login + today's lorries + trip day happen automatically — fast, no
@@ -2258,7 +2360,7 @@ async function autoLoadPlanner(user, autoFetch){
       setMsg('#login-msg', null);
       setDayDate(dl.trip_day || _todayISO());
       setTripActive(dl.trip_session || '1');
-      _loadSavedEtdDays();
+      _resetEtdDays();
       show('#tp-etd-row', true);
       show('#tp-toggle-section', true);
       show('#tp-fetch-row', true);
@@ -2303,7 +2405,7 @@ async function autoLoadPlanner(user, autoFetch){
     await jpost('/api/trip-session',{session:'1'});
 
     setMsg('#login-msg', null);
-    _loadSavedEtdDays();
+    _resetEtdDays();
     show('#tp-etd-row', true);
     show('#tp-toggle-section', true);
     show('#tp-fetch-row', true);
@@ -2477,7 +2579,6 @@ async function fetchAndAssign(){
     setMsg('#login-msg', 'ETD window must be a whole number of days (0 or more).', true);
     return;
   }
-  try{ localStorage.setItem('etdWindowDays', raw); }catch(e){}
   btn.disabled = true;
   try{
     setMsg('#login-msg', 'Fetching DOs from system… ', false);
@@ -3211,6 +3312,7 @@ async function aiAssign(){
   } finally { btn.disabled=false; }
 }
 $('#btn-board-ai').onclick=aiAssign;
+$('#btn-board-print').onclick=()=>{ window.open('/api/board/print', '_blank'); };
 
 async function refetchDOs(){
   const btn=$('#btn-board-back'); btn.disabled=true;
@@ -3316,7 +3418,7 @@ async function boot(){
     // A real browser refresh lands here directly (skipping autoLoadPlanner
     // entirely), so the 1)/2)/3) setup rows — hidden by default in the HTML
     // — need to be shown here too, or they just stay gone after a refresh.
-    _loadSavedEtdDays();
+    _resetEtdDays();
     show('#tp-etd-row', true);
     show('#tp-toggle-section', true);
     show('#tp-fetch-row', true);
