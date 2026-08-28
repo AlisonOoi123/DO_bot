@@ -3987,7 +3987,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
                         ts = pd.to_datetime(v, errors="coerce")
                         if pd.isna(ts):
                             return str(v)
-                        return ts.strftime("%-d/%-m/%y")
+                        # %-d/%-m (no leading zero) is a glibc-only strftime
+                        # extension — raises on Windows (the production
+                        # server's OS), which this except silently swallowed,
+                        # falling back to the unformatted raw value. Build the
+                        # string manually so it works on every platform.
+                        return f"{ts.day}/{ts.month}/{ts.strftime('%y')}"
                     except Exception:
                         return str(v)
                 df["DATE"] = df["DATE"].apply(_fmt_date_on_load).astype(str)
@@ -9550,7 +9555,12 @@ def _export_result_inner(sess) -> list[str]:
     # NUMBER), regardless of the uploaded file's own column layout — added
     # here, after the _orig_cols restriction above, so they're never dropped.
     try:
-        _add_date = _resolve_trip_day_date(sess.get("trip_day")).strftime("%-d/%-m/%Y")
+        # %-d/%-m (no leading zero) is a glibc-only strftime extension that
+        # raises on Windows (the production server's OS) — this except was
+        # silently swallowing it, leaving ADD blank. Build the string
+        # manually instead so it works on every platform.
+        _add_dt = _resolve_trip_day_date(sess.get("trip_day"))
+        _add_date = f"{_add_dt.day}/{_add_dt.month}/{_add_dt.year}"
     except Exception:
         _add_date = ""
     _trip_label = str(sess.get("trip_session") or "1")
