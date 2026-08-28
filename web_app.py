@@ -1426,49 +1426,16 @@ def api_board_refetch():
 
 @app.route("/api/download")
 def api_download():
+    """Same workbook as the Print button: a LORRY DAILY STATUS summary sheet
+    plus one sheet per assigned plate — download it and print straight from
+    Excel, no separate Print button needed."""
     sid = _active_user_sid()
     sess = bot.get_session(sid)
-    # Ensure the export bytes exist (build them if the user goes straight to
-    # download after seeing the result).
-    data = sess.get("export_bytes")
-    if not data:
-        try:
-            bot._export_result(sess)
-            data = sess.get("export_bytes")
-        except Exception:
-            data = None
-    if not data:
+    xbytes = _print_excel_bytes(sess)
+    if xbytes is None:
         return _with_cookie({"error": "Nothing to download yet."}, sid, 400)
-
-    # Append a second "Snapshot" sheet (lorry status format) computed fresh
-    # from the current session state, so it reflects any board edits made
-    # since the export bytes were last built.
-    try:
-        from openpyxl import load_workbook
-        from openpyxl.styles import Font
-        snap_rows = _snapshot_rows(sess)
-        if snap_rows:
-            wb = load_workbook(io.BytesIO(data))
-            if "Snapshot" in wb.sheetnames:
-                del wb["Snapshot"]
-            ws = wb.create_sheet("Snapshot")
-            headers = list(snap_rows[0].keys())
-            ws.append(headers)
-            for cell in ws[1]:
-                cell.font = Font(bold=True)
-            for r in snap_rows:
-                ws.append([r[h] for h in headers])
-            for col_idx, h in enumerate(headers, start=1):
-                ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = max(12, len(h) + 2)
-            buf = io.BytesIO()
-            wb.save(buf)
-            data = buf.getvalue()
-    except Exception:
-        import traceback
-        traceback.print_exc()
-
     return send_file(
-        io.BytesIO(data),
+        io.BytesIO(xbytes),
         as_attachment=True,
         download_name="DO_Assigned.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1546,23 +1513,6 @@ def _print_excel_bytes(sess) -> bytes | None:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
-
-
-@app.route("/api/board/print")
-def api_board_print():
-    sid = _active_user_sid()
-    sess = bot.get_session(sid)
-    if not sess.get("items"):
-        return _with_cookie({"error": "No board to print yet — fetch or upload DOs first."}, sid, 400)
-    xbytes = _print_excel_bytes(sess)
-    if xbytes is None:
-        return _with_cookie({"error": "Nothing to print yet."}, sid, 400)
-    return send_file(
-        io.BytesIO(xbytes),
-        as_attachment=True,
-        download_name="Lorry_Print.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
 
 @app.route("/api/reset", methods=["POST"])
@@ -2184,8 +2134,7 @@ _PAGE = r"""<!doctype html>
       </div>
       <div class="board-top-actions">
         <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
-        <a class="dl" href="/api/board/print"><button class="btn secondary" id="btn-board-print">🖨️ Print</button></a>
-        <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download</button></a>
+        <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download &amp; Print</button></a>
         <button class="btn secondary hidden" id="btn-board-table">📋 Table view</button>
       </div>
     </div>
