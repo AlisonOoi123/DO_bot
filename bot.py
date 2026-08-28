@@ -3085,8 +3085,11 @@ def _handle_trip_day(phone, sess, text):
                 ],
             }]
 
-    if _target_date < datetime.now().date():
+    _now = datetime.now()
+    if _target_date < _now.date():
         return ["❌ Can't plan for a date that's already passed — pick today or a future date."]
+    if _target_date == _now.date() and _now.hour >= 16:
+        return ["❌ It's after 4pm — today is closed for planning. Please pick tomorrow (or a later date) instead."]
 
     sess["trip_day"] = _target_date.isoformat()
     sess["state"]   = "AWAIT_EXCEL"

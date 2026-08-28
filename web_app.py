@@ -1129,6 +1129,16 @@ def api_trip_session():
     session = str((request.json or {}).get("session", "1")).strip().lower()
     if session not in ("1", "2", "3", "4"):
         return _with_cookie({"ok": False, "error": "Invalid session."}, sid, 400)
+    # Same 2pm/4pm cutoffs as /api/day, re-checked here too since the date
+    # and trip are set independently — a stale client clock or a direct API
+    # call must not bypass them.
+    _target_date = bot._resolve_trip_day_date(sess.get("trip_day"))
+    _now = datetime.now()
+    if _target_date == _now.date():
+        if _now.hour >= 16:
+            return _with_cookie({"ok": False, "error": "It's after 4pm — today is closed for planning. Pick tomorrow's date first."}, sid, 400)
+        if _now.hour >= 14 and session in ("1", "2"):
+            return _with_cookie({"ok": False, "error": "It's after 2pm — Trip 1/2 are closed for today. Pick Trip 3/4, or plan for tomorrow."}, sid, 400)
     sess["trip_session"] = session
     return _with_cookie({"ok": True, "session": session}, sid)
 
@@ -1446,50 +1456,60 @@ def api_download():
     )
 
 
-def _print_html(sess) -> str:
+def _print_html(sess) -> str | None:
     """Printable driver hand-off document: page 1 is the lorry-status
     summary (same shape/formulas as the Snapshot export sheet — DRIVER left
     blank), then one page per lorry that actually has DOs assigned, each
-    listing only that lorry's own DOs. Idle/unused lorries are skipped
-    entirely — this is only for what's actually going out today."""
+    listing only that lorry's own DOs with the SAME full column set as the
+    main Download export (NO/DATE/ADD/TRIP/DO NUMBER/.../SALES REP) — the
+    export bytes are the single source of truth for both, so the two never
+    drift apart. Idle/unused lorries are skipped entirely. Returns None if
+    there's nothing to export yet."""
     import html as _html
 
     def esc(v) -> str:
         return _html.escape(str(v), quote=True)
 
-    snap_rows = [r for r in _snapshot_rows(sess) if r["DONE"] == "✓"]
+    data = sess.get("export_bytes")
+    if not data:
+        try:
+            bot._export_result(sess)
+            data = sess.get("export_bytes")
+        except Exception:
+            data = None
+    if not data:
+        return None
 
-    items = sess.get("items", []) or []
+    export_df = pd.read_excel(io.BytesIO(data), sheet_name=0)
+    export_df.columns = [str(c).strip() for c in export_df.columns]
+    if "DRIVER" in export_df.columns:
+        export_df["DRIVER"] = ""   # always blank on the print sheet
+    columns = list(export_df.columns)
+
     by_plate: dict[str, list] = {}
-    for it in items:
-        lorry = it.get("LORRY")
-        if not lorry or lorry in _SENTINELS:
-            continue
-        by_plate.setdefault(lorry, []).append(it)
+    if "LICENSE" in export_df.columns:
+        _blank = {"", "nan", "none", "no_lorry", "split", "skipped"}
+        for _, row in export_df.iterrows():
+            plate = str(row.get("LICENSE", "")).strip()
+            if plate.lower() in _blank:
+                continue
+            by_plate.setdefault(plate, []).append(row)
 
-    def _do_sort_key(it):
-        _dt = pd.to_datetime(str(it.get("DATE", "")), dayfirst=True, errors="coerce")
-        _date_key = _dt if pd.notna(_dt) else pd.Timestamp.max
-        return (_date_key, str(it.get("DO NUMBER", "")))
-
-    fl = _fleet_lists(sess)
-    caps = {l["plate"]: l["capacity"] for l in fl["lorries"]}
+    snap_rows = [r for r in _snapshot_rows(sess) if r["DONE"] == "✓"]
 
     parts = ["""<!doctype html><html><head><meta charset="utf-8"><title>Print — Lorry Assignment</title>
 <style>
-  @page { size: A4 landscape; margin: 12mm; }
+  @page { size: A4 landscape; margin: 10mm; }
   * { box-sizing: border-box; }
   body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0; }
   .sheet { page-break-after: always; padding: 4mm 0; }
   .sheet:last-child { page-break-after: auto; }
   h1 { font-size: 16px; margin: 0 0 10px; }
-  h2 { font-size: 14px; margin: 0 0 4px; }
   .meta { font-size: 12px; color: #444; margin-bottom: 10px; }
-  table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  th, td { border: 1px solid #333; padding: 4px 6px; text-align: left; }
+  table { width: 100%; border-collapse: collapse; font-size: 9px; }
+  th, td { border: 1px solid #333; padding: 3px 4px; text-align: left; white-space: nowrap; }
   th { background: #eee; font-weight: 700; }
   td.num, th.num { text-align: right; }
-  .done { text-align: center; font-weight: 700; }
 </style></head><body>"""]
 
     # Page 1 — lorry status summary (same columns as the Snapshot export sheet).
@@ -1504,34 +1524,17 @@ def _print_html(sess) -> str:
         parts.append("<p>No lorries with assigned DOs.</p>")
     parts.append("</div>")
 
-    # One page per lorry with assigned DOs.
+    # One page per lorry with assigned DOs — same columns as the main export.
     for plate in sorted(by_plate.keys()):
-        dos = sorted(by_plate[plate], key=_do_sort_key)
-        cap = caps.get(plate)
-        total_w = sum(float(it.get("WEIGHT", 0) or 0) for it in dos)
+        rows = by_plate[plate]
         parts.append('<div class="sheet">')
         parts.append(f"<h1>LORRY: {esc(plate)}</h1>")
-        parts.append(
-            f'<div class="meta">DRIVER: ______________________ &nbsp;&nbsp; '
-            f'CAPACITY: {cap:.2f}T &nbsp;&nbsp; TOTAL: {total_w:.3f}T '
-            f'({len(dos)} DO{"s" if len(dos) != 1 else ""})</div>'
-            if cap is not None else
-            f'<div class="meta">DRIVER: ______________________ &nbsp;&nbsp; '
-            f'TOTAL: {total_w:.3f}T ({len(dos)} DO{"s" if len(dos) != 1 else ""})</div>'
-        )
-        parts.append(
-            "<table><thead><tr><th>NO</th><th>DO NUMBER</th><th>CODE</th>"
-            "<th>CUSTOMER NAME</th><th>ROUTE</th><th class=\"num\">WEIGHT (KG)</th>"
-            "<th>REMARKS</th></tr></thead><tbody>"
-        )
-        for i, it in enumerate(dos, start=1):
-            weight_kg = round(float(it.get("WEIGHT", 0) or 0) * 1000, 1)
-            parts.append(
-                f"<tr><td>{i}</td><td>{esc(it.get('DO NUMBER',''))}</td>"
-                f"<td>{esc(it.get('CODE',''))}</td><td>{esc(it.get('CUSTOMER NAME',''))}</td>"
-                f"<td>{esc(it.get('ROUTE',''))}</td><td class=\"num\">{weight_kg}</td>"
-                f"<td>{esc(it.get('REMARKS','') or '')}</td></tr>"
-            )
+        parts.append(f'<div class="meta">{len(rows)} DO{"s" if len(rows) != 1 else ""}</div>')
+        parts.append("<table><thead><tr>" + "".join(f"<th>{esc(c)}</th>" for c in columns) + "</tr></thead><tbody>")
+        for row in rows:
+            parts.append("<tr>" + "".join(
+                f"<td>{esc(row[c]) if pd.notna(row[c]) else ''}</td>" for c in columns
+            ) + "</tr>")
         parts.append("</tbody></table></div>")
 
     parts.append("<script>window.onload=function(){window.print();};</script>")
@@ -1545,7 +1548,10 @@ def api_board_print():
     sess = bot.get_session(sid)
     if not sess.get("items"):
         return _with_cookie({"error": "No board to print yet — fetch or upload DOs first."}, sid, 400)
-    return Response(_print_html(sess), mimetype="text/html")
+    html = _print_html(sess)
+    if html is None:
+        return _with_cookie({"error": "Nothing to print yet."}, sid, 400)
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/api/reset", methods=["POST"])
@@ -2360,6 +2366,7 @@ async function autoLoadPlanner(user, autoFetch){
       setMsg('#login-msg', null);
       setDayDate(dl.trip_day || _todayISO());
       setTripActive(dl.trip_session || '1');
+      await updateTimeRestrictions();
       _resetEtdDays();
       show('#tp-etd-row', true);
       show('#tp-toggle-section', true);
@@ -2396,13 +2403,17 @@ async function autoLoadPlanner(user, autoFetch){
       }
     }
 
-    // Default to Today / Any trip (matches prior behaviour) — the board's
-    // own Assign-for/Trip controls let the user switch before re-fetching.
-    setDayDate(_todayISO());
-    const dd = await jpost('/api/day',{day:_todayISO()});
+    // Default to the earliest still-plannable day/trip (today unless the
+    // 2pm/4pm cutoffs have already closed it) — the board's own
+    // Assign-for/Trip controls let the user switch before re-fetching.
+    const _defaultDay = _earliestAllowedDate();
+    setDayDate(_defaultDay);
+    const dd = await jpost('/api/day',{day:_defaultDay});
     if(!dd.ok){ setMsg('#login-msg', dd.messages||'Could not set trip day', true); return; }
-    setTripActive('1');
-    await jpost('/api/trip-session',{session:'1'});
+    const _defaultTrip = (_defaultDay===_todayISO() && new Date().getHours()>=14) ? '3' : '1';
+    setTripActive(_defaultTrip);
+    await jpost('/api/trip-session',{session:_defaultTrip});
+    await updateTimeRestrictions();
 
     setMsg('#login-msg', null);
     _resetEtdDays();
@@ -2527,9 +2538,20 @@ document.addEventListener('pointerup', async e=>{
 
 // ---- Assign-for date (calendar) — which SCHD weekday to plan against.
 // Deliberately NOT a filter on the DOs' own DATE column (see /api/day).
+// Cutoff rules (by explicit request): after 4pm, today is closed for
+// planning entirely — the earliest pickable date becomes tomorrow. Between
+// 2pm and 4pm today is still pickable but Trip 1/2 close first (only
+// Trip 3/4 may be used for today in that window).
 function _todayISO(){
   const d = new Date();
   return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,10);
+}
+function _tomorrowISO(){
+  const d = new Date(Date.now() + 24*3600*1000);
+  return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,10);
+}
+function _earliestAllowedDate(){
+  return new Date().getHours() >= 16 ? _tomorrowISO() : _todayISO();
 }
 function updateLateWarning(){
   const inp = $('#tp-day-date'), warn = $('#tp-day-late-warn');
@@ -2543,31 +2565,72 @@ function setDayDate(dateStr){
   if(inp) inp.value = dateStr;
   updateLateWarning();
 }
+function setTripActive(session){
+  ['1','2','3','4'].forEach(s=>{
+    const btn = $('#tp-trip-'+s);
+    if(!btn) return;
+    const isActive = s===session;
+    btn.classList.toggle('active', isActive);
+    btn.classList.toggle('secondary', !isActive);
+  });
+}
+// Re-checked on load, on date change, and every minute (so a page left
+// open across the 2pm/4pm cutoffs updates itself without a refresh).
+async function updateTimeRestrictions(){
+  const inp = $('#tp-day-date');
+  if(!inp) return;
+  const earliest = _earliestAllowedDate();
+  inp.min = earliest;
+  if(inp.value && inp.value < earliest){
+    setDayDate(earliest);
+    await jpost('/api/day', {day: earliest});
+    boardToast("It's after 4pm — today is closed for planning. Moved to tomorrow.");
+  }
+  const isToday = inp.value === _todayISO();
+  const block12 = isToday && new Date().getHours() >= 14;
+  ['1','2'].forEach(s=>{
+    const btn = $('#tp-trip-'+s);
+    if(btn) btn.disabled = block12;
+  });
+  if(block12){
+    const activeTrip = document.querySelector('.tp-trip-btn.active')?.dataset.tptrip;
+    if(activeTrip==='1' || activeTrip==='2'){
+      setTripActive('3');
+      await jpost('/api/trip-session', {session: '3'});
+      boardToast("It's after 2pm — Trip 1/2 are closed for today. Switched to Trip 3.");
+    }
+  }
+  updateLateWarning();
+}
 const _dayDateInput = $('#tp-day-date');
 if(_dayDateInput){
-  _dayDateInput.min = _todayISO();   // can't pick a backdated date
+  _dayDateInput.min = _earliestAllowedDate();
   _dayDateInput.addEventListener('change', async()=>{
     const val = _dayDateInput.value;
     if(!val) return;
-    updateLateWarning();
     const dd = await jpost('/api/day', {day: val});
     if(!dd.ok){
       boardToast(dd.error || (dd.messages && dd.messages[0]) || 'Could not set that date');
-      setDayDate(_todayISO());
-      await jpost('/api/day', {day: _todayISO()});
+      const fallback = _earliestAllowedDate();
+      setDayDate(fallback);
+      await jpost('/api/day', {day: fallback});
     }
+    await updateTimeRestrictions();
   });
+  setInterval(updateTimeRestrictions, 60000);
 }
 
-function setTripActive(session){
-  ['1','2','3','4'].forEach(s=>{
-    $('#tp-trip-'+s).classList.toggle('active', s===session);
-  });
-}
 document.querySelectorAll('.tp-trip-btn').forEach(b=>{
   b.onclick = async()=>{
+    if(b.disabled) return;
+    const prev = document.querySelector('.tp-trip-btn.active')?.dataset.tptrip;
     setTripActive(b.dataset.tptrip);
-    await jpost('/api/trip-session', {session: b.dataset.tptrip});
+    const d = await jpost('/api/trip-session', {session: b.dataset.tptrip});
+    if(!d.ok){
+      boardToast(d.error || 'Could not set that trip.');
+      if(prev) setTripActive(prev);
+      await updateTimeRestrictions();
+    }
   };
 });
 
@@ -3422,7 +3485,8 @@ async function boot(){
     show('#tp-etd-row', true);
     show('#tp-toggle-section', true);
     show('#tp-fetch-row', true);
-    setDayDate(_todayISO());
+    setDayDate(_earliestAllowedDate());
+    await updateTimeRestrictions();
     await loadLorryToggles();
     if(d.needs_picking){ await showPickingList(); } else { showBoard(); }
     return;
