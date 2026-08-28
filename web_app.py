@@ -1903,7 +1903,7 @@ _PAGE = r"""<!doctype html>
     <div class="msg hidden" id="picking-msg"></div>
     <div class="scroll" style="max-height:60vh">
       <table>
-        <thead><tr><th style="width:32px"></th><th>DO</th><th>Code</th><th>Customer</th><th>Route</th><th class="w">Weight</th><th>Date</th></tr></thead>
+        <thead><tr><th style="width:32px"></th><th>Date</th><th>DO</th><th>Code</th><th>Customer</th><th>Route</th><th class="w">Weight</th></tr></thead>
         <tbody id="picking-rows"></tbody>
       </table>
     </div>
@@ -2643,12 +2643,12 @@ function renderPickingList(rows){
   tbody.innerHTML = rows.map(r=>`
     <tr>
       <td><input type="checkbox" class="picking-cb" data-do="${esc(r.do)}" ${r.checked?'checked':''}></td>
+      <td>${esc(r.date)}</td>
       <td>${esc(r.do)}</td>
       <td>${esc(r.code)}</td>
       <td>${esc(r.customer)}</td>
       <td>${esc(r.route)}</td>
       <td class="w">${r.weight.toFixed(3)}T</td>
-      <td>${esc(r.date)}</td>
     </tr>`).join('');
   tbody.querySelectorAll('.picking-cb').forEach(cb=>{ cb.onchange = updatePickingCount; });
   updatePickingCount();
