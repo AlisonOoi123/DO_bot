@@ -3283,7 +3283,10 @@ function boardCardEl(o){
       return bar === -1
         ? {label: p, bold: false}
         : {label: p.slice(bar+1), bold: BOARD_BOLD_ITMREFS.has(p.slice(0, bar).trim())};
-    }) : [];
+    })
+    // Bold (highlight-list) items listed first — stable sort keeps each
+    // group's own original order otherwise.
+    .sort((a,b)=>(b.bold?1:0)-(a.bold?1:0)) : [];
   const productsHtml = productItems.length
     ? `<div class="b-meta b-products" style="color:var(--pink)">
          <div class="b-products-toggle">&#9656; ${productItems.length} product${productItems.length===1?'':'s'}</div>
