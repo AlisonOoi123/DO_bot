@@ -544,7 +544,10 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
                     WHERE SDHNUM_0 = :do_number
                 """),
                 {
-                    "plate": plate if plate else None,
+                    # ZLICENSE_0 is NOT NULL in Sage X3 — the existing fetch query
+                    # already defends against this with ISNULL(ZLICENSE_0, ''),
+                    # confirming '' is the "blank" convention here, not NULL.
+                    "plate": plate if plate else "",
                     "add_date": add_date if plate else None,
                     "do_number": do_number,
                 },
