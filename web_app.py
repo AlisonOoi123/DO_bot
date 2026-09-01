@@ -164,14 +164,16 @@ _SENTINELS = {"NO_LORRY", "NO_ELIGIBLE_LORRY", "SPLIT", "SKIPPED",
 
 # Not actionable by the logged-in planner at all today — not "their" route
 # (OTHER_USER), not their scheduled day (NOT_TODAY), outsourced (OUT_SOURCE),
-# explicitly skipped (REMARKS_SKIP), the wrong half-day (WRONG_TRIP), or
-# unchecked by the user on the Picking List (NOT_PICKED). _result_json
-# (table view) has always kept these out of the actionable "unassigned"
-# list, showing only a count via dos_other/skipped_other — _board_json must
-# apply the same exclusion or a planner's board pool ends up showing the
-# OTHER planner's routes (or DOs they deliberately excluded) as if they
-# were theirs to work on today.
-_NOT_MINE_TODAY = {"OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP", "NOT_PICKED"}
+# explicitly skipped (REMARKS_SKIP), the wrong half-day (WRONG_TRIP), more
+# than 30 days stale (PAST_DATE — bot.py's own comment says these should be
+# "left alone entirely", not just hidden from a lorry lane), or unchecked by
+# the user on the Picking List (NOT_PICKED). _result_json (table view) has
+# always kept these out of the actionable "unassigned" list, showing only a
+# count via dos_other/skipped_other — _board_json must apply the same
+# exclusion or a planner's board pool ends up showing the OTHER planner's
+# routes (or DOs they deliberately excluded, or DOs long past their date)
+# as if they were theirs to work on today.
+_NOT_MINE_TODAY = {"OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP", "PAST_DATE", "NOT_PICKED"}
 
 
 def _result_json(sess) -> dict:
