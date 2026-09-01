@@ -3452,7 +3452,7 @@ async function saveBoardToSql(){
       ...p.lorries.map(l=>`  ${l.plate}: ${l.ton_kg.toFixed(1)} KG`),
     ];
     if(p.dos_unassigned){
-      lines.push('', `${p.dos_unassigned} unassigned DO(s) in scope — if any were saved with a plate before, that will be cleared.`);
+      lines.push('', `${p.dos_unassigned} unassigned DO(s) in scope — left untouched, not written.`);
     }
     lines.push('', 'This writes directly to the live ERP database (SDELIVERY + ZLORRY). Continue?');
     if(!confirm(lines.join('\n'))) return;

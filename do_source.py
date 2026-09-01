@@ -490,16 +490,17 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
     per (add_date, trip, plate).
 
     rows: one dict per DO in the board's own scope (assigned AND
-    unassigned — an unassigned row is what clears a stale prior save):
+    unassigned — unassigned rows are only used for the ZLORRY totals
+    below; they are never written to SDELIVERY):
         {"do_number": str, "plate": str | None, "weight_kg": float}
     add_date: the "Assign for" date (a datetime.date) — ZLORRY.<date col>
         and SDELIVERY.ARVDAT_0.
     trip: the Trip number as a string ("1".."4") — ZLORRY.TRIP.
 
-    SDELIVERY.ZLICENSE_0/ARVDAT_0 are written to mirror the board exactly:
-    an assigned DO gets its plate + add_date; an unassigned DO gets both
-    cleared (NULL) — so a DO removed from a lorry since the last save
-    doesn't keep showing a stale plate in Sage X3.
+    SDELIVERY.ZLICENSE_0/ARVDAT_0 are written ONLY for assigned DOs (by
+    explicit request — unassigned DOs must never be touched, even to
+    clear a stale prior plate). A DO with no plate this save is simply
+    skipped; whatever SDELIVERY already holds for it is left alone.
 
     ZLORRY.TON (converted to KG here — callers pass weight_kg already) is
     the SUMMED weight of everything assigned to that plate for this exact
@@ -532,10 +533,14 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
         # OUTPUT, and SDELIVERY may well have one too; a plain UPDATE is
         # safe either way.
         for r in rows:
+            plate = r.get("plate")
+            if not plate:
+                # Unassigned DO — leave whatever SDELIVERY already has for
+                # it untouched, by explicit request.
+                continue
             do_number = str(r.get("do_number", "")).strip()
             if not do_number:
                 continue
-            plate = r.get("plate")
             conn.execute(
                 text(f"""
                     UPDATE {SCHEMA_NAME}.SDELIVERY
@@ -543,14 +548,7 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
                         ARVDAT_0 = :add_date
                     WHERE SDHNUM_0 = :do_number
                 """),
-                {
-                    # ZLICENSE_0 is NOT NULL in Sage X3 — the existing fetch query
-                    # already defends against this with ISNULL(ZLICENSE_0, ''),
-                    # confirming '' is the "blank" convention here, not NULL.
-                    "plate": plate if plate else "",
-                    "add_date": add_date if plate else None,
-                    "do_number": do_number,
-                },
+                {"plate": plate, "add_date": add_date, "do_number": do_number},
             )
             dos_written += 1
 
