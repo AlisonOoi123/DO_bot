@@ -2177,6 +2177,9 @@ _PAGE = r"""<!doctype html>
     overflow:hidden;text-overflow:ellipsis}
   .board-card .b-meta{color:var(--muted);font-size:10.5px;margin-top:1px;
     font-family:ui-monospace,Menlo,monospace}
+  .board-card .b-products-toggle{cursor:pointer;user-select:none}
+  .board-card .b-products-toggle:hover{text-decoration:underline}
+  .board-card .b-products-list{margin-top:2px}
   .board-card .b-warn{color:var(--warn);font-size:10.5px;margin-top:3px}
   .board-ghost{position:fixed;transform:translate(-50%,-120%);display:flex;gap:8px;
     align-items:center;background:var(--card2);border:1px solid var(--brand);border-radius:8px;
@@ -3266,9 +3269,12 @@ function boardCardEl(o){
   const deleteBtn = o.lorry
     ? `<button class="b-delete" title="Remove from ${esc(o.lorry)} and return to unassigned">&times;</button>`
     : '';
-  const productsHtml = o.products
-    ? o.products.split(';').map(p=>p.trim()).filter(Boolean)
-        .map(p=>`<div>&bull; ${esc(p)}</div>`).join('')
+  const productItems = o.products ? o.products.split(';').map(p=>p.trim()).filter(Boolean) : [];
+  const productsHtml = productItems.length
+    ? `<div class="b-meta b-products" style="color:var(--pink);font-weight:700">
+         <div class="b-products-toggle">&#9656; ${productItems.length} product${productItems.length===1?'':'s'}</div>
+         <div class="b-products-list hidden">${productItems.map(p=>`<div>&bull; ${esc(p)}</div>`).join('')}</div>
+       </div>`
     : '';
   el.innerHTML=`
     <span class="b-stripe" style="background:${color}"></span>
@@ -3277,7 +3283,7 @@ function boardCardEl(o){
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
-      ${productsHtml?`<div class="b-meta" style="color:var(--pink);font-weight:700">${productsHtml}</div>`:''}
+      ${productsHtml}
       ${o.reason?`<div class="b-meta" style="color:var(--bad)">${esc(o.reason)}</div>`:''}
       ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
     </div>`;
@@ -3287,8 +3293,18 @@ function boardCardEl(o){
       moveBoardCard(o.do, null);
     });
   }
+  const _prodToggle = el.querySelector('.b-products-toggle');
+  if(_prodToggle){
+    _prodToggle.addEventListener('click', e=>{
+      e.stopPropagation();
+      const list = el.querySelector('.b-products-list');
+      const expanding = list.classList.contains('hidden');
+      list.classList.toggle('hidden', !expanding);
+      _prodToggle.innerHTML = `${expanding?'&#9662;':'&#9656;'} ${productItems.length} product${productItems.length===1?'':'s'}`;
+    });
+  }
   el.addEventListener('pointerdown', e=>{
-    if(e.target.classList.contains('b-delete')) return;
+    if(e.target.classList.contains('b-delete') || e.target.closest('.b-products-toggle')) return;
     startBoardDrag(e,o.do);
   });
   if(boardDrag && boardDrag.doId===o.do) el.classList.add('dragging');
