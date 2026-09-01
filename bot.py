@@ -8076,6 +8076,23 @@ def _handle_excel_upload(phone, sess, file_bytes):
         seen_do = {}
         pending_dos = []
         _remarks_skip_count = sum(1 for it in items if it.get("LORRY") in ("REMARKS_SKIP", "OUT_SOURCE"))
+        # Post-fetch classification breakdown — mirrors do_source's own
+        # LAST_FETCH_DIAGNOSTICS but for the exclusions that happen AFTER the
+        # SQL fetch (route ownership, day-of-week schedule, backdate cutoff,
+        # trip mismatch, REMARKS-driven skip). A healthy SQL fetch can still
+        # collapse to a small visible board if one of these is over-broad;
+        # surfaced via /api/dos-fetch and /api/board/refetch's "fetch
+        # details" so that's diagnosable without guessing which stage did it.
+        sess["_last_parse_diagnostics"] = {
+            "raw_rows_parsed": int(len(raw)),
+            "other_user": _other_user_count,
+            "not_today": _not_today_count,
+            "past_date": _past_date_count,
+            "wrong_trip": _wrong_trip_count,
+            "remarks_skip": _remarks_skip_count,
+            "actionable": len(items) - _other_user_count - _not_today_count
+                          - _past_date_count - _wrong_trip_count - _remarks_skip_count,
+        }
         for item in items:
             if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE", "PAST_DATE", "WRONG_TRIP"):
                 continue          # keep in raw_df for export blank; hide from UI

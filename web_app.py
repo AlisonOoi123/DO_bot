@@ -977,6 +977,8 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -
     # loaded" board message once /api/board is queried afterwards.
     if not sess.get("items") and msgs and str(msgs[0]).strip().startswith("❌"):
         resp["error"] = msgs[0]
+    if sess.get("_last_parse_diagnostics"):
+        resp["parse_diagnostics"] = sess["_last_parse_diagnostics"]
     return resp
 
 
@@ -2251,6 +2253,8 @@ _PAGE = r"""<!doctype html>
       <span id="picking-count" style="margin-left:auto;font-size:12.5px;color:var(--muted);font-weight:600"></span>
     </div>
     <div class="msg hidden" id="picking-msg"></div>
+    <span id="picking-fetch-diag-toggle" class="hidden" style="cursor:pointer;color:var(--muted);text-decoration:underline;font-size:12px">ℹ️ fetch details</span>
+    <div id="picking-fetch-diag" class="hidden" style="margin:6px 0;font-size:12px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap"></div>
     <div class="scroll" style="max-height:60vh">
       <table>
         <thead><tr><th style="width:32px"></th><th>Date</th><th>DO</th><th>Code</th><th>Customer</th><th>Route</th><th class="w">Weight</th></tr></thead>
@@ -2909,7 +2913,9 @@ document.querySelectorAll('[data-day]').forEach(b=>b.onclick=async()=>{
 
 // ---- Step 4: DOs ----
 // Shared by manual upload and "use fetched DOs directly" — same response shape.
+let LAST_PARSE_DIAG = null;
 function handleDosResponse(d){
+  LAST_PARSE_DIAG = d.parse_diagnostics || null;
   if(d.offschedule){
     const os=d.offschedule;
     const dayTxt = os.day==='tomorrow' ? 'tomorrow' : 'today';
@@ -2940,22 +2946,8 @@ async function doFetchDos(){
     if(d.error){ setMsg('#dos-fetch-msg', d.error, true); return; }
     setMsg('#dos-fetch-msg', null);
     $('#dos-fetch-summary').textContent = `Found ${d.count} DO(s), ${d.weight}T total.`;
-    const diagEl = $('#dos-fetch-diag');
+    $('#dos-fetch-diag').textContent = buildDiagText(d) || '(no diagnostics returned)';
     show('#dos-fetch-diag', false);
-    if(d.diagnostics){
-      const dg = d.diagnostics;
-      diagEl.textContent = `raw SQL rows: ${dg.raw_rows_from_sql}\n`+
-        `after not-LOAN: ${dg.after_not_loan}\n`+
-        `after site 1SA: ${dg.after_site_1SA}\n`+
-        `after not-yet-validated: ${dg.after_not_validated}\n`+
-        `after known route: ${dg.after_known_route}\n`+
-        `after 30-day floor: ${dg.after_30day_floor}`+
-        (dg.after_etd_window!=null?`\nafter ETD window: ${dg.after_etd_window}`:'')+
-        `\nsite codes seen: ${(dg.distinct_stofcy_seen||[]).join(', ')||'none'}`+
-        `\ntypes seen: ${(dg.distinct_sdhtyp_seen||[]).join(', ')||'none'}`;
-    } else {
-      diagEl.textContent = '(no diagnostics returned)';
-    }
     show('#dos-fetch-result', true);
   } finally { btn.disabled=false; }
 }
@@ -3064,7 +3056,14 @@ async function showPickingList(){
   if(d.error){ setMsg('#picking-msg', d.error, true); return; }
   setMsg('#picking-msg', null);
   renderPickingList(d.rows || []);
+  const diagText = buildDiagText({parse_diagnostics: LAST_PARSE_DIAG});
+  $('#picking-fetch-diag').textContent = diagText;
+  show('#picking-fetch-diag', false);
+  show('#picking-fetch-diag-toggle', !!diagText);
 }
+$('#picking-fetch-diag-toggle').onclick=()=>{
+  show('#picking-fetch-diag', $('#picking-fetch-diag').classList.contains('hidden'));
+};
 function renderPickingList(rows){
   PICKING_ROWS = rows;
   const tbody = $('#picking-rows');
@@ -3554,21 +3553,41 @@ async function saveBoardToSql(){
 }
 $('#btn-board-save').onclick=saveBoardToSql;
 
-function renderFetchDiag(d){
-  const toggle=$('#board-fetch-diag-toggle'), diagEl=$('#board-fetch-diag');
-  show('#board-fetch-diag', false);
-  if(!d || !d.diagnostics || !Object.keys(d.diagnostics).length){ show('#board-fetch-diag-toggle', false); return; }
-  const dg=d.diagnostics;
-  diagEl.textContent = `raw SQL rows: ${dg.raw_rows_from_sql}\n`+
-    `after not-LOAN: ${dg.after_not_loan}\n`+
-    `after site 1SA: ${dg.after_site_1SA}\n`+
-    `after not-yet-validated: ${dg.after_not_validated}\n`+
-    `after known route: ${dg.after_known_route}\n`+
-    `after 30-day floor: ${dg.after_30day_floor}`+
-    (dg.after_etd_window!=null?`\nafter ETD window: ${dg.after_etd_window}`:'')+
-    `\nsite codes seen: ${(dg.distinct_stofcy_seen||[]).join(', ')||'none'}`+
-    `\ntypes seen: ${(dg.distinct_sdhtyp_seen||[]).join(', ')||'none'}`;
-  show('#board-fetch-diag-toggle', true);
+function buildDiagText(d){
+  const parts=[];
+  if(d && d.diagnostics && Object.keys(d.diagnostics).length){
+    const dg=d.diagnostics;
+    parts.push(`SQL FETCH\n`+
+      `raw SQL rows: ${dg.raw_rows_from_sql}\n`+
+      `after not-LOAN: ${dg.after_not_loan}\n`+
+      `after site 1SA: ${dg.after_site_1SA}\n`+
+      `after not-yet-validated: ${dg.after_not_validated}\n`+
+      `after known route: ${dg.after_known_route}\n`+
+      `after 30-day floor: ${dg.after_30day_floor}`+
+      (dg.after_etd_window!=null?`\nafter ETD window: ${dg.after_etd_window}`:'')+
+      `\nsite codes seen: ${(dg.distinct_stofcy_seen||[]).join(', ')||'none'}`+
+      `\ntypes seen: ${(dg.distinct_sdhtyp_seen||[]).join(', ')||'none'}`);
+  }
+  if(d && d.parse_diagnostics){
+    const pg=d.parse_diagnostics;
+    parts.push(`AFTER-FETCH CLASSIFICATION\n`+
+      `rows parsed: ${pg.raw_rows_parsed}\n`+
+      `excluded — other user's route: ${pg.other_user}\n`+
+      `excluded — not on today's schedule: ${pg.not_today}\n`+
+      `excluded — older than 30-day cutoff: ${pg.past_date}\n`+
+      `excluded — wrong trip: ${pg.wrong_trip}\n`+
+      `excluded — REMARKS skip: ${pg.remarks_skip}\n`+
+      `= actionable (this planner's pool): ${pg.actionable}`);
+  }
+  return parts.join('\n\n');
+}
+
+function renderFetchDiag(d, toggleSel, diagSel){
+  const text = buildDiagText(d);
+  show(diagSel, false);
+  if(!text){ show(toggleSel, false); return; }
+  $(diagSel).textContent = text;
+  show(toggleSel, true);
 }
 $('#board-fetch-diag-toggle').onclick=()=>{
   show('#board-fetch-diag', $('#board-fetch-diag').classList.contains('hidden'));
@@ -3580,7 +3599,7 @@ async function refetchDOs(){
   show('#board-fetch-diag-toggle', false); show('#board-fetch-diag', false);
   try{
     const d=await jpost('/api/board/refetch',{});
-    renderFetchDiag(d);
+    renderFetchDiag(d, '#board-fetch-diag-toggle', '#board-fetch-diag');
     if(d.error){ setMsg('#board-msg', d.error, true); return; }
     if(d.board){ BOARD=d.board; renderBoard(); }
     const n=d.new_count||0;
