@@ -1915,7 +1915,7 @@ _PAGE = r"""<!doctype html>
   :root{
     --bg:#0f172a; --card:#1e293b; --card2:#273449; --line:#334155;
     --ink:#e2e8f0; --muted:#94a3b8; --brand:#38bdf8; --brand2:#0ea5e9;
-    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --stage:#c084fc; --pink:#db2777; --radius:14px;
+    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --stage:#c084fc; --pink:#F6D4DC; --radius:14px;
   }
   @media (prefers-color-scheme: light){
     :root{ --bg:#f1f5f9; --card:#ffffff; --card2:#f8fafc; --line:#e2e8f0;
