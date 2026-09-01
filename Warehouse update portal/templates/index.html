@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Warehouse Route &amp; Remarks Update</title>
+<style>
+    :root {
+        --primary: #1c6e4a;
+        --primary-dark: #14503a;
+        --bg: #f4f6f5;
+        --card-bg: #ffffff;
+        --border: #dfe3e1;
+        --text: #1f2a26;
+        --muted: #6b7773;
+        --warn-bg: #fff6e0;
+        --warn-border: #ecd48a;
+        --warn-text: #6b5300;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+    }
+    header {
+        background: var(--primary);
+        color: #fff;
+        padding: 16px 20px;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+    }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header .user { font-size: 12px; opacity: 0.85; margin-top: 2px; }
+    header .logout {
+        color: #fff;
+        font-size: 12px;
+        text-decoration: underline;
+        opacity: 0.9;
+    }
+    .container {
+        max-width: 480px;
+        margin: 0 auto;
+        padding: 16px;
+    }
+    .card {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 16px;
+    }
+    input[type="text"], input[type="number"] {
+        width: 100%;
+        padding: 12px 14px;
+        font-size: 16px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        outline: none;
+    }
+    input[type="text"]:focus, input[type="number"]:focus { border-color: var(--primary); }
+
+    .result-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--border);
+        cursor: pointer;
+    }
+    .result-item:last-child { border-bottom: none; }
+    .result-item:active, .result-item.selected { background: #eef6f1; }
+    .result-checkbox { width: 20px; height: 20px; flex-shrink: 0; accent-color: var(--primary); }
+    .result-text { flex: 1; min-width: 0; }
+    .result-code { font-weight: 600; font-size: 15px; }
+    .result-name { font-size: 13px; color: var(--muted); }
+    .result-route { font-size: 12px; color: var(--muted); }
+
+    .selected-summary { margin-top: 14px; }
+    .chip-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .chip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: #eef6f1;
+        border: 1px solid #cfe6da;
+        color: var(--primary-dark);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-size: 13px;
+    }
+    .chip button {
+        border: none;
+        background: none;
+        color: var(--primary-dark);
+        font-weight: 700;
+        cursor: pointer;
+        padding: 0;
+        line-height: 1;
+    }
+
+    .customer-banner {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 14px;
+    }
+    .customer-banner .code { font-weight: 700; font-size: 16px; }
+    .customer-banner .name { font-size: 13px; color: var(--muted); }
+    .change-btn {
+        font-size: 12px;
+        color: var(--primary);
+        background: none;
+        border: none;
+        text-decoration: underline;
+        cursor: pointer;
+        padding: 0;
+        white-space: nowrap;
+    }
+
+    .cat-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+    }
+    .cat-btn {
+        padding: 18px 8px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #fafcfb;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+        text-align: center;
+    }
+    .cat-btn.active {
+        background: var(--primary);
+        color: #fff;
+        border-color: var(--primary);
+    }
+    .cat-btn.locked {
+        color: var(--muted);
+    }
+    .cat-btn.locked::after {
+        content: " \1F512";
+    }
+
+    .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 4px;
+        border-bottom: 1px solid var(--border);
+    }
+    .toggle-row:last-child { border-bottom: none; }
+    .toggle-label { font-size: 15px; }
+
+    .switch {
+        position: relative;
+        display: inline-block;
+        width: 48px;
+        height: 28px;
+        flex-shrink: 0;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+        position: absolute; cursor: pointer;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background-color: #ccc;
+        border-radius: 28px;
+        transition: 0.15s;
+    }
+    .slider:before {
+        position: absolute;
+        content: "";
+        height: 22px; width: 22px;
+        left: 3px; bottom: 3px;
+        background-color: white;
+        border-radius: 50%;
+        transition: 0.15s;
+    }
+    input:checked + .slider { background-color: var(--primary); }
+    input:checked + .slider:before { transform: translateX(20px); }
+    input:disabled + .slider { opacity: 0.5; cursor: not-allowed; }
+
+    .save-bar {
+        display: flex;
+        gap: 10px;
+        margin-top: 16px;
+    }
+    button.primary {
+        flex: 1;
+        padding: 14px;
+        border-radius: 10px;
+        border: none;
+        background: var(--primary);
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    button.primary:active { background: var(--primary-dark); }
+    button.primary:disabled { background: #a9b8b1; cursor: not-allowed; }
+    button.secondary {
+        padding: 14px 18px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--text);
+        font-size: 15px;
+        cursor: pointer;
+    }
+
+    .bulk-warning {
+        background: var(--warn-bg);
+        border: 1px solid var(--warn-border);
+        color: var(--warn-text);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 13px;
+        margin-bottom: 12px;
+    }
+    .route-current {
+        background: #fafcfb;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 13px;
+        margin-bottom: 12px;
+    }
+    .route-current .val { font-weight: 600; color: var(--text); }
+    .route-list {
+        max-height: 280px;
+        overflow-y: auto;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        margin-top: 10px;
+    }
+    .route-option {
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border);
+        cursor: pointer;
+        font-size: 14px;
+    }
+    .route-option:last-child { border-bottom: none; }
+    .route-option:active, .route-option.selected { background: #eef6f1; }
+    .route-option .num { font-weight: 600; margin-right: 6px; }
+    .route-custom-toggle {
+        width: 100%;
+        margin-top: 10px;
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px dashed var(--border);
+        background: none;
+        color: var(--muted);
+        font-size: 13px;
+        cursor: pointer;
+    }
+    .route-preview {
+        margin-top: 12px;
+        font-size: 13px;
+        color: var(--muted);
+    }
+    .route-preview .val { color: var(--text); font-weight: 600; }
+    .locked-message {
+        background: #f2f2f2;
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 16px;
+        font-size: 14px;
+        text-align: center;
+        margin-bottom: 16px;
+    }
+
+    .toast {
+        position: fixed;
+        bottom: 20px; left: 50%;
+        transform: translateX(-50%);
+        background: var(--text);
+        color: #fff;
+        padding: 12px 20px;
+        border-radius: 10px;
+        font-size: 14px;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s;
+        max-width: 90%;
+        text-align: center;
+    }
+    .toast.show { opacity: 1; }
+    .toast.error { background: #a83232; }
+
+    .hidden { display: none !important; }
+    .muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+    <div>
+        <h1>Warehouse Route &amp; Remarks Update</h1>
+        <div class="user">Logged in as {{ username }}</div>
+    </div>
+    <a class="logout" href="/logout">Log out</a>
+</header>
+
+<div class="container">
+
+    <!-- STEP 1: Search + select one or more customers -->
+    <div class="card" id="search-card">
+        <input type="text" id="search-box" placeholder="Search customer code or name...">
+        <div id="search-results" style="margin-top:10px;"></div>
+
+        <div class="selected-summary hidden" id="selected-summary">
+            <div class="muted">Selected (<span id="selected-count">0</span>)</div>
+            <div class="chip-list" id="selected-chips"></div>
+            <div class="save-bar">
+                <button class="primary" id="continue-btn">Continue</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- STEP 2 + 3: Selected customer(s) + categories + toggles -->
+    <div class="card hidden" id="detail-card">
+        <div class="customer-banner">
+            <div>
+                <div class="code" id="detail-code"></div>
+                <div class="name" id="detail-name"></div>
+            </div>
+            <button class="change-btn" id="change-customer-btn">Change selection</button>
+        </div>
+
+        <div class="cat-grid" id="cat-grid"></div>
+
+        <div id="locked-section" class="hidden" style="margin-top:16px;">
+            <div class="locked-message" id="locked-message"></div>
+            <button class="secondary" id="locked-back-btn" style="width:100%;">Back</button>
+        </div>
+
+        <div id="toggle-section" class="hidden" style="margin-top:16px;">
+            <div class="bulk-warning hidden" id="bulk-warning"></div>
+            <div id="toggle-list"></div>
+            <div class="save-bar">
+                <button class="secondary" id="cancel-btn">Back</button>
+                <button class="primary" id="save-btn">Save changes</button>
+            </div>
+        </div>
+
+        <div id="route-section" class="hidden" style="margin-top:16px;">
+            <div class="muted" id="route-note" style="margin-bottom:10px;"></div>
+            <div class="bulk-warning hidden" id="route-bulk-warning"></div>
+            <div class="route-current hidden" id="route-current-box">
+                Current route: <span class="val" id="route-current-val"></span>
+            </div>
+            <input type="text" id="route-search" placeholder="Search route code or name...">
+            <div class="route-list" id="route-options"></div>
+            <button type="button" class="route-custom-toggle" id="route-custom-toggle">
+                Can't find this route? Enter a new code instead
+            </button>
+            <div id="route-custom-fields" class="hidden" style="margin-top:10px;">
+                <div class="bulk-warning">
+                    This route code is not on the reference list. Please confirm
+                    with the IT department before adding a new code &mdash; route
+                    names are only kept in this portal's route list, so an
+                    unlisted code can make routes inconsistent for everyone else.
+                </div>
+                <input type="number" id="route-custom-number" min="0" max="255" placeholder="New route code number (0-255)" style="margin-top:10px;">
+            </div>
+            <div class="route-preview" id="route-preview"></div>
+            <div class="save-bar">
+                <button class="secondary" id="route-cancel-btn">Back</button>
+                <button class="primary" id="route-save-btn">Save route</button>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const categories = {{ categories | tojson }};
+
+// selectedCustomers: Map key "bpcnum|bpaadd" -> {bpcnum, bpaadd, name}
+let selectedCustomers = new Map();
+let singleCustomerDetail = null;  // populated only when exactly 1 customer is selected (real current values)
+let currentCategory = null;
+
+const searchBox = document.getElementById('search-box');
+const searchResults = document.getElementById('search-results');
+const searchCard = document.getElementById('search-card');
+const selectedSummary = document.getElementById('selected-summary');
+const selectedCount = document.getElementById('selected-count');
+const selectedChips = document.getElementById('selected-chips');
+const continueBtn = document.getElementById('continue-btn');
+
+const detailCard = document.getElementById('detail-card');
+const detailCode = document.getElementById('detail-code');
+const detailName = document.getElementById('detail-name');
+const catGrid = document.getElementById('cat-grid');
+const lockedSection = document.getElementById('locked-section');
+const lockedMessage = document.getElementById('locked-message');
+const lockedBackBtn = document.getElementById('locked-back-btn');
+const toggleSection = document.getElementById('toggle-section');
+const bulkWarning = document.getElementById('bulk-warning');
+const toggleList = document.getElementById('toggle-list');
+const toast = document.getElementById('toast');
+const changeCustomerBtn = document.getElementById('change-customer-btn');
+const cancelBtn = document.getElementById('cancel-btn');
+const saveBtn = document.getElementById('save-btn');
+
+const routeSection = document.getElementById('route-section');
+const routeNote = document.getElementById('route-note');
+const routeBulkWarning = document.getElementById('route-bulk-warning');
+const routeCurrentBox = document.getElementById('route-current-box');
+const routeCurrentVal = document.getElementById('route-current-val');
+const routeSearch = document.getElementById('route-search');
+const routeOptions = document.getElementById('route-options');
+const routeCustomToggle = document.getElementById('route-custom-toggle');
+const routeCustomFields = document.getElementById('route-custom-fields');
+const routeCustomNumber = document.getElementById('route-custom-number');
+const routePreview = document.getElementById('route-preview');
+const routeCancelBtn = document.getElementById('route-cancel-btn');
+const routeSaveBtn = document.getElementById('route-save-btn');
+
+let routesCache = null;       // [{number, message}, ...] once loaded from /api/routes
+let selectedRouteNumber = null;
+
+function escapeHtml(s) {
+    return (s ?? '').toString()
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function showToast(msg, isError) {
+    toast.textContent = msg;
+    toast.className = 'toast show' + (isError ? ' error' : '');
+    setTimeout(() => { toast.className = 'toast'; }, 3200);
+}
+
+function custKey(bpcnum, bpaadd) { return `${bpcnum}|${bpaadd}`; }
+
+// ---------------------------------------------------------------------------
+// Search + multi-select
+// ---------------------------------------------------------------------------
+let searchTimer = null;
+searchBox.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    const q = searchBox.value.trim();
+    if (q.length < 2) { searchResults.innerHTML = ''; return; }
+    searchTimer = setTimeout(() => runSearch(q), 300);
+});
+
+async function runSearch(q) {
+    try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+        if (res.status === 401) { window.location.href = '/login'; return; }
+        if (!res.ok) throw new Error('Search failed');
+        const data = await res.json();
+        renderResults(data.results);
+    } catch (e) {
+        showToast('Search error: ' + e.message, true);
+    }
+}
+
+function renderResults(results) {
+    if (results.length === 0) {
+        searchResults.innerHTML = '<div class="muted">No matches</div>';
+        return;
+    }
+    searchResults.innerHTML = results.map(r => {
+        const key = custKey(r.bpcnum, r.bpaadd);
+        const isChecked = selectedCustomers.has(key);
+        return `
+        <div class="result-item" data-bpcnum="${escapeHtml(r.bpcnum)}" data-bpaadd="${escapeHtml(r.bpaadd)}" data-name="${escapeHtml(r.name)}">
+            <input type="checkbox" class="result-checkbox" ${isChecked ? 'checked' : ''}>
+            <div class="result-text">
+                <div class="result-code">${escapeHtml(r.bpcnum)} <span class="muted">/ ${escapeHtml(r.bpaadd)}</span></div>
+                <div class="result-name">${escapeHtml(r.name)}</div>
+                <div class="result-route">Route: ${r.route ?? '-'}${r.route_message ? ' &mdash; ' + escapeHtml(r.route_message) : ''}</div>
+            </div>
+        </div>
+    `;
+    }).join('');
+
+    document.querySelectorAll('.result-item').forEach(el => {
+        el.addEventListener('click', (e) => {
+            const checkbox = el.querySelector('.result-checkbox');
+            if (e.target !== checkbox) checkbox.checked = !checkbox.checked;
+            toggleSelection(el.dataset.bpcnum, el.dataset.bpaadd, el.dataset.name, checkbox.checked);
+        });
+    });
+}
+
+function toggleSelection(bpcnum, bpaadd, name, isSelected) {
+    const key = custKey(bpcnum, bpaadd);
+    if (isSelected) {
+        selectedCustomers.set(key, { bpcnum, bpaadd, name });
+    } else {
+        selectedCustomers.delete(key);
+    }
+    renderSelectedSummary();
+}
+
+function renderSelectedSummary() {
+    const count = selectedCustomers.size;
+    if (count === 0) {
+        selectedSummary.classList.add('hidden');
+        return;
+    }
+    selectedSummary.classList.remove('hidden');
+    selectedCount.textContent = count;
+    selectedChips.innerHTML = Array.from(selectedCustomers.values()).map(c => `
+        <div class="chip">
+            <span>${escapeHtml(c.bpcnum)}/${escapeHtml(c.bpaadd)}</span>
+            <button data-bpcnum="${escapeHtml(c.bpcnum)}" data-bpaadd="${escapeHtml(c.bpaadd)}" title="Remove">&times;</button>
+        </div>
+    `).join('');
+
+    selectedChips.querySelectorAll('button').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const key = custKey(btn.dataset.bpcnum, btn.dataset.bpaadd);
+            selectedCustomers.delete(key);
+            renderSelectedSummary();
+            document.querySelectorAll('.result-item').forEach(el => {
+                if (el.dataset.bpcnum === btn.dataset.bpcnum && el.dataset.bpaadd === btn.dataset.bpaadd) {
+                    el.querySelector('.result-checkbox').checked = false;
+                }
+            });
+        });
+    });
+}
+
+continueBtn.addEventListener('click', async () => {
+    if (selectedCustomers.size === 0) return;
+
+    if (selectedCustomers.size === 1) {
+        const only = Array.from(selectedCustomers.values())[0];
+        await loadSingleCustomer(only.bpcnum, only.bpaadd);
+    } else {
+        singleCustomerDetail = null;
+        renderDetailScreen();
+    }
+});
+
+async function loadSingleCustomer(bpcnum, bpaadd) {
+    try {
+        const res = await fetch(`/api/customer?bpcnum=${encodeURIComponent(bpcnum)}&bpaadd=${encodeURIComponent(bpaadd)}`);
+        if (res.status === 401) { window.location.href = '/login'; return; }
+        if (!res.ok) throw new Error('Customer not found');
+        singleCustomerDetail = await res.json();
+        renderDetailScreen();
+    } catch (e) {
+        showToast(e.message, true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Detail screen: category grid + toggles (single or bulk mode)
+// ---------------------------------------------------------------------------
+function renderDetailScreen() {
+    searchCard.classList.add('hidden');
+    detailCard.classList.remove('hidden');
+    toggleSection.classList.add('hidden');
+    lockedSection.classList.add('hidden');
+    routeSection.classList.add('hidden');
+    currentCategory = null;
+
+    if (selectedCustomers.size === 1 && singleCustomerDetail) {
+        detailCode.textContent = `${singleCustomerDetail.bpcnum} / ${singleCustomerDetail.bpaadd}`;
+        detailName.textContent = singleCustomerDetail.name;
+    } else {
+        detailCode.textContent = `${selectedCustomers.size} customers selected`;
+        detailName.textContent = Array.from(selectedCustomers.values()).map(c => c.bpcnum).join(', ');
+    }
+
+    const catKeys = Object.keys(categories);
+    catGrid.innerHTML = catKeys.map(key => `
+        <button class="cat-btn ${categories[key].locked ? 'locked' : ''}" data-cat="${key}">${categories[key].title}</button>
+    `).join('');
+
+    document.querySelectorAll('.cat-btn').forEach(btn => {
+        btn.addEventListener('click', () => selectCategory(btn.dataset.cat));
+    });
+}
+
+function selectCategory(catKey) {
+    currentCategory = catKey;
+    document.querySelectorAll('.cat-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.cat === catKey);
+    });
+
+    const cat = categories[catKey];
+
+    if (cat.locked) {
+        toggleSection.classList.add('hidden');
+        routeSection.classList.add('hidden');
+        lockedSection.classList.remove('hidden');
+        lockedMessage.textContent = cat.locked_message || 'This category cannot be changed here. Please contact IT.';
+        return;
+    }
+    lockedSection.classList.add('hidden');
+
+    if (cat.type === 'route') {
+        toggleSection.classList.add('hidden');
+        selectRouteCategory();
+        return;
+    }
+    routeSection.classList.add('hidden');
+
+    const isBulk = !(selectedCustomers.size === 1 && singleCustomerDetail);
+
+    if (isBulk) {
+        bulkWarning.classList.remove('hidden');
+        bulkWarning.textContent = `This will set the value below for ALL ${selectedCustomers.size} selected customers, replacing whatever they currently have for ${cat.title}.`;
+        toggleList.innerHTML = cat.columns.map(([col, label]) => `
+            <div class="toggle-row">
+                <span class="toggle-label">${escapeHtml(label)}</span>
+                <label class="switch">
+                    <input type="checkbox" data-col="${col}">
+                    <span class="slider"></span>
+                </label>
+            </div>
+        `).join('');
+    } else {
+        bulkWarning.classList.add('hidden');
+        const items = singleCustomerDetail.categories[catKey];
+        toggleList.innerHTML = items.map(item => `
+            <div class="toggle-row">
+                <span class="toggle-label">${escapeHtml(item.label)}</span>
+                <label class="switch">
+                    <input type="checkbox" data-col="${item.column}" ${item.checked ? 'checked' : ''}>
+                    <span class="slider"></span>
+                </label>
+            </div>
+        `).join('');
+    }
+
+    toggleSection.classList.remove('hidden');
+}
+
+lockedBackBtn.addEventListener('click', () => {
+    lockedSection.classList.add('hidden');
+    document.querySelectorAll('.cat-btn').forEach(btn => btn.classList.remove('active'));
+    currentCategory = null;
+});
+
+changeCustomerBtn.addEventListener('click', () => {
+    selectedCustomers.clear();
+    singleCustomerDetail = null;
+    currentCategory = null;
+    detailCard.classList.add('hidden');
+    routeSection.classList.add('hidden');
+    searchCard.classList.remove('hidden');
+    searchBox.value = '';
+    searchResults.innerHTML = '';
+    renderSelectedSummary();
+    searchBox.focus();
+});
+
+cancelBtn.addEventListener('click', () => {
+    toggleSection.classList.add('hidden');
+    document.querySelectorAll('.cat-btn').forEach(btn => btn.classList.remove('active'));
+    currentCategory = null;
+});
+
+// ---------------------------------------------------------------------------
+// Route Code category: route names come only from data/route_codes.csv
+// (via /api/routes), never from the database.
+// ---------------------------------------------------------------------------
+async function ensureRoutesLoaded() {
+    if (routesCache) return routesCache;
+    const res = await fetch('/api/routes');
+    if (res.status === 401) { window.location.href = '/login'; return []; }
+    if (!res.ok) throw new Error('Could not load route list');
+    const data = await res.json();
+    routesCache = data.routes;
+    return routesCache;
+}
+
+async function selectRouteCategory() {
+    selectedRouteNumber = null;
+    routeSearch.value = '';
+    routeCustomFields.classList.add('hidden');
+    routeCustomNumber.value = '';
+    routeNote.textContent = categories.route.note || '';
+
+    const isBulk = !(selectedCustomers.size === 1 && singleCustomerDetail);
+
+    if (isBulk) {
+        routeBulkWarning.classList.remove('hidden');
+        routeBulkWarning.textContent = `This will set the route code below for ALL ${selectedCustomers.size} selected customers, replacing whatever route they currently have.`;
+        routeCurrentBox.classList.add('hidden');
+    } else {
+        routeBulkWarning.classList.add('hidden');
+        const route = singleCustomerDetail.route;
+        routeCurrentBox.classList.remove('hidden');
+        routeCurrentVal.textContent = `${route.drn ?? '-'}${route.message ? ' — ' + route.message : (route.drn != null ? ' (not on route list)' : '')}`;
+        selectedRouteNumber = route.drn;
+    }
+
+    routeSection.classList.remove('hidden');
+    routeOptions.innerHTML = '<div class="muted" style="padding:10px;">Loading route list...</div>';
+
+    try {
+        await ensureRoutesLoaded();
+        renderRouteOptions();
+        updateRoutePreview();
+    } catch (e) {
+        routeOptions.innerHTML = `<div class="muted" style="padding:10px;">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderRouteOptions() {
+    const q = routeSearch.value.trim().toLowerCase();
+    const list = (routesCache || []).filter(r =>
+        !q || String(r.number).includes(q) || (r.message || '').toLowerCase().includes(q)
+    );
+
+    if (list.length === 0) {
+        routeOptions.innerHTML = '<div class="muted" style="padding:10px;">No matching routes</div>';
+        return;
+    }
+
+    routeOptions.innerHTML = list.map(r => `
+        <div class="route-option ${r.number === selectedRouteNumber ? 'selected' : ''}" data-num="${r.number}">
+            <span class="num">${r.number}</span>${escapeHtml(r.message || '')}
+        </div>
+    `).join('');
+
+    routeOptions.querySelectorAll('.route-option').forEach(el => {
+        el.addEventListener('click', () => {
+            selectedRouteNumber = parseInt(el.dataset.num, 10);
+            routeCustomFields.classList.add('hidden');
+            routeCustomNumber.value = '';
+            renderRouteOptions();
+            updateRoutePreview();
+        });
+    });
+}
+
+routeSearch.addEventListener('input', renderRouteOptions);
+
+routeCustomToggle.addEventListener('click', () => {
+    routeCustomFields.classList.toggle('hidden');
+    if (!routeCustomFields.classList.contains('hidden')) {
+        routeCustomNumber.focus();
+    }
+});
+
+routeCustomNumber.addEventListener('input', () => {
+    const n = parseInt(routeCustomNumber.value, 10);
+    selectedRouteNumber = Number.isInteger(n) ? n : null;
+    renderRouteOptions();
+    updateRoutePreview();
+});
+
+function updateRoutePreview() {
+    if (selectedRouteNumber == null) {
+        routePreview.innerHTML = 'No route selected yet.';
+        return;
+    }
+    const known = (routesCache || []).find(r => r.number === selectedRouteNumber);
+    if (known) {
+        routePreview.innerHTML = `Will set route to: <span class="val">${known.number} — ${escapeHtml(known.message)}</span>`;
+    } else {
+        routePreview.innerHTML = `Will set route to: <span class="val">${selectedRouteNumber}</span> (not on the reference list &mdash; confirm with IT first)`;
+    }
+}
+
+routeCancelBtn.addEventListener('click', () => {
+    routeSection.classList.add('hidden');
+    document.querySelectorAll('.cat-btn').forEach(btn => btn.classList.remove('active'));
+    currentCategory = null;
+});
+
+routeSaveBtn.addEventListener('click', async () => {
+    if (selectedCustomers.size === 0 || selectedRouteNumber == null) {
+        showToast('Pick a route code first', true);
+        return;
+    }
+    if (selectedRouteNumber < 0 || selectedRouteNumber > 255) {
+        showToast('Route code must be between 0 and 255', true);
+        return;
+    }
+
+    routeSaveBtn.disabled = true;
+    routeSaveBtn.textContent = 'Saving...';
+
+    try {
+        if (selectedCustomers.size === 1) {
+            const only = Array.from(selectedCustomers.values())[0];
+            const res = await fetch('/api/update-route', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ bpcnum: only.bpcnum, bpaadd: only.bpaadd, drn: selectedRouteNumber }),
+            });
+
+            if (res.status === 401) { window.location.href = '/login'; return; }
+
+            let data;
+            try { data = await res.json(); }
+            catch { throw new Error(`Server returned an unexpected response (status ${res.status})`); }
+            if (!res.ok) throw new Error(data.detail || 'Update failed');
+
+            showToast('Route saved');
+            await loadSingleCustomer(only.bpcnum, only.bpaadd);
+            selectCategory('route');
+
+        } else {
+            const customersPayload = Array.from(selectedCustomers.values()).map(c => ({ bpcnum: c.bpcnum, bpaadd: c.bpaadd }));
+            const res = await fetch('/api/bulk-update-route', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ customers: customersPayload, drn: selectedRouteNumber }),
+            });
+
+            if (res.status === 401) { window.location.href = '/login'; return; }
+
+            let data;
+            try { data = await res.json(); }
+            catch { throw new Error(`Server returned an unexpected response (status ${res.status})`); }
+            if (!res.ok) throw new Error(data.detail || 'Bulk update failed');
+
+            if (data.failed > 0) {
+                const failedList = data.results
+                    .filter(r => r.status !== 'ok')
+                    .map(r => `${r.bpcnum}/${r.bpaadd} (${r.status})`)
+                    .join(', ');
+                showToast(`Saved ${data.succeeded} of ${data.total}. Failed: ${failedList}`, true);
+            } else {
+                showToast(`Saved ${data.succeeded} of ${data.total} customers`);
+            }
+        }
+    } catch (e) {
+        showToast(e.message, true);
+    } finally {
+        routeSaveBtn.disabled = false;
+        routeSaveBtn.textContent = 'Save route';
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Save (single or bulk)
+// ---------------------------------------------------------------------------
+saveBtn.addEventListener('click', async () => {
+    if (selectedCustomers.size === 0 || !currentCategory) return;
+
+    const categoryToReselect = currentCategory;
+
+    const values = {};
+    toggleList.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        values[cb.dataset.col] = cb.checked;
+    });
+
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+
+    try {
+        if (selectedCustomers.size === 1) {
+            const only = Array.from(selectedCustomers.values())[0];
+            const res = await fetch('/api/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    bpcnum: only.bpcnum,
+                    bpaadd: only.bpaadd,
+                    category: categoryToReselect,
+                    values: values,
+                }),
+            });
+
+            if (res.status === 401) { window.location.href = '/login'; return; }
+
+            let data;
+            try { data = await res.json(); }
+            catch { throw new Error(`Server returned an unexpected response (status ${res.status})`); }
+            if (!res.ok) throw new Error(data.detail || 'Update failed');
+
+            showToast('Saved successfully');
+            await loadSingleCustomer(only.bpcnum, only.bpaadd);
+            selectCategory(categoryToReselect);
+
+        } else {
+            const customersPayload = Array.from(selectedCustomers.values()).map(c => ({ bpcnum: c.bpcnum, bpaadd: c.bpaadd }));
+            const res = await fetch('/api/bulk-update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    customers: customersPayload,
+                    category: categoryToReselect,
+                    values: values,
+                }),
+            });
+
+            if (res.status === 401) { window.location.href = '/login'; return; }
+
+            let data;
+            try { data = await res.json(); }
+            catch { throw new Error(`Server returned an unexpected response (status ${res.status})`); }
+            if (!res.ok) throw new Error(data.detail || 'Bulk update failed');
+
+            if (data.failed > 0) {
+                const failedList = data.results
+                    .filter(r => r.status !== 'ok')
+                    .map(r => `${r.bpcnum}/${r.bpaadd} (${r.status})`)
+                    .join(', ');
+                showToast(`Saved ${data.succeeded} of ${data.total}. Failed: ${failedList}`, true);
+            } else {
+                showToast(`Saved ${data.succeeded} of ${data.total} customers`);
+            }
+        }
+    } catch (e) {
+        showToast(e.message, true);
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save changes';
+    }
+});
+</script>
+
+</body>
+</html>

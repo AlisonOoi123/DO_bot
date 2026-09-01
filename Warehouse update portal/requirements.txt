@@ -1,0 +1,8 @@
+fastapi==0.115.0
+starlette==0.38.6
+uvicorn[standard]
+sqlalchemy
+pyodbc
+jinja2==3.1.4
+pydantic
+python-multipart
