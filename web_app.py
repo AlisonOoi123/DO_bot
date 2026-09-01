@@ -2758,7 +2758,7 @@ async function fetchAndAssign(){
         _diagMsg = ` [diagnostics: raw SQL rows=${d.raw_rows_from_sql}, `+
           `after not-LOAN=${d.after_not_loan}, after site 1SA=${d.after_site_1SA}, `+
           `after not-yet-validated=${d.after_not_validated}, after known route=${d.after_known_route}, `+
-          `after this-year date=${d.after_this_year}`+
+          `after 30-day floor=${d.after_30day_floor}`+
           (d.after_etd_window!=null?`, after ETD window=${d.after_etd_window}`:'')+
           `. Site codes seen: ${(d.distinct_stofcy_seen||[]).join(', ')||'none'}. `+
           `Types seen: ${(d.distinct_sdhtyp_seen||[]).join(', ')||'none'}.]`;

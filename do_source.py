@@ -38,12 +38,14 @@ number — several real discrepancies were found and fixed:
      that were clearly dead/abandoned records, not real pending work —
      confirmed by cross-checking the reference dump: every one of those
      stale rows had a delivery date before the current year, every
-     legitimate row didn't. Added `AND DLVDAT_0 >= <start of the current
-     calendar year>` (SQL: DATEFROMPARTS(YEAR(GETDATE()),1,1); pandas
-     mirror: same, computed at call time) — NOT a hardcoded '2026-01-01'
-     literal, so this keeps working correctly in 2027 and beyond without
-     needing a code change. This alone closed nearly the entire gap
-     between what this file fetched and the real count.
+     legitimate row didn't. Originally added as `DLVDAT_0 >= <start of
+     the current calendar year>`; tightened 2026-09-01 per explicit
+     request to a rolling 30-day floor instead (`DLVDAT_0 >= DATEADD(day,
+     -30, CAST(GETDATE() AS DATE))`; pandas mirror: `today - 30 days`,
+     computed at call time) — a DO more than 30 days old is never useful
+     to fetch, matching the same 30-day backdate-priority cutoff bot.py
+     already applies after the fetch (see _past_date_cutoff). No upper
+     bound — today onward is unrestricted.
   2. CUSTOMER NAME was pulled from SDELIVERY.BPDNAM_0; the real query
      reads BPDLVCUST.BPDNAM_0. POSTCODE/CITY/STATE were pulled from the
      BPADDRESS join (the customer's current master address), but the real
@@ -262,7 +264,7 @@ LEFT JOIN {schema}.BPADDRESS a
 WHERE d.SDHTYP_0 <> 'LOAN'
   AND d.STOFCY_0 = '1SA'
   AND (d.SIHNUM_0 IS NULL OR LTRIM(RTRIM(d.SIHNUM_0)) = '')
-  AND d.DLVDAT_0 >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
+  AND d.DLVDAT_0 >= DATEADD(day, -30, CAST(GETDATE() AS DATE))
   AND c.DRN_0 IN ({drn_list})
   {etd_clause}
 ORDER BY d.DLVDAT_0
@@ -372,24 +374,24 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     # at. Overwritten on every call — read it right after this function
     # returns if you need to know why.
     global LAST_FETCH_DIAGNOSTICS
-    _year_start = pd.Timestamp(datetime.now().year, 1, 1)
+    _cutoff_30d = pd.Timestamp(datetime.now().date()) - timedelta(days=30)
     _not_loan = df['SDHTYP_0'] != 'LOAN'
     _right_site = df['STOFCY_0'] == '1SA'
     _not_validated = df['VALIDATED'] == 'NO'
     _known_route = df['DRN_0'].isin(DRN_LIST)
-    _this_year = pd.to_datetime(df['DLVDAT_0'], errors='coerce') >= _year_start
+    _within_30_days = pd.to_datetime(df['DLVDAT_0'], errors='coerce') >= _cutoff_30d
     LAST_FETCH_DIAGNOSTICS = {
         "raw_rows_from_sql": int(len(df)),
         "after_not_loan": int(_not_loan.sum()),
         "after_site_1SA": int((_not_loan & _right_site).sum()),
         "after_not_validated": int((_not_loan & _right_site & _not_validated).sum()),
         "after_known_route": int((_not_loan & _right_site & _not_validated & _known_route).sum()),
-        "after_this_year": int((_not_loan & _right_site & _not_validated & _known_route & _this_year).sum()),
+        "after_30day_floor": int((_not_loan & _right_site & _not_validated & _known_route & _within_30_days).sum()),
         "distinct_stofcy_seen": sorted(str(v) for v in df['STOFCY_0'].dropna().unique())[:10] if len(df) else [],
         "distinct_sdhtyp_seen": sorted(str(v) for v in df['SDHTYP_0'].dropna().unique())[:10] if len(df) else [],
     }
 
-    filtered_df = df[_not_loan & _right_site & _not_validated & _known_route & _this_year].copy()
+    filtered_df = df[_not_loan & _right_site & _not_validated & _known_route & _within_30_days].copy()
 
     if etd_days is not None:
         _etd_dt = pd.to_datetime(filtered_df['ZETD_0'], errors='coerce')
