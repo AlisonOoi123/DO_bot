@@ -4365,6 +4365,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "CUSTOMER NAME": str(row["CUSTOMER NAME"]).strip(),
                 "ROUTE":         route_str,
                 "CODE":          str(row["CODE"]).strip(),
+                "DROPPOINT":     str(row.get("DROPPOINT", "")).strip(),
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
                 "DATE":          str(row.get("DATE", "")).strip(),

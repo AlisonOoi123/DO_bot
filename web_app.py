@@ -394,6 +394,14 @@ def _board_json(sess) -> dict:
     orders = []
     routes: dict[str, dict] = {}
     manual_only: dict[str, dict] = {}
+    # Dropping points per lane: distinct (CODE, DROPPOINT) pairs among that
+    # plate's assigned DOs — BPDLVCUST.ZDROPPOINT_0 per customer (BPCNUM_0),
+    # by explicit request. Two DOs for the SAME customer at the SAME drop
+    # point count as 1; the SAME customer at two DIFFERENT drop points counts
+    # as 2 (see do_source.py's fetch — ZDROPPOINT_0 is now pulled in as the
+    # "DROPPOINT" column). Blank DROPPOINT (manual uploads, or no BPDLVCUST
+    # match) falls back to one shared point per customer code.
+    _drop_points: dict[str, set] = {}
     _effective_mo_codes = _effective_manual_only_codes(sess)
     for it in items:
         lorry = it.get("LORRY")
@@ -402,6 +410,9 @@ def _board_json(sess) -> dict:
         route = str(it.get("ROUTE", ""))
         code = str(it.get("CODE", ""))
         assigned_plate = lorry if lorry and lorry not in _SENTINELS else None
+        if assigned_plate:
+            _drop_points.setdefault(assigned_plate, set()).add(
+                (code.strip().upper(), str(it.get("DROPPOINT", "")).strip().upper()))
         weight = float(it.get("WEIGHT", 0) or 0)
         weight = round(weight, 3) if pd.notna(weight) else 0.0
         # A real reason (e.g. PAST_DATE) beats no explanation at
@@ -460,7 +471,8 @@ def _board_json(sess) -> dict:
         "aging": _aging,
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
         "manual_only": sorted(manual_only.values(), key=lambda m: m["code"]),
-        "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates}
+        "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates,
+                     "droppingPoints": len(_drop_points.get(p, ()))}
                     for p, c in sorted(caps.items())],
         # Shared staging pool: plates parked unclaimed (the 4 SPARE plates
         # by default, or anything either planner has voluntarily released)
@@ -2099,6 +2111,8 @@ _PAGE = r"""<!doctype html>
   .board-lane-plate{font-weight:700;font-size:14px;font-family:ui-monospace,Menlo,monospace}
   .board-lane-count{font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;
     background:var(--bg);border-radius:10px;padding:1px 7px}
+  .board-lane-drops{font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;
+    background:var(--bg);border-radius:10px;padding:1px 7px}
   .board-lane-load{margin-left:auto;font-size:11px;font-weight:700;
     font-family:ui-monospace,Menlo,monospace}
   .board-lane.lane-off{opacity:.5}
@@ -3383,6 +3397,7 @@ function renderBoard(){
         <button class="lane-max-btn" title="${maximized?'Minimize':'Maximize — focus assigning on this lorry'}">${maximized?'&#10529;':'&#10530;'}</button>
         <button class="lane-drop-btn" title="Drop all of this lorry's DOs back to Unassigned" ${list.length?'':'disabled'}>&#128465;</button>
         <span class="board-lane-count">${list.length} DO${list.length===1?'':'s'}</span>
+        <span class="board-lane-drops" title="Dropping points — distinct customer + drop point combinations on this lorry">${t.droppingPoints||0} drop${(t.droppingPoints||0)===1?'':'s'}</span>
         <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}${t.capacity!=null?' &middot; '+pctReal+'%':''}</span>
       </div>
       <div class="board-lane-naik">naik limit ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</div>

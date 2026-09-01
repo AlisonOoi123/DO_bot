@@ -219,6 +219,7 @@ SELECT DISTINCT
     ISNULL(c.ZDOREMARKS_0, '') AS ZDOREMARKS_0,
     ISNULL(c.ZDISTANCE_0, '') AS ZDISTANCE_0,
     ISNULL(c.ZLONGITUD_0, '') AS ZLONGITUD_0,
+    ISNULL(c.ZDROPPOINT_0, '') AS ZDROPPOINT_0,
     i.ACCDAT_0 AS INVOICE_DATE,
     d.BPDPOSCOD_0,
     d.BPDCTY_0,
@@ -408,7 +409,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     filtered_df['INVOICE_DATE_FORMATTED'] = pd.to_datetime(
         filtered_df['INVOICE_DATE'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
 
-    for col in ['ZDOREMARKS_0', 'ZLONGITUD_0', 'ZDISTANCE_0']:
+    for col in ['ZDOREMARKS_0', 'ZLONGITUD_0', 'ZDISTANCE_0', 'ZDROPPOINT_0']:
         if col not in filtered_df.columns:
             filtered_df[col] = ''
 
@@ -447,6 +448,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         'SHIP_DETAIL': filtered_df['SHIP_DETAIL'],        # was 'SHIP DETAIL' — see docstring
         'ETD': filtered_df['ETD_FORMATTED'],
         'SALES REP': filtered_df['REPNAM_0'],
+        'DROPPOINT': filtered_df['ZDROPPOINT_0'],
     })
 
     # NOTE: rows are intentionally NOT dropped just because ETD is unset (the
