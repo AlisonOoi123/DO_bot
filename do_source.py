@@ -493,13 +493,16 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
         and SDELIVERY.ARVDAT_0.
     trip: the Trip number as a string ("1".."4") — ZLORRY.TRIP.
 
-    SDELIVERY.ZLICENSE_0/ARVDAT_0/AI_Assign are written ONLY for assigned
-    DOs (by explicit request — unassigned DOs must never be touched, even
-    to clear a stale prior plate). A DO with no plate this save is simply
+    SDELIVERY.ZLICENSE_0/ARVDAT_0 are written ONLY for assigned DOs (by
+    explicit request — unassigned DOs must never be touched, even to
+    clear a stale prior plate). A DO with no plate this save is simply
     skipped; whatever SDELIVERY already holds for it is left alone.
-    AI_Assign is written 'Yes'/'No' per the caller's own ai_assigned flag —
-    'Yes' only for a DO still sitting on exactly the plate the last AI
-    Assign run placed it on; any manual drag makes it 'No'.
+
+    ai_assigned on each row is currently unused here — SDELIVERY.AI_Assign
+    was dropped from the schema (temporarily, per the user), so the write
+    is disabled below rather than removed outright; re-enable by adding
+    `AI_Assign = :ai_assign` back to the UPDATE once the column exists
+    again.
 
     ZLORRY.TON (converted to KG here — callers pass weight_kg already) is
     the SUMMED weight of everything assigned to that plate for this exact
@@ -554,16 +557,10 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
                 text(f"""
                     UPDATE {SCHEMA_NAME}.SDELIVERY
                     SET ZLICENSE_0 = :plate,
-                        ARVDAT_0 = :add_date,
-                        AI_Assign = :ai_assign
+                        ARVDAT_0 = :add_date
                     WHERE SDHNUM_0 = :do_number
                 """),
-                {
-                    "plate": plate,
-                    "add_date": add_date,
-                    "ai_assign": "Yes" if r.get("ai_assigned") else "No",
-                    "do_number": do_number,
-                },
+                {"plate": plate, "add_date": add_date, "do_number": do_number},
             )
             dos_written += 1
 
