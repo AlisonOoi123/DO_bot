@@ -273,7 +273,11 @@ LEFT JOIN {schema}.BPADDRESS a
 -- than silently returning wrong data.
 LEFT JOIN (
     SELECT SDHNUM_0,
-           STRING_AGG(CONCAT(ITMDES_0, ' x', QTY_0), '; ') AS PRODUCTS_0
+           -- QTY_0 is a decimal column with a long fixed scale (e.g.
+           -- 10.0000000000000000) — rounded to a whole number here since
+           -- delivery quantities are always whole units; the web app splits
+           -- on '; ' and renders each product on its own bulleted line.
+           STRING_AGG(CONCAT(ITMDES_0, ' x', CAST(ROUND(QTY_0, 0) AS BIGINT)), '; ') AS PRODUCTS_0
     FROM {schema}.SDELIVERYD
     GROUP BY SDHNUM_0
 ) p ON d.SDHNUM_0 = p.SDHNUM_0

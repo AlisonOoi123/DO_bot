@@ -3254,6 +3254,10 @@ function boardCardEl(o){
   const deleteBtn = o.lorry
     ? `<button class="b-delete" title="Remove from ${esc(o.lorry)} and return to unassigned">&times;</button>`
     : '';
+  const productsHtml = o.products
+    ? o.products.split(';').map(p=>p.trim()).filter(Boolean)
+        .map(p=>`<div>&bull; ${esc(p)}</div>`).join('')
+    : '';
   el.innerHTML=`
     <span class="b-stripe" style="background:${color}"></span>
     <div class="b-body">
@@ -3261,7 +3265,7 @@ function boardCardEl(o){
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
-      ${o.products?`<div class="b-meta" style="color:var(--brand);font-weight:700">${esc(o.products)}</div>`:''}
+      ${productsHtml?`<div class="b-meta" style="color:var(--brand);font-weight:700">${productsHtml}</div>`:''}
       ${o.reason?`<div class="b-meta" style="color:var(--bad)">${esc(o.reason)}</div>`:''}
       ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
     </div>`;
