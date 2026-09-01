@@ -518,6 +518,16 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
     config = _load_config(config_path)
     engine = _build_engine(config)
 
+    # The legacy "[Microsoft][ODBC SQL Server Driver]" driver this DB uses
+    # can't bind a bare Python `datetime.date` (raises HYC00 "Optional
+    # feature not implemented" from SQLBindParameter) — only a full
+    # `datetime.datetime`. Normalize once, up front, for every :add_date
+    # param used below.
+    if isinstance(add_date, datetime):
+        pass
+    elif hasattr(add_date, "year"):
+        add_date = datetime(add_date.year, add_date.month, add_date.day)
+
     plate_totals: dict[str, float] = {}
     for r in rows:
         plate = r.get("plate")

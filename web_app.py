@@ -1205,6 +1205,19 @@ def api_board_move():
     plate = body.get("lorry")
     if not do:
         return _with_cookie({"error": "Missing 'do'."}, sid, 400)
+    if not plate:
+        # Cancelling a DO off a lorry: if its live ROUTE is still "NA", it
+        # must land back in Manual Assign Only, not plain Unassigned — even
+        # if this code's group was released earlier in the session (e.g.
+        # dragged out via its header). The route is still NA, so it still
+        # needs a human to place it.
+        for it in sess.get("items", []) or []:
+            if str(it.get("DO NUMBER", "")).strip() == do:
+                if str(it.get("ROUTE", "")).strip().upper() == "NA":
+                    code = str(it.get("CODE", "")).strip().upper()
+                    if code:
+                        sess.setdefault("_manual_only_override", {})[code] = True
+                break
     outcome = bot.board_move(sess, do, plate)
     if not outcome.get("ok"):
         return _with_cookie(outcome, sid, 400)
