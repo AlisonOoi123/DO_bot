@@ -1481,7 +1481,17 @@ def api_board_refetch():
     fresh_df["DO NUMBER"] = fresh_df["DO NUMBER"].astype(str).str.strip()
     new_rows = fresh_df[~fresh_df["DO NUMBER"].isin(_known)]
     if new_rows.empty:
-        return _with_cookie({"new_count": 0, "board": _board_json(sess), "diagnostics": _diagnostics}, sid)
+        # No new DOs, so no re-parse happens here — but the classification
+        # breakdown from whenever this board was first built (Fetch DOs ->
+        # Use, or the last refetch that DID bring in new rows) is still
+        # sitting in the session and still explains the board's current
+        # total, so surface it rather than only the SQL-side numbers.
+        return _with_cookie({
+            "new_count": 0,
+            "board": _board_json(sess),
+            "diagnostics": _diagnostics,
+            "parse_diagnostics": sess.get("_last_parse_diagnostics"),
+        }, sid)
 
     # Snapshot: DO NUMBER -> its current real lorry plate, for every item
     # that's actually assigned right now (drag-and-drop, a prior AI Assign,
