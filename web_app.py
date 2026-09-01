@@ -1472,13 +1472,14 @@ def api_board_refetch():
         fresh_df = do_source.fetch_delivery_report(etd_days=sess.get("etd_days"))
     except Exception as e:
         return _with_cookie({"error": f"Could not fetch DOs from the system: {e}"}, sid, 500)
+    _diagnostics = dict(do_source.LAST_FETCH_DIAGNOSTICS)
 
     _known = set(old_raw["DO NUMBER"].astype(str).str.strip())
     fresh_df = fresh_df.copy()
     fresh_df["DO NUMBER"] = fresh_df["DO NUMBER"].astype(str).str.strip()
     new_rows = fresh_df[~fresh_df["DO NUMBER"].isin(_known)]
     if new_rows.empty:
-        return _with_cookie({"new_count": 0, "board": _board_json(sess)}, sid)
+        return _with_cookie({"new_count": 0, "board": _board_json(sess), "diagnostics": _diagnostics}, sid)
 
     # Snapshot: DO NUMBER -> its current real lorry plate, for every item
     # that's actually assigned right now (drag-and-drop, a prior AI Assign,
@@ -1510,6 +1511,7 @@ def api_board_refetch():
 
     outcome["new_count"] = int(len(new_rows))
     outcome["board"] = _board_json(sess) if sess.get("items") else None
+    outcome["diagnostics"] = _diagnostics
     return _with_cookie(outcome, sid)
 
 
@@ -2286,6 +2288,10 @@ _PAGE = r"""<!doctype html>
       </div>
     </div>
     <div class="msg hidden" id="board-msg"></div>
+    <div style="margin:-4px 0 8px">
+      <span id="board-fetch-diag-toggle" class="hidden" style="cursor:pointer;color:var(--muted);text-decoration:underline;font-size:12px">ℹ️ fetch details</span>
+      <div id="board-fetch-diag" class="hidden" style="margin-top:6px;font-size:12px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap"></div>
+    </div>
     <div class="board-grid">
       <section class="board-pool" data-zone="">
         <div class="board-pool-label" id="board-pool-label">UNASSIGNED</div>
@@ -3548,11 +3554,33 @@ async function saveBoardToSql(){
 }
 $('#btn-board-save').onclick=saveBoardToSql;
 
+function renderFetchDiag(d){
+  const toggle=$('#board-fetch-diag-toggle'), diagEl=$('#board-fetch-diag');
+  show('#board-fetch-diag', false);
+  if(!d || !d.diagnostics || !Object.keys(d.diagnostics).length){ show('#board-fetch-diag-toggle', false); return; }
+  const dg=d.diagnostics;
+  diagEl.textContent = `raw SQL rows: ${dg.raw_rows_from_sql}\n`+
+    `after not-LOAN: ${dg.after_not_loan}\n`+
+    `after site 1SA: ${dg.after_site_1SA}\n`+
+    `after not-yet-validated: ${dg.after_not_validated}\n`+
+    `after known route: ${dg.after_known_route}\n`+
+    `after 30-day floor: ${dg.after_30day_floor}`+
+    (dg.after_etd_window!=null?`\nafter ETD window: ${dg.after_etd_window}`:'')+
+    `\nsite codes seen: ${(dg.distinct_stofcy_seen||[]).join(', ')||'none'}`+
+    `\ntypes seen: ${(dg.distinct_sdhtyp_seen||[]).join(', ')||'none'}`;
+  show('#board-fetch-diag-toggle', true);
+}
+$('#board-fetch-diag-toggle').onclick=()=>{
+  show('#board-fetch-diag', $('#board-fetch-diag').classList.contains('hidden'));
+};
+
 async function refetchDOs(){
   const btn=$('#btn-board-back'); btn.disabled=true;
   setMsg('#board-msg','Checking for new DOs… ',false);
+  show('#board-fetch-diag-toggle', false); show('#board-fetch-diag', false);
   try{
     const d=await jpost('/api/board/refetch',{});
+    renderFetchDiag(d);
     if(d.error){ setMsg('#board-msg', d.error, true); return; }
     if(d.board){ BOARD=d.board; renderBoard(); }
     const n=d.new_count||0;
