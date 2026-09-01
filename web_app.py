@@ -3287,7 +3287,7 @@ function boardCardEl(o){
   const productsHtml = productItems.length
     ? `<div class="b-meta b-products" style="color:var(--pink)">
          <div class="b-products-toggle">&#9656; ${productItems.length} product${productItems.length===1?'':'s'}</div>
-         <div class="b-products-list hidden">${productItems.map(p=>`<div style="font-weight:${p.bold?700:400}">&bull; ${esc(p.label)}</div>`).join('')}</div>
+         <div class="b-products-list hidden">${productItems.map(p=>`<div style="font-weight:${p.bold?700:400};color:${p.bold?'#C11C84':'var(--pink)'}">&bull; ${esc(p.label)}</div>`).join('')}</div>
        </div>`
     : '';
   el.innerHTML=`
