@@ -163,17 +163,24 @@ _SENTINELS = {"NO_LORRY", "NO_ELIGIBLE_LORRY", "SPLIT", "SKIPPED",
               "WRONG_TRIP", "PAST_DATE", "NOT_PICKED", "", None}
 
 # Not actionable by the logged-in planner at all today — not "their" route
-# (OTHER_USER), not their scheduled day (NOT_TODAY), outsourced (OUT_SOURCE),
-# explicitly skipped (REMARKS_SKIP), the wrong half-day (WRONG_TRIP), more
-# than 30 days stale (PAST_DATE — bot.py's own comment says these should be
-# "left alone entirely", not just hidden from a lorry lane), or unchecked by
-# the user on the Picking List (NOT_PICKED). _result_json (table view) has
-# always kept these out of the actionable "unassigned" list, showing only a
-# count via dos_other/skipped_other — _board_json must apply the same
-# exclusion or a planner's board pool ends up showing the OTHER planner's
-# routes (or DOs they deliberately excluded, or DOs long past their date)
-# as if they were theirs to work on today.
-_NOT_MINE_TODAY = {"OTHER_USER", "NOT_TODAY", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP", "PAST_DATE", "NOT_PICKED"}
+# (OTHER_USER), outsourced (OUT_SOURCE), explicitly skipped (REMARKS_SKIP),
+# the wrong half-day (WRONG_TRIP), more than 30 days stale (PAST_DATE —
+# bot.py's own comment says these should be "left alone entirely", not just
+# hidden from a lorry lane), or unchecked by the user on the Picking List
+# (NOT_PICKED). _result_json (table view) has always kept these out of the
+# actionable "unassigned" list, showing only a count via dos_other/
+# skipped_other — _board_json must apply the same exclusion or a planner's
+# board pool ends up showing the OTHER planner's routes (or DOs they
+# deliberately excluded, or DOs long past their date) as if they were theirs
+# to work on today.
+#
+# NOT_TODAY is deliberately NOT in this set (by explicit request) — a DO off
+# today's SCHD schedule still needs to be visible on the board so the
+# planner can see and manually place it if they choose; bot.py's own
+# assignment engine already refuses to auto-assign a real plate to anything
+# classified NOT_TODAY (see the LORRY priority chain in _handle_excel_upload),
+# so AI Assign still leaves it alone regardless of board visibility here.
+_NOT_MINE_TODAY = {"OTHER_USER", "OUT_SOURCE", "REMARKS_SKIP", "WRONG_TRIP", "PAST_DATE", "NOT_PICKED"}
 
 
 def _result_json(sess) -> dict:
@@ -1545,6 +1552,55 @@ def api_download():
     )
 
 
+@app.route("/api/board/download-unassigned")
+def api_download_unassigned():
+    """TEMPORARY debug tool — every DO NOT currently on a real lorry plate,
+    whatever the reason (still unassigned, or excluded as NOT_TODAY/
+    OTHER_USER/PAST_DATE/WRONG_TRIP/REMARKS_SKIP/OUT_SOURCE), one row each,
+    with the reason plainly labelled — for cross-checking the fetch/
+    classification pipeline against an external reference report. Remove
+    once that's no longer needed."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    items = sess.get("items", []) or []
+    if not items:
+        return _with_cookie({"error": "Nothing fetched yet."}, sid, 400)
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "UNASSIGNED"
+    headers = ["DO NUMBER", "CODE", "ROUTE", "CUSTOMER NAME", "DATE", "WEIGHT", "REASON", "REMARKS"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    rows = 0
+    for it in items:
+        lorry = it.get("LORRY")
+        if lorry and lorry not in _SENTINELS:
+            continue   # has a real plate — not what this tool is for
+        reason = lorry if lorry else "NO_LORRY"
+        ws.append([
+            it.get("DO NUMBER", ""), it.get("CODE", ""), it.get("ROUTE", ""),
+            it.get("CUSTOMER NAME", ""), it.get("DATE", ""),
+            round(float(it.get("WEIGHT", 0) or 0), 3), reason, it.get("REMARKS", ""),
+        ])
+        rows += 1
+    for col_idx, h in enumerate(headers, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = max(12, min(40, len(h) + 2))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return send_file(
+        io.BytesIO(buf.getvalue()),
+        as_attachment=True,
+        download_name="Unassigned_DOs.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 def _print_excel_bytes(sess) -> bytes | None:
     """Excel driver hand-off workbook: sheet 1 is the lorry-status summary
     (same shape/formulas as the Snapshot export sheet — DRIVER left blank,
@@ -2298,6 +2354,7 @@ _PAGE = r"""<!doctype html>
         <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
         <button class="btn btn-save" id="btn-board-save">💾 Save to SQL</button>
         <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download &amp; Print</button></a>
+        <a class="dl" href="/api/board/download-unassigned" title="Temporary — every DO not on a real plate, with the reason it's not, for checking"><button class="btn secondary">🔎 Download unassigned (temp)</button></a>
         <button class="btn secondary hidden" id="btn-board-table">📋 Table view</button>
       </div>
     </div>
