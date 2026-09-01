@@ -4022,7 +4022,31 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     if not isinstance(v, str) and pd.isna(v):
                         return ""
                     try:
-                        ts = pd.to_datetime(v, errors="coerce")
+                        # This function doesn't only ever see the "2026-05-11
+                        # 00:00:00" ISO string the comment above assumes — on
+                        # a Refetch, old_raw's DATE column has ALREADY been
+                        # through this same function once (producing "D/M/YY"
+                        # strings like "5/8/26"), so it has to correctly
+                        # handle re-parsing its own prior output too.
+                        #
+                        # Neither dayfirst=True nor dayfirst=False is safe for
+                        # BOTH shapes at once: confirmed pd.to_datetime with
+                        # dayfirst=True actually mis-parses the ISO string
+                        # "2026-08-05" as 8 May (pandas applies day/month
+                        # ambiguity resolution to the trailing MM-DD pair even
+                        # though the leading YYYY makes the whole string
+                        # unambiguous), while dayfirst=False mis-parses the
+                        # "D/M/YY" string "5/8/26" as 8 May instead of 5 Aug.
+                        # Matching each shape against its own explicit format
+                        # avoids the ambiguity entirely instead of guessing.
+                        s = str(v).strip()
+                        ts = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+                        if pd.isna(ts):
+                            ts = pd.to_datetime(s, format="%d/%m/%y", errors="coerce")
+                        if pd.isna(ts):
+                            # Last-resort fallback for a shape neither format
+                            # matches — same flexible parse as before.
+                            ts = pd.to_datetime(s, errors="coerce", dayfirst=True)
                         if pd.isna(ts):
                             return str(v)
                         # %-d/%-m (no leading zero) is a glibc-only strftime
@@ -9544,7 +9568,24 @@ def _export_result_inner(sess) -> list[str]:
         if not is_new_fmt and "DATE" in existing_df.columns:
             def _fmt_date(v):
                 try:
-                    ts = pd.to_datetime(v, errors="coerce")
+                    # Explicit format matching, not a dayfirst guess: this
+                    # history file's DATE column can hold either ISO strings
+                    # or D/M/Y-style strings from prior writes, and neither
+                    # dayfirst=True nor dayfirst=False is safe for both at
+                    # once (dayfirst=True actually mis-parses an ISO
+                    # "2026-08-05" as 8 May — pandas applies day/month
+                    # ambiguity resolution to the trailing pair regardless of
+                    # the unambiguous YYYY prefix — while dayfirst=False
+                    # mis-parses "5/8/26" as 8 May instead of 5 Aug). See
+                    # _fmt_date_on_load above for the same fix.
+                    s = str(v).strip()
+                    ts = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+                    if pd.isna(ts):
+                        ts = pd.to_datetime(s, format="%d/%m/%y", errors="coerce")
+                    if pd.isna(ts):
+                        ts = pd.to_datetime(s, format="%d-%m-%Y", errors="coerce")
+                    if pd.isna(ts):
+                        ts = pd.to_datetime(s, errors="coerce", dayfirst=True)
                     return str(v) if pd.isna(ts) else ts.strftime("%d-%m-%Y")
                 except Exception:
                     return str(v)
