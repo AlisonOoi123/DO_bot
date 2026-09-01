@@ -8083,15 +8083,27 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # collapse to a small visible board if one of these is over-broad;
         # surfaced via /api/dos-fetch and /api/board/refetch's "fetch
         # details" so that's diagnosable without guessing which stage did it.
+        #
+        # Deliberately counted from each item's FINAL LORRY value (post
+        # per-row loop), not the eager _other_user_count/_not_today_count/
+        # _past_date_count/_wrong_trip_count locals above: those increment
+        # the moment a condition is true, but the actual sentinel written to
+        # LORRY follows a priority chain (OUT_SOURCE > OTHER_USER > PAST_DATE
+        # > NOT_TODAY > WRONG_TRIP) — a DO that's both past-date AND
+        # off-schedule bumps _not_today_count even though it ends up
+        # PAST_DATE, so those locals can double-count the same row across
+        # two buckets. Counting the final LORRY value instead keeps every
+        # bucket mutually exclusive, so this always sums correctly against
+        # raw_rows_parsed.
         sess["_last_parse_diagnostics"] = {
             "raw_rows_parsed": int(len(raw)),
-            "other_user": _other_user_count,
-            "not_today": _not_today_count,
-            "past_date": _past_date_count,
-            "wrong_trip": _wrong_trip_count,
+            "other_user": sum(1 for it in items if it.get("LORRY") == "OTHER_USER"),
+            "not_today": sum(1 for it in items if it.get("LORRY") == "NOT_TODAY"),
+            "past_date": sum(1 for it in items if it.get("LORRY") == "PAST_DATE"),
+            "wrong_trip": sum(1 for it in items if it.get("LORRY") == "WRONG_TRIP"),
             "remarks_skip": _remarks_skip_count,
-            "actionable": len(items) - _other_user_count - _not_today_count
-                          - _past_date_count - _wrong_trip_count - _remarks_skip_count,
+            "actionable": sum(1 for it in items if it.get("LORRY") not in
+                               ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE", "PAST_DATE", "WRONG_TRIP")),
         }
         for item in items:
             if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE", "PAST_DATE", "WRONG_TRIP"):
