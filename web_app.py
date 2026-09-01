@@ -887,6 +887,24 @@ def _effective_manual_only_codes(sess: dict) -> set[str]:
     return codes
 
 
+def _reassert_na_manual_only(sess: dict, do_numbers) -> None:
+    """Call right before unassigning any DO (single cancel or a lane-level
+    bulk drop): if its live ROUTE is still "NA", re-flag its customer code
+    as manual-only so it lands back in MANUAL ASSIGN ONLY, not plain
+    Unassigned — even if this code's group was released earlier in the
+    session (e.g. dragged out via its header). The route is still NA, so
+    it still needs a human to place it."""
+    do_numbers = set(do_numbers)
+    for it in sess.get("items", []) or []:
+        if str(it.get("DO NUMBER", "")).strip() not in do_numbers:
+            continue
+        if str(it.get("ROUTE", "")).strip().upper() != "NA":
+            continue
+        code = str(it.get("CODE", "")).strip().upper()
+        if code:
+            sess.setdefault("_manual_only_override", {})[code] = True
+
+
 def _force_manual_only_unassigned(sess: dict) -> None:
     """DOs for the effective manual-only customer codes must never carry a
     real plate — even a fresh AI Assign run has to leave them for the
@@ -1206,18 +1224,7 @@ def api_board_move():
     if not do:
         return _with_cookie({"error": "Missing 'do'."}, sid, 400)
     if not plate:
-        # Cancelling a DO off a lorry: if its live ROUTE is still "NA", it
-        # must land back in Manual Assign Only, not plain Unassigned — even
-        # if this code's group was released earlier in the session (e.g.
-        # dragged out via its header). The route is still NA, so it still
-        # needs a human to place it.
-        for it in sess.get("items", []) or []:
-            if str(it.get("DO NUMBER", "")).strip() == do:
-                if str(it.get("ROUTE", "")).strip().upper() == "NA":
-                    code = str(it.get("CODE", "")).strip().upper()
-                    if code:
-                        sess.setdefault("_manual_only_override", {})[code] = True
-                break
+        _reassert_na_manual_only(sess, [do])
     outcome = bot.board_move(sess, do, plate)
     if not outcome.get("ok"):
         return _with_cookie(outcome, sid, 400)
@@ -1309,6 +1316,11 @@ def api_board_drop_lane():
     plate = str((request.json or {}).get("lorry", "")).strip()
     if not plate:
         return _with_cookie({"error": "Missing 'lorry'."}, sid, 400)
+    lane_do_numbers = [
+        str(it.get("DO NUMBER", "")) for it in sess.get("items", []) or []
+        if it.get("LORRY") == plate
+    ]
+    _reassert_na_manual_only(sess, lane_do_numbers)
     dropped = 0
     for it in sess.get("items", []) or []:
         if it.get("LORRY") != plate:
@@ -2001,10 +2013,10 @@ _PAGE = r"""<!doctype html>
     width:22px;height:22px;flex-shrink:0;cursor:pointer;font-size:12px;line-height:1;
     display:inline-flex;align-items:center;justify-content:center}
   .lane-max-btn:hover{color:var(--ink);border-color:var(--brand)}
-  .lane-drop-btn{background:none;border:1px solid var(--line);border-radius:6px;color:var(--muted);
-    width:22px;height:22px;flex-shrink:0;cursor:pointer;font-size:12px;line-height:1;
+  .lane-drop-btn{background:none;border:1px solid var(--bad);border-radius:6px;color:var(--bad);
+    width:22px;height:22px;flex-shrink:0;cursor:pointer;font-size:13px;line-height:1;font-weight:700;
     display:inline-flex;align-items:center;justify-content:center}
-  .lane-drop-btn:hover:not(:disabled){color:var(--bad);border-color:var(--bad)}
+  .lane-drop-btn:hover:not(:disabled){background:var(--bad);color:#fff}
   .lane-drop-btn:disabled{opacity:.3;cursor:not-allowed}
   .board-lanes.has-maximized{grid-template-columns:1fr}
   .board-lane-maximized{padding:20px;min-height:60vh}
