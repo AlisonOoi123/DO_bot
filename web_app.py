@@ -1028,9 +1028,13 @@ def api_dos_fetch():
     resp = {
         "count": int(len(report_df)),
         "weight": round(float(pd.to_numeric(report_df["GROSS WEIGHT"], errors="coerce").fillna(0).sum()) / 1000.0, 3),
+        # Always attached (not just on a 0-count fetch) — a suspiciously LOW
+        # but non-zero count is just as hard to diagnose blind, and this is
+        # the only way to see which SQL-side filter stage (not-LOAN, site,
+        # not-yet-validated, known route, 30-day floor) is actually
+        # responsible without direct DB access.
+        "diagnostics": dict(do_source.LAST_FETCH_DIAGNOSTICS),
     }
-    if resp["count"] == 0:
-        resp["diagnostics"] = dict(do_source.LAST_FETCH_DIAGNOSTICS)
     return _with_cookie(resp, sid)
 
 
@@ -2203,6 +2207,8 @@ _PAGE = r"""<!doctype html>
       <div class="msg hidden" id="dos-fetch-msg"></div>
       <div id="dos-fetch-result" class="hidden" style="margin-top:10px;font-size:14px">
         <span id="dos-fetch-summary"></span>
+        <span id="dos-fetch-diag-toggle" style="cursor:pointer;color:var(--muted);text-decoration:underline;margin-left:8px;font-size:12px">ℹ️ fetch details</span>
+        <div id="dos-fetch-diag" class="hidden" style="margin-top:6px;font-size:12px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap"></div>
         <div class="row" style="margin-top:8px">
           <a class="dl" href="/api/dos-fetch/download"><button class="btn secondary" style="width:auto">⬇️ Download to review</button></a>
           <button class="btn" id="btn-dos-fetch-use" style="width:auto">Use this directly →</button>
@@ -2928,9 +2934,28 @@ async function doFetchDos(){
     if(d.error){ setMsg('#dos-fetch-msg', d.error, true); return; }
     setMsg('#dos-fetch-msg', null);
     $('#dos-fetch-summary').textContent = `Found ${d.count} DO(s), ${d.weight}T total.`;
+    const diagEl = $('#dos-fetch-diag');
+    show('#dos-fetch-diag', false);
+    if(d.diagnostics){
+      const dg = d.diagnostics;
+      diagEl.textContent = `raw SQL rows: ${dg.raw_rows_from_sql}\n`+
+        `after not-LOAN: ${dg.after_not_loan}\n`+
+        `after site 1SA: ${dg.after_site_1SA}\n`+
+        `after not-yet-validated: ${dg.after_not_validated}\n`+
+        `after known route: ${dg.after_known_route}\n`+
+        `after 30-day floor: ${dg.after_30day_floor}`+
+        (dg.after_etd_window!=null?`\nafter ETD window: ${dg.after_etd_window}`:'')+
+        `\nsite codes seen: ${(dg.distinct_stofcy_seen||[]).join(', ')||'none'}`+
+        `\ntypes seen: ${(dg.distinct_sdhtyp_seen||[]).join(', ')||'none'}`;
+    } else {
+      diagEl.textContent = '(no diagnostics returned)';
+    }
     show('#dos-fetch-result', true);
   } finally { btn.disabled=false; }
 }
+$('#dos-fetch-diag-toggle').onclick=()=>{
+  show('#dos-fetch-diag', $('#dos-fetch-diag').classList.contains('hidden'));
+};
 $('#btn-dos-fetch').onclick=doFetchDos;
 
 async function useFetchedDos(){
