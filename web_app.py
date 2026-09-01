@@ -1915,11 +1915,11 @@ _PAGE = r"""<!doctype html>
   :root{
     --bg:#0f172a; --card:#1e293b; --card2:#273449; --line:#334155;
     --ink:#e2e8f0; --muted:#94a3b8; --brand:#38bdf8; --brand2:#0ea5e9;
-    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --stage:#c084fc; --radius:14px;
+    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --stage:#c084fc; --pink:#db2777; --radius:14px;
   }
   @media (prefers-color-scheme: light){
     :root{ --bg:#f1f5f9; --card:#ffffff; --card2:#f8fafc; --line:#e2e8f0;
-      --ink:#0f172a; --muted:#64748b; --brand:#0284c7; --brand2:#0369a1; --stage:#9333ea; }
+      --ink:#0f172a; --muted:#64748b; --brand:#0284c7; --brand2:#0369a1; --stage:#9333ea; --pink:#be185d; }
   }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0}
@@ -2050,6 +2050,13 @@ _PAGE = r"""<!doctype html>
   .board-top .btn-save{background:#059669;color:#fff}
   .board-top .btn-save:hover{background:#047857}
   .board-top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-left:auto}
+  .board-download-dropdown{position:relative}
+  .board-download-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:20;
+    background:var(--card);border:1px solid var(--line);border-radius:10px;
+    box-shadow:0 8px 24px rgba(0,0,0,.35);padding:6px;min-width:230px;display:flex;flex-direction:column;gap:2px}
+  .board-download-menu a{display:block;padding:8px 10px;border-radius:7px;font-size:13px;
+    font-weight:600;color:var(--ink);text-decoration:none;white-space:nowrap}
+  .board-download-menu a:hover{background:var(--card2)}
   .board-plan-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .board-plan-field{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
     font-weight:600;background:var(--card2);border:1px solid var(--line);border-radius:20px;
@@ -2366,10 +2373,15 @@ _PAGE = r"""<!doctype html>
         </span>
       </div>
       <div class="board-top-actions">
-        <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
         <button class="btn btn-save" id="btn-board-save">💾 Save to SQL</button>
-        <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download &amp; Print</button></a>
-        <a class="dl" href="/api/board/download-unassigned" title="Temporary — every DO not on a real plate, with the reason it's not, for checking"><button class="btn secondary">🔎 Download unassigned (temp)</button></a>
+        <div class="board-download-dropdown" id="board-download-dropdown">
+          <button class="btn secondary" id="board-download-toggle">⬇️ Download ▾</button>
+          <div class="board-download-menu hidden" id="board-download-menu">
+            <a class="dl" href="/api/download">⬇️ Download &amp; Print (assigned)</a>
+            <a class="dl" href="/api/board/download-unassigned" title="Temporary — every DO not on a real plate, with the reason it's not, for checking">🔎 Download unassigned (temp)</a>
+          </div>
+        </div>
+        <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
         <button class="btn secondary hidden" id="btn-board-table">📋 Table view</button>
       </div>
     </div>
@@ -3265,7 +3277,7 @@ function boardCardEl(o){
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
-      ${productsHtml?`<div class="b-meta" style="color:var(--brand);font-weight:700">${productsHtml}</div>`:''}
+      ${productsHtml?`<div class="b-meta" style="color:var(--pink);font-weight:700">${productsHtml}</div>`:''}
       ${o.reason?`<div class="b-meta" style="color:var(--bad)">${esc(o.reason)}</div>`:''}
       ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
     </div>`;
@@ -3614,6 +3626,14 @@ async function aiAssign(){
   } finally { btn.disabled=false; }
 }
 $('#btn-board-ai').onclick=aiAssign;
+
+$('#board-download-toggle').onclick=(e)=>{
+  e.stopPropagation();
+  show('#board-download-menu', $('#board-download-menu').classList.contains('hidden'));
+};
+document.addEventListener('click', (e)=>{
+  if(!e.target.closest('#board-download-dropdown')) show('#board-download-menu', false);
+});
 
 async function saveBoardToSql(){
   const btn=$('#btn-board-save'); btn.disabled=true;
