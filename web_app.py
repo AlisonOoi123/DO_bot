@@ -3589,7 +3589,11 @@ function buildDiagText(d){
       `excluded — REMARKS skip: ${pg.remarks_skip}\n`+
       `= actionable (this planner's pool): ${pg.actionable}\n`+
       (pg.today_used_by_app_server?`\napp server's "today": ${pg.today_used_by_app_server}`:'')+
-      (pg.past_date_cutoff_used?`\npast-date cutoff used: ${pg.past_date_cutoff_used}`:''));
+      (pg.past_date_cutoff_used?`\npast-date cutoff used: ${pg.past_date_cutoff_used}`:'')+
+      (pg.past_date_samples&&pg.past_date_samples.length?`\nmost-recent excluded past-date DOs: `+
+        pg.past_date_samples.map(s=>`${s.do} (${s.date})`).join(', '):'')+
+      (pg.other_user_route_prefixes&&pg.other_user_route_prefixes.length?`\nexcluded other-user route prefixes: `+
+        pg.other_user_route_prefixes.join(', '):''));
   }
   return parts.join('\n\n');
 }

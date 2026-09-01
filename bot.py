@@ -8116,6 +8116,19 @@ def _handle_excel_upload(phone, sess, file_bytes):
             "today_used_by_app_server": _today_date.isoformat(),
             "past_date_cutoff_used": _past_date_cutoff.isoformat(),
         }
+        # Samples so a suspicious count can be checked concretely instead of
+        # against a reference file that may not match the live fetch exactly
+        # (different snapshot time, different day/trip selection, etc).
+        _past_date_items = [it for it in items if it.get("LORRY") == "PAST_DATE"]
+        _past_date_items.sort(key=lambda it: str(it.get("DATE", "")), reverse=True)
+        sess["_last_parse_diagnostics"]["past_date_samples"] = [
+            {"do": it.get("DO NUMBER"), "date": str(it.get("DATE", ""))}
+            for it in _past_date_items[:5]
+        ]
+        sess["_last_parse_diagnostics"]["other_user_route_prefixes"] = sorted({
+            _extract_route_prefix(str(it.get("ROUTE", "")))
+            for it in items if it.get("LORRY") == "OTHER_USER"
+        } - {""})[:15]
         for item in items:
             if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE", "PAST_DATE", "WRONG_TRIP"):
                 continue          # keep in raw_df for export blank; hide from UI
