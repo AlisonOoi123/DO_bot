@@ -1,0 +1,26 @@
+{
+    
+"database": {
+        
+	"driver": "ODBC Driver 17 for SQL Server",
+        
+	"server": "10.0.0.19\\X3V12",
+        
+	"database": "x3v12",
+        
+	"uid": "sa",
+        
+	"pwd": "tWqXW2769ksC"   
+	},
+
+"secret_key": "engsheng-uvyday-2026-a8f3k29dQpLm",
+    
+"app_users": {
+        
+	"alison": "xyz789",
+	"chow": "abc123",
+	"ardy": "def789"
+    
+	}
+
+}

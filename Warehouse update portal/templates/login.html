@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Login - Warehouse Route &amp; Remarks Update</title>
+<style>
+    :root {
+        --primary: #1c6e4a;
+        --primary-dark: #14503a;
+        --bg: #f4f6f5;
+        --card-bg: #ffffff;
+        --border: #dfe3e1;
+        --text: #1f2a26;
+        --muted: #6b7773;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+    }
+    .card {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 28px 24px;
+        width: 100%;
+        max-width: 360px;
+        margin: 16px;
+    }
+    h1 {
+        font-size: 18px;
+        margin: 0 0 20px 0;
+        color: var(--primary);
+    }
+    label {
+        display: block;
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 6px;
+    }
+    input[type="text"], input[type="password"] {
+        width: 100%;
+        padding: 12px 14px;
+        font-size: 16px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        outline: none;
+        margin-bottom: 16px;
+    }
+    input:focus { border-color: var(--primary); }
+    button {
+        width: 100%;
+        padding: 14px;
+        border-radius: 10px;
+        border: none;
+        background: var(--primary);
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    button:active { background: var(--primary-dark); }
+    .error {
+        background: #fdecec;
+        color: #a83232;
+        border: 1px solid #f3c7c7;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 13px;
+        margin-bottom: 16px;
+    }
+</style>
+</head>
+<body>
+    <div class="card">
+        <h1>Warehouse Route &amp; Remarks Update</h1>
+        {% if error %}
+        <div class="error">Incorrect username or password.</div>
+        {% endif %}
+        <form method="post" action="/login">
+            <label for="username">Username</label>
+            <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" autocomplete="current-password" required>
+            <button type="submit">Log In</button>
+        </form>
+    </div>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# Update Credential in "config.json"
+
+# Restart Command
+C:\nssm\win64\nssm.exe restart UvydayMaintenance
+C:\nssm\win64\nssm.exe stop UvydayMaintenance
