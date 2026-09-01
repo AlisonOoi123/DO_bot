@@ -8104,6 +8104,17 @@ def _handle_excel_upload(phone, sess, file_bytes):
             "remarks_skip": _remarks_skip_count,
             "actionable": sum(1 for it in items if it.get("LORRY") not in
                                ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE", "PAST_DATE", "WRONG_TRIP")),
+            # This app-server's own idea of "today" (Python datetime.now() on
+            # whatever machine runs the Flask process) and the cutoff derived
+            # from it — the SQL fetch computes its OWN 30-day floor from the
+            # DATABASE server's GETDATE(). If these two servers' clocks
+            # disagree, the SQL layer can already restrict to "no rows older
+            # than 30 days" while this app-server-side check still throws
+            # away far more of them as PAST_DATE, which is exactly the kind
+            # of contradiction a clock mismatch between the two machines
+            # would produce.
+            "today_used_by_app_server": _today_date.isoformat(),
+            "past_date_cutoff_used": _past_date_cutoff.isoformat(),
         }
         for item in items:
             if item.get("LORRY") in ("OTHER_USER", "NOT_TODAY", "REMARKS_SKIP", "OUT_SOURCE", "PAST_DATE", "WRONG_TRIP"):

@@ -3587,7 +3587,9 @@ function buildDiagText(d){
       `excluded — older than 30-day cutoff: ${pg.past_date}\n`+
       `excluded — wrong trip: ${pg.wrong_trip}\n`+
       `excluded — REMARKS skip: ${pg.remarks_skip}\n`+
-      `= actionable (this planner's pool): ${pg.actionable}`);
+      `= actionable (this planner's pool): ${pg.actionable}\n`+
+      (pg.today_used_by_app_server?`\napp server's "today": ${pg.today_used_by_app_server}`:'')+
+      (pg.past_date_cutoff_used?`\npast-date cutoff used: ${pg.past_date_cutoff_used}`:''));
   }
   return parts.join('\n\n');
 }
