@@ -277,7 +277,10 @@ LEFT JOIN (
            -- 10.0000000000000000) — rounded to a whole number here since
            -- delivery quantities are always whole units; the web app splits
            -- on '; ' and renders each product on its own bulleted line.
-           STRING_AGG(CONCAT(ITMDES_0, ' x', CAST(ROUND(QTY_0, 0) AS BIGINT)), '; ') AS PRODUCTS_0
+           -- ITMREF_0 is prefixed (before a '|') so the web app can bold
+           -- only the item codes on its highlight list without a second
+           -- round trip — stripped back out before display.
+           STRING_AGG(CONCAT(ITMREF_0, '|', ITMDES_0, ' x', CAST(ROUND(QTY_0, 0) AS BIGINT)), '; ') AS PRODUCTS_0
     FROM {schema}.SDELIVERYD
     GROUP BY SDHNUM_0
 ) p ON d.SDHNUM_0 = p.SDHNUM_0

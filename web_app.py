@@ -2177,7 +2177,7 @@ _PAGE = r"""<!doctype html>
     overflow:hidden;text-overflow:ellipsis}
   .board-card .b-meta{color:var(--muted);font-size:10.5px;margin-top:1px;
     font-family:ui-monospace,Menlo,monospace}
-  .board-card .b-products-toggle{cursor:pointer;user-select:none}
+  .board-card .b-products-toggle{cursor:pointer;user-select:none;font-weight:700}
   .board-card .b-products-toggle:hover{text-decoration:underline}
   .board-card .b-products-list{margin-top:2px}
   .board-card .b-warn{color:var(--warn);font-size:10.5px;margin-top:3px}
@@ -3256,6 +3256,10 @@ function fmtT(w){ return w.toFixed(3)+'T'; }
 
 const BOARD_ROUTE_COLORS=['#5ab0ff','#c58bff','#ffd166','#7ee8b2','#ff9e7d',
   '#8fd3ff','#f2a6d8','#b6e37a','#ffc98a','#9fb8ff'];
+// Only these item codes (SDELIVERYD.ITMREF_0) render bold in the product
+// list — everything else stays normal weight, by explicit request.
+const BOARD_BOLD_ITMREFS = new Set(['SS007','SS005','SS006','BL002','BL004',
+  'AG001','KM101-1','KM101-2','CK102','CK107','CK004','CD001','KP065']);
 function boardRouteColor(route){
   const idx=(BOARD.routes||[]).findIndex(r=>r.route===route);
   return BOARD_ROUTE_COLORS[(idx<0?0:idx)%BOARD_ROUTE_COLORS.length];
@@ -3269,11 +3273,21 @@ function boardCardEl(o){
   const deleteBtn = o.lorry
     ? `<button class="b-delete" title="Remove from ${esc(o.lorry)} and return to unassigned">&times;</button>`
     : '';
-  const productItems = o.products ? o.products.split(';').map(p=>p.trim()).filter(Boolean) : [];
+  // Each raw item is "ITMREF_0|description xqty" (see do_source.py) — the
+  // ref decides bold vs. normal weight per line, then gets stripped before
+  // display. A part with no '|' (stale cached board data from before this
+  // format existed) falls back to plain, unbolded display.
+  const productItems = o.products ? o.products.split(';').map(p=>p.trim()).filter(Boolean)
+    .map(p=>{
+      const bar = p.indexOf('|');
+      return bar === -1
+        ? {label: p, bold: false}
+        : {label: p.slice(bar+1), bold: BOARD_BOLD_ITMREFS.has(p.slice(0, bar).trim())};
+    }) : [];
   const productsHtml = productItems.length
-    ? `<div class="b-meta b-products" style="color:var(--pink);font-weight:700">
+    ? `<div class="b-meta b-products" style="color:var(--pink)">
          <div class="b-products-toggle">&#9656; ${productItems.length} product${productItems.length===1?'':'s'}</div>
-         <div class="b-products-list hidden">${productItems.map(p=>`<div>&bull; ${esc(p)}</div>`).join('')}</div>
+         <div class="b-products-list hidden">${productItems.map(p=>`<div style="font-weight:${p.bold?700:400}">&bull; ${esc(p.label)}</div>`).join('')}</div>
        </div>`
     : '';
   el.innerHTML=`
