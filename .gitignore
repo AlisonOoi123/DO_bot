@@ -15,6 +15,7 @@ __pycache__/
 data/daily_assignments.json
 daily_assignments.json
 data/lorry_toggle.json
+data/customer_route_owner.json
 
 # Large data files — commit the .zip; ignore the raw .xls/.xlsx
 data/ZSDOROUTEWRH.xlsx

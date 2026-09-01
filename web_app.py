@@ -36,7 +36,6 @@ from flask import (
 
 import bot   # the existing engine — reused as-is
 import do_source   # live DO fetch from the ERP DB — see do_source.py
-from assignment_config import MANUAL_ONLY_CUSTOMER_CODES
 
 app = Flask(__name__)
 
@@ -418,7 +417,7 @@ def _board_json(sess) -> dict:
             _mo_code = code.strip().upper()
             mo = manual_only.setdefault(_mo_code, {
                 "code": code,
-                "customer": MANUAL_ONLY_CUSTOMER_CODES.get(_mo_code, str(it.get("CUSTOMER NAME", ""))),
+                "customer": str(it.get("CUSTOMER NAME", "")),
                 "dos": 0, "weight": 0.0,
             })
             mo["dos"] += 1
@@ -447,16 +446,11 @@ def _board_json(sess) -> dict:
         if _age > 5: _aging["over5"] += 1
         if _age > 3: _aging["over3"] += 1
 
-    _mo_order = list(MANUAL_ONLY_CUSTOMER_CODES.keys())
     return {
         "orders": orders,
         "aging": _aging,
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
-        "manual_only": sorted(
-            manual_only.values(),
-            key=lambda m: _mo_order.index(m["code"].strip().upper())
-            if m["code"].strip().upper() in _mo_order else 999,
-        ),
+        "manual_only": sorted(manual_only.values(), key=lambda m: m["code"]),
         "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates}
                     for p, c in sorted(caps.items())],
         # Shared staging pool: plates parked unclaimed (the 4 SPARE plates
@@ -840,17 +834,29 @@ def _reset_items_to_unassigned(sess: dict) -> None:
             it["LORRY"] = "NO_LORRY"
 
 
-_MANUAL_ONLY_CODES = {c.strip().upper() for c in MANUAL_ONLY_CUSTOMER_CODES}
+def _base_manual_only_codes(sess: dict) -> set[str]:
+    """Customer codes whose live ROUTE resolved to "NA" — data-driven off
+    the ERP's DRN_0 via do_source.ROUTE_MAP (see the Warehouse Route &
+    Remarks Update portal), not a hardcoded list. A customer with no route
+    assigned can never be usefully auto-assigned, so it's always excluded
+    from AI Assign by default."""
+    codes = set()
+    for it in sess.get("items", []) or []:
+        if str(it.get("ROUTE", "")).strip().upper() == "NA":
+            code = str(it.get("CODE", "")).strip().upper()
+            if code:
+                codes.add(code)
+    return codes
 
 
 def _effective_manual_only_codes(sess: dict) -> set[str]:
-    """The base MANUAL_ONLY_CUSTOMER_CODES set, adjusted by this planner
-    session's own drag-and-drop overrides: dragging a manual-only group's
-    header out to the Unassigned pool releases it (False) so AI Assign may
-    fit it again; dragging any single DO onto the Manual Assign Only zone
-    flags its whole customer code (True) even if it isn't in the base
-    config. Overrides are per-session — they don't touch assignment_config.py."""
-    codes = set(_MANUAL_ONLY_CODES)
+    """The base NA-route set, adjusted by this planner session's own
+    drag-and-drop overrides: dragging a manual-only group's header out to
+    the Unassigned pool releases it (False) so AI Assign may fit it again;
+    dragging any single DO onto the Manual Assign Only zone flags its whole
+    customer code (True) even if its route isn't NA. Overrides are
+    per-session only."""
+    codes = _base_manual_only_codes(sess)
     for code, forced in (sess.get("_manual_only_override") or {}).items():
         if forced:
             codes.add(code)
@@ -1032,8 +1038,8 @@ def api_picking_list():
     # items in. Date is parsed for the sort key only (dayfirst, matching
     # every other date parse in this app) so e.g. "5-1-2026" sorts before
     # "12-1-2026"; an unparseable date sorts last rather than breaking the
-    # whole sort. MANUAL_ONLY_CUSTOMER_CODES rows always sort to the very
-    # end, in their own section, regardless of date.
+    # whole sort. NA-route (manual-only) rows always sort to the very end,
+    # in their own section, regardless of date.
     def _picking_sort_key(r):
         _dt = pd.to_datetime(r["date"], dayfirst=True, errors="coerce")
         _date_key = _dt if pd.notna(_dt) else pd.Timestamp.max
@@ -3057,7 +3063,7 @@ function renderBoard(){
     list.forEach(o=>body.appendChild(boardCardEl(o)));
     wrap.appendChild(div);
   });
-  // Manual-assign-only customers (MANUAL_ONLY_CUSTOMER_CODES, plus any this
+  // Manual-assign-only customers (live ROUTE == "NA", plus any this
   // session has dragged in/out) — AI Assign never touches these; shown as
   // their own drop zone below the normal route groups so the planner
   // remembers to place them by hand. Drag a single DO onto this zone to

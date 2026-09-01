@@ -80,6 +80,17 @@ except FileNotFoundError:
 _DATA_DIR = os.path.join(_HERE, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
+# pandas' default read_excel/read_csv na_values list, MINUS the literal
+# string "NA" — a ROUTE can legitimately BE the text "NA" (do_source.py's
+# ROUTE_MAP uses it for "no route assigned"), which pandas would otherwise
+# silently read back as a missing value (NaN) on every Excel round-trip,
+# making the entire row vanish at raw.dropna(subset=["ROUTE", ...]) further
+# down — before any of the NA-route/Manual-Assign-Only handling ever runs.
+_NA_VALUES_KEEP_LITERAL_NA = {
+    "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
+    "1.#IND", "1.#QNAN", "<NA>", "N/A", "NULL", "NaN", "None", "n/a", "nan", "null",
+}
+
 PLANNING_PATH  = os.path.join(_DATA_DIR, "LORRY DAILY PLANNING.xlsx")         # lorry naik + route codes
 MASTER_PATH    = PLANNING_PATH   # alias kept for backwards compat inside engine calls
 MASTER_LORRY_PATH = os.path.join(_DATA_DIR, "master_lorry.xlsx")              # capacity lookup for simple lorry lists
@@ -1093,6 +1104,7 @@ def _resolve_history_path() -> str:
             return p
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
 DAILY_LOG_PATH = os.path.join(_DATA_DIR, "daily_assignments.json")
+CUSTOMER_ROUTE_OWNER_PATH = os.path.join(_DATA_DIR, "customer_route_owner.json")
 
 # _POSTCODE_STATE_RANGES imported from assignment_config
 
@@ -1173,6 +1185,29 @@ def _save_daily_log(log: dict):
 def get_assigned_today() -> set:
     """Return set of ALL lorry plates assigned today (never includes empty strings)."""
     return {p for p in _load_daily_log()["assigned"] if p and p.strip()}
+
+
+def _load_customer_route_owner() -> dict:
+    """{ CODE: "ABI"|"VIVIAN" } — the most recent planner whose fetch/upload
+    saw a REAL (non-NA) route for this customer code. An NA route (no route
+    assigned in the Warehouse Route & Remarks Update portal) has no route
+    prefix to check against the ABI/VIVIAN ROUTE sheets, so this is the
+    fallback for keeping an NA customer visible to whichever planner
+    actually owns it instead of it silently flipping to "everyone" or
+    "nobody". Persists indefinitely (not reset daily) — ownership doesn't
+    expire just because a day passed."""
+    if os.path.exists(CUSTOMER_ROUTE_OWNER_PATH):
+        try:
+            with open(CUSTOMER_ROUTE_OWNER_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_customer_route_owner(mapping: dict):
+    with open(CUSTOMER_ROUTE_OWNER_PATH, "w") as f:
+        json.dump(mapping, f, indent=2)
 
 def record_assignments_today(plates: list[str], user: str | None = None):
     """Add newly confirmed plates to today's log, recording WHO assigned each
@@ -3921,14 +3956,16 @@ def _handle_excel_upload(phone, sess, file_bytes):
         # full assignment with the schedule filter off.
         if file_bytes and not sess.get("_ignore_schedule"):
             sess["_upload_bytes"] = file_bytes
-        df = pd.read_excel(io.BytesIO(file_bytes))
+        df = pd.read_excel(io.BytesIO(file_bytes), keep_default_na=False,
+                            na_values=_NA_VALUES_KEEP_LITERAL_NA)
         # Some exports (e.g. the ZSDOROUTEWRH .xls) put a title/date row above the
         # real header, so row 0 is not the column names. Detect the header row
         # (the one containing DO NUMBER / ROUTE) and re-read from there.
         _cols0 = [str(c).strip().upper() for c in df.columns]
         if not any(_k in _cols0 for _k in
                    ("DO NUMBER", "ROUTE", "GROSS WEIGHT", "WEIGHT(T)")):
-            _raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+            _raw = pd.read_excel(io.BytesIO(file_bytes), header=None,
+                                  keep_default_na=False, na_values=_NA_VALUES_KEEP_LITERAL_NA)
             _hdr = None
             for _i in range(min(10, len(_raw))):
                 _rv = [str(x).strip().upper() for x in _raw.iloc[_i].tolist()]
@@ -3936,7 +3973,8 @@ def _handle_excel_upload(phone, sess, file_bytes):
                     _hdr = _i
                     break
             if _hdr is not None:
-                df = pd.read_excel(io.BytesIO(file_bytes), header=_hdr)
+                df = pd.read_excel(io.BytesIO(file_bytes), header=_hdr,
+                                    keep_default_na=False, na_values=_NA_VALUES_KEEP_LITERAL_NA)
         df.columns = [str(c).strip().upper() for c in df.columns]
 
         # Remember the EXACT columns (and order) of the uploaded file so the
@@ -4133,18 +4171,42 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 }
             except Exception:
                 _prefill_cap_map = {}
+        # Last-known-owner fallback for NA-route customers (see
+        # _load_customer_route_owner) — a route of "NA" has no prefix to
+        # check against the ABI/VIVIAN ROUTE sheets, so ownership falls
+        # back to whichever planner's fetch most recently saw a REAL route
+        # for that customer code. Updates collected during the loop below
+        # and persisted once at the end (not per-row — this runs on every
+        # re-parse, so writing per-row would mean a lot of needless disk I/O).
+        _customer_route_owner = _load_customer_route_owner()
+        _route_owner_updates: dict[str, str] = {}
         for idx, row in raw.iterrows():
             route_str = str(row["ROUTE"]).strip()
             pfx = _extract_route_prefix(route_str)
+            _row_code = str(row.get("CODE", "")).strip().upper()
             _is_mine     = True
             _is_today    = True
 
             if pfx and not _route_belongs_to_user(pfx, _upload_user, _abi_route_prefixes):
                 _is_mine = False
                 _other_user_count += 1
+            elif pfx and _row_code:
+                # A real, determinable route — remember this planner as the
+                # code's current owner in case the route later flips to NA.
+                _route_owner_updates[_row_code] = _upload_user.strip().upper()
+            elif not pfx and route_str.strip().upper() == "NA" and _row_code:
+                _last_owner = _customer_route_owner.get(_row_code)
+                if _last_owner and _last_owner != _upload_user.strip().upper():
+                    _is_mine = False
+                    _other_user_count += 1
+                # No record on file at all (brand-new customer that's never
+                # had a real route) → stays visible to both rather than
+                # silently hiding a planner's genuinely new work.
 
-            # Schedule check: route must be on today's SCHD sheet.
-            if _is_mine and _sched_prefixes is not None:
+            # Schedule check: route must be on today's SCHD sheet. An NA
+            # route (empty pfx) has no weekday schedule to check at all —
+            # exempt rather than excluding every NA customer as "not today".
+            if _is_mine and pfx and _sched_prefixes is not None:
                 if pfx not in _sched_prefixes:
                     _is_today = False
                     _not_today_count += 1
@@ -4354,6 +4416,13 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _sched_notice.append(
                     f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s route list — left unassigned."
                 )
+
+        if _route_owner_updates:
+            _customer_route_owner.update(_route_owner_updates)
+            try:
+                _save_customer_route_owner(_customer_route_owner)
+            except Exception:
+                pass
 
         sess["items"]      = items          # row-level item list
         sess["raw_df"]     = raw

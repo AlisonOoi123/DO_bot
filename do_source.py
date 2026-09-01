@@ -187,7 +187,14 @@ _ABI_DRN = [25, 26, 27, 28, 29, 30, 31, 32, 37, 39, 40, 41, 45, 60, 61, 66, 67,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 84, 85]
 _VIVIAN_DRN = [2, 3, 4, 5, 6, 23, 24, 33, 34, 35, 36, 68, 78, 79, 80, 81, 82,
                83, 86, 87, 88, 89, 90, 92, 93, 94]
-DRN_LIST = sorted(set(_ABI_DRN) | set(_VIVIAN_DRN))
+# DRN_0 codes whose ROUTE_MAP value is the literal "NA" — a customer whose
+# route has been cleared in the Warehouse Route & Remarks Update portal
+# (same DB, same DRN_0 column) uses one of these. Included so those DOs are
+# still fetched at all instead of silently dropped by the WHERE clause —
+# bot.py routes anything with ROUTE == "NA" into the board's Manual Assign
+# Only section rather than letting AI Assign touch it.
+_NA_DRN = sorted(k for k, v in ROUTE_MAP.items() if v == 'NA')
+DRN_LIST = sorted(set(_ABI_DRN) | set(_VIVIAN_DRN) | set(_NA_DRN))
 
 # Set by fetch_delivery_report() on every call — a stage-by-stage row count
 # breakdown, so a 0-row result can be explained (which filter zeroed it out)
