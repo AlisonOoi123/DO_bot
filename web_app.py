@@ -515,22 +515,29 @@ def _snapshot_rows(sess) -> list[dict]:
 
 def _board_save_rows(sess) -> list[dict]:
     """Every DO in this planner's own scope (assigned AND unassigned),
-    shaped for do_source.save_board_to_erp. Deliberately includes
-    unassigned rows — an unassigned DO is what clears a stale plate from
-    an earlier save. Items outside this planner's scope (another user's
+    shaped for do_source.save_board_to_erp. Includes unassigned rows too —
+    save_board_to_erp only uses them for the ZLORRY totals, never writes
+    them to SDELIVERY. Items outside this planner's scope (another user's
     route, off-schedule, outsourced, wrong trip) are excluded entirely —
     their SDELIVERY rows are never touched, since they're not this
-    planner's DOs to manage."""
+    planner's DOs to manage.
+
+    ai_assigned mirrors _ai_plate_snapshot (see _run_dos_upload): True only
+    for a DO still sitting on the exact plate the last AI Assign run put it
+    on — any manual drag since then naturally falls out of this check."""
+    ai_snapshot = sess.get("_ai_plate_snapshot") or {}
     rows = []
     for it in sess.get("items", []) or []:
         lorry = it.get("LORRY")
         if lorry in _NOT_MINE_TODAY:
             continue
         plate = lorry if lorry and lorry not in _SENTINELS else None
+        do_number = str(it.get("DO NUMBER", "")).strip()
         rows.append({
-            "do_number": str(it.get("DO NUMBER", "")).strip(),
+            "do_number": do_number,
             "plate": plate,
             "weight_kg": round(float(it.get("WEIGHT", 0) or 0) * 1000, 3),
+            "ai_assigned": bool(plate) and ai_snapshot.get(do_number) == plate,
         })
     return rows
 
@@ -948,6 +955,19 @@ def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -
         # switching planner tabs and back (see _planner_already_active)
         # restores to the right screen instead of skipping the picking step.
         sess["_picking_pending"] = True
+        sess["_ai_plate_snapshot"] = {}
+    else:
+        # Snapshot DO NUMBER -> plate for everything the engine itself just
+        # placed (never a manual drag) — the Excel watermark later compares
+        # each row's CURRENT plate against this snapshot, so any manual move
+        # after this point (which changes the DO's LORRY away from here)
+        # naturally falls out of the watermark instead of needing every
+        # manual-edit endpoint to separately clear a flag.
+        sess["_ai_plate_snapshot"] = {
+            str(it.get("DO NUMBER", "")).strip(): it.get("LORRY")
+            for it in sess.get("items", []) or []
+            if it.get("LORRY") and it.get("LORRY") not in _SENTINELS
+        }
     result = _result_json(sess) if sess.get("items") else None
     resp = {"messages": msgs, "state": sess.get("state"), "result": result}
     # bot.py's error messages consistently lead with "❌" — surface that as a
@@ -1459,6 +1479,11 @@ def api_board_refetch():
         for it in sess["items"]
         if it.get("LORRY") and it["LORRY"] not in _SENTINELS
     }
+    # Preserved separately from _run_dos_upload's reset below (assign_now=
+    # False wipes _ai_plate_snapshot since a normal fetch lands everything
+    # unassigned) — restored alongside each DO's plate so a refetch doesn't
+    # silently strip the AI watermark off assignments that didn't change.
+    _prev_ai_snapshot = dict(sess.get("_ai_plate_snapshot") or {})
 
     combined = pd.concat(
         [old_raw, new_rows.reindex(columns=old_raw.columns, fill_value="")],
@@ -1471,6 +1496,8 @@ def api_board_refetch():
         do_num = str(it.get("DO NUMBER", "")).strip()
         if do_num in _prev_assigned and it.get("LORRY") == "NO_LORRY":
             it["LORRY"] = _prev_assigned[do_num]
+            if do_num in _prev_ai_snapshot:
+                sess.setdefault("_ai_plate_snapshot", {})[do_num] = _prev_ai_snapshot[do_num]
 
     outcome["new_count"] = int(len(new_rows))
     outcome["board"] = _board_json(sess) if sess.get("items") else None
@@ -3485,7 +3512,8 @@ async function saveBoardToSql(){
     const d=await jpost('/api/board/save',{});
     if(!d.ok){ setMsg('#board-msg', d.error||'Save failed', true); return; }
     setMsg('#board-msg', null);
-    boardToast(`Saved: ${d.dos_written} DO(s), ${d.lorries_written} lorry(s) written to SQL.`);
+    boardToast(`Saved: ${d.dos_written} DO(s), ${d.lorries_written} lorry(s) written to SQL. Downloading Excel…`);
+    window.location.href='/api/download';
   } finally { btn.disabled=false; }
 }
 $('#btn-board-save').onclick=saveBoardToSql;
