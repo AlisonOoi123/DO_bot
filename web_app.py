@@ -1297,6 +1297,7 @@ def api_board_mark_manual_only():
         lorry = it.get("LORRY")
         if lorry and lorry not in _SENTINELS:
             it["LORRY"] = "NO_LORRY"
+    sess.pop("export_bytes", None)
     return _with_cookie({"ok": True, "code": code, "board": _board_json(sess)}, sid)
 
 
@@ -1324,6 +1325,7 @@ def api_board_move_code():
         it["LORRY"] = plate if plate else "NO_LORRY"
         sess.setdefault("assigned", {})[str(it.get("DO NUMBER", ""))] = it["LORRY"]
         moved += 1
+    sess.pop("export_bytes", None)
     return _with_cookie({"ok": True, "moved": moved, "board": _board_json(sess)}, sid)
 
 
@@ -1348,6 +1350,7 @@ def api_board_drop_lane():
         it["LORRY"] = "NO_LORRY"
         sess.setdefault("assigned", {})[str(it.get("DO NUMBER", ""))] = "NO_LORRY"
         dropped += 1
+    sess.pop("export_bytes", None)
     return _with_cookie({"ok": True, "dropped": dropped, "board": _board_json(sess)}, sid)
 
 
