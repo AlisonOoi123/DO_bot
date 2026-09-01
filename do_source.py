@@ -92,7 +92,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 CONFIG_PATH = os.environ.get(
     "DO_DB_CONFIG_PATH",
@@ -466,3 +466,122 @@ def report_to_xlsx_bytes(report_df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         report_df.to_excel(writer, index=False, sheet_name="Delivery Report")
     return buf.getvalue()
+
+
+# ── Write path: save the board's assignments back to the ERP ────────────────
+# By explicit request. This is the only place in the whole app that writes
+# to production Sage X3 tables rather than just reading from them — treat
+# any change here with the same care as the read query's own history (see
+# the module docstring's cross-check notes).
+#
+# UNCONFIRMED: the exact ZLORRY date-column name. The user's own screenshot
+# of a raw `SELECT * FROM ZLORRY` showed the header as "ACTUAL_D.DATE",
+# which isn't a legal bare SQL Server column identifier — almost certainly
+# either an underscore ("ACTUAL_D_DATE") that got mangled in the screenshot/
+# copy, or a bracketed name. Using "ACTUAL_D_DATE" as the best-effort guess;
+# if the real column name differs, every write below will fail loudly with
+# a SQL "Invalid column name" error (never silently write to the wrong
+# column) — fix _ZLORRY_DATE_COL below to match once confirmed.
+_ZLORRY_DATE_COL = "ACTUAL_D_DATE"
+
+
+def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = None) -> dict:
+    """Write one planner's board back to the ERP — SDELIVERY per DO, ZLORRY
+    per (add_date, trip, plate).
+
+    rows: one dict per DO in the board's own scope (assigned AND
+    unassigned — an unassigned row is what clears a stale prior save):
+        {"do_number": str, "plate": str | None, "weight_kg": float}
+    add_date: the "Assign for" date (a datetime.date) — ZLORRY.<date col>
+        and SDELIVERY.ARVDAT_0.
+    trip: the Trip number as a string ("1".."4") — ZLORRY.TRIP.
+
+    SDELIVERY.ZLICENSE_0/ARVDAT_0 are written to mirror the board exactly:
+    an assigned DO gets its plate + add_date; an unassigned DO gets both
+    cleared (NULL) — so a DO removed from a lorry since the last save
+    doesn't keep showing a stale plate in Sage X3.
+
+    ZLORRY.TON (converted to KG here — callers pass weight_kg already) is
+    the SUMMED weight of everything assigned to that plate for this exact
+    (add_date, trip) — the natural key the user confirmed is unique per
+    date+trip+vehicle. A plate that had DOs before but has none now still
+    gets its row (never deleted, DRIVER/ASSIT_1/ASSIT_2/OVERNIGHT
+    untouched) — just its TON drops to 0, so ZLORRY always mirrors what's
+    actually assigned rather than accumulating stale totals. A brand-new
+    (add_date, trip, plate) combination gets INSERTed.
+
+    Everything happens in one transaction — a failure partway rolls back
+    the whole save rather than leaving Sage X3 half-updated. Raises on any
+    DB/config failure; the caller decides how to surface that.
+    """
+    config = _load_config(config_path)
+    engine = _build_engine(config)
+
+    plate_totals: dict[str, float] = {}
+    for r in rows:
+        plate = r.get("plate")
+        if plate:
+            plate_totals[plate] = plate_totals.get(plate, 0.0) + float(r.get("weight_kg", 0) or 0)
+
+    dos_written = 0
+    lorries_written = 0
+    with engine.begin() as conn:
+        # 1) SDELIVERY — one row per DO, matched by SDHNUM_0 (the DO number,
+        # same column the read query already keys off). No OUTPUT clause —
+        # BPDLVCUST is documented to have an update trigger that breaks
+        # OUTPUT, and SDELIVERY may well have one too; a plain UPDATE is
+        # safe either way.
+        for r in rows:
+            do_number = str(r.get("do_number", "")).strip()
+            if not do_number:
+                continue
+            plate = r.get("plate")
+            conn.execute(
+                text(f"""
+                    UPDATE {SCHEMA_NAME}.SDELIVERY
+                    SET ZLICENSE_0 = :plate,
+                        ARVDAT_0 = :add_date
+                    WHERE SDHNUM_0 = :do_number
+                """),
+                {
+                    "plate": plate if plate else None,
+                    "add_date": add_date if plate else None,
+                    "do_number": do_number,
+                },
+            )
+            dos_written += 1
+
+        # 2) ZLORRY — union of plates assigned today and plates that already
+        # have a row for this exact (add_date, trip), so a plate dropped to
+        # zero DOs still gets its TON reset instead of being left stale.
+        existing = conn.execute(
+            text(f"""
+                SELECT VEHICLE FROM {SCHEMA_NAME}.ZLORRY
+                WHERE {_ZLORRY_DATE_COL} = :add_date AND TRIP = :trip
+            """),
+            {"add_date": add_date, "trip": trip},
+        ).fetchall()
+        existing_plates = {row[0] for row in existing}
+
+        for plate in sorted(set(plate_totals) | existing_plates):
+            ton_kg = round(plate_totals.get(plate, 0.0), 3)
+            if plate in existing_plates:
+                conn.execute(
+                    text(f"""
+                        UPDATE {SCHEMA_NAME}.ZLORRY
+                        SET TON = :ton
+                        WHERE {_ZLORRY_DATE_COL} = :add_date AND TRIP = :trip AND VEHICLE = :plate
+                    """),
+                    {"ton": ton_kg, "add_date": add_date, "trip": trip, "plate": plate},
+                )
+            else:
+                conn.execute(
+                    text(f"""
+                        INSERT INTO {SCHEMA_NAME}.ZLORRY ({_ZLORRY_DATE_COL}, TRIP, VEHICLE, TON)
+                        VALUES (:add_date, :trip, :plate, :ton)
+                    """),
+                    {"add_date": add_date, "trip": trip, "plate": plate, "ton": ton_kg},
+                )
+            lorries_written += 1
+
+    return {"dos_written": dos_written, "lorries_written": lorries_written}

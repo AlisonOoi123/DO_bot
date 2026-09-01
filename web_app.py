@@ -513,6 +513,28 @@ def _snapshot_rows(sess) -> list[dict]:
     return rows
 
 
+def _board_save_rows(sess) -> list[dict]:
+    """Every DO in this planner's own scope (assigned AND unassigned),
+    shaped for do_source.save_board_to_erp. Deliberately includes
+    unassigned rows — an unassigned DO is what clears a stale plate from
+    an earlier save. Items outside this planner's scope (another user's
+    route, off-schedule, outsourced, wrong trip) are excluded entirely —
+    their SDELIVERY rows are never touched, since they're not this
+    planner's DOs to manage."""
+    rows = []
+    for it in sess.get("items", []) or []:
+        lorry = it.get("LORRY")
+        if lorry in _NOT_MINE_TODAY:
+            continue
+        plate = lorry if lorry and lorry not in _SENTINELS else None
+        rows.append({
+            "do_number": str(it.get("DO NUMBER", "")).strip(),
+            "plate": plate,
+            "weight_kg": round(float(it.get("WEIGHT", 0) or 0) * 1000, 3),
+        })
+    return rows
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API endpoints — each drives the existing engine handler for the current step.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1521,6 +1543,59 @@ def _print_excel_bytes(sess) -> bytes | None:
     return buf.getvalue()
 
 
+@app.route("/api/board/save-preview", methods=["POST"])
+def api_board_save_preview():
+    """Read-only — computes exactly what /api/board/save would write,
+    without touching SQL, so the Save button can show a confirm dialog
+    first (writing straight to production ERP tables, by explicit
+    request)."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    if not sess.get("items"):
+        return _with_cookie({"error": "No board to save yet."}, sid, 400)
+    rows = _board_save_rows(sess)
+    if not rows:
+        return _with_cookie({"error": "Nothing in scope to save."}, sid, 400)
+    add_dt = bot._resolve_trip_day_date(sess.get("trip_day"))
+    trip = str(sess.get("trip_session") or "1")
+    plate_totals: dict[str, float] = {}
+    for r in rows:
+        if r["plate"]:
+            plate_totals[r["plate"]] = plate_totals.get(r["plate"], 0.0) + r["weight_kg"]
+    return _with_cookie({
+        "add_date": add_dt.strftime("%d/%m/%Y"),
+        "trip": trip,
+        "dos_total": len(rows),
+        "dos_assigned": sum(1 for r in rows if r["plate"]),
+        "dos_unassigned": sum(1 for r in rows if not r["plate"]),
+        "lorries": [{"plate": p, "ton_kg": round(t, 1)} for p, t in sorted(plate_totals.items())],
+    }, sid)
+
+
+@app.route("/api/board/save", methods=["POST"])
+def api_board_save():
+    """Writes the board to SQL — see do_source.save_board_to_erp for exactly
+    what gets written and why. Always re-derives from the current session
+    state (never trusts anything the client sent) and runs as one
+    transaction on the ERP side."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    if not sess.get("items"):
+        return _with_cookie({"error": "No board to save yet."}, sid, 400)
+    rows = _board_save_rows(sess)
+    if not rows:
+        return _with_cookie({"error": "Nothing in scope to save."}, sid, 400)
+    add_dt = bot._resolve_trip_day_date(sess.get("trip_day"))
+    trip = str(sess.get("trip_session") or "1")
+    try:
+        result = do_source.save_board_to_erp(rows, add_dt, trip)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return _with_cookie({"ok": False, "error": f"Save failed: {e}"}, sid, 500)
+    return _with_cookie({"ok": True, **result}, sid)
+
+
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
     sid = _active_user_sid()
@@ -1828,6 +1903,8 @@ _PAGE = r"""<!doctype html>
   .board-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
   .board-top .btn{width:auto}
   .board-top .btn-ai{background:linear-gradient(135deg,var(--brand),#a855f7);color:#fff}
+  .board-top .btn-save{background:#059669;color:#fff}
+  .board-top .btn-save:hover{background:#047857}
   .board-top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-left:auto}
   .board-plan-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .board-plan-field{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
@@ -2140,6 +2217,7 @@ _PAGE = r"""<!doctype html>
       </div>
       <div class="board-top-actions">
         <button class="btn btn-ai" id="btn-board-ai">🤖 AI Assign</button>
+        <button class="btn btn-save" id="btn-board-save">💾 Save to SQL</button>
         <a class="dl" href="/api/download"><button class="btn secondary">⬇️ Download &amp; Print</button></a>
         <button class="btn secondary hidden" id="btn-board-table">📋 Table view</button>
       </div>
@@ -3361,6 +3439,31 @@ async function aiAssign(){
   } finally { btn.disabled=false; }
 }
 $('#btn-board-ai').onclick=aiAssign;
+
+async function saveBoardToSql(){
+  const btn=$('#btn-board-save'); btn.disabled=true;
+  try{
+    const p=await jpost('/api/board/save-preview',{});
+    if(p.error){ boardToast(p.error); return; }
+    const lines=[
+      `Save to SQL — Assign for ${p.add_date}, Trip ${p.trip}`,
+      '',
+      `${p.dos_assigned} DO(s) assigned across ${p.lorries.length} lorry(s):`,
+      ...p.lorries.map(l=>`  ${l.plate}: ${l.ton_kg.toFixed(1)} KG`),
+    ];
+    if(p.dos_unassigned){
+      lines.push('', `${p.dos_unassigned} unassigned DO(s) in scope — if any were saved with a plate before, that will be cleared.`);
+    }
+    lines.push('', 'This writes directly to the live ERP database (SDELIVERY + ZLORRY). Continue?');
+    if(!confirm(lines.join('\n'))) return;
+    setMsg('#board-msg','Saving to SQL… ',false);
+    const d=await jpost('/api/board/save',{});
+    if(!d.ok){ setMsg('#board-msg', d.error||'Save failed', true); return; }
+    setMsg('#board-msg', null);
+    boardToast(`Saved: ${d.dos_written} DO(s), ${d.lorries_written} lorry(s) written to SQL.`);
+  } finally { btn.disabled=false; }
+}
+$('#btn-board-save').onclick=saveBoardToSql;
 
 async function refetchDOs(){
   const btn=$('#btn-board-back'); btn.disabled=true;
