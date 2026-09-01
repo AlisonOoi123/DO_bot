@@ -4368,6 +4368,7 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 "DROPPOINT":     str(row.get("DROPPOINT", "")).strip(),
                 "WEIGHT":        float(row["WEIGHT(T)"]),
                 "ITMREF":        str(row.get("ITMREF_0", "")).strip(),
+                "PRODUCTS":      str(row.get("PRODUCTS", "")).strip(),
                 "DATE":          str(row.get("DATE", "")).strip(),
                 "ETD":           str(row.get("ETD", "")).strip(),
                 "STATE":         _state_from_row(row),   # destination state from file

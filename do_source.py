@@ -250,7 +250,8 @@ SELECT DISTINCT
     ISNULL(c.ZUVYDAY18_0, 0) AS ZUVYDAY18_0,
     ISNULL(c.ZUVYDAY19_0, 0) AS ZUVYDAY19_0,
     ISNULL(c.ZUVYDAY20_0, 0) AS ZUVYDAY20_0,
-    ISNULL(c.ZUVYDAY21_0, 0) AS ZUVYDAY21_0
+    ISNULL(c.ZUVYDAY21_0, 0) AS ZUVYDAY21_0,
+    ISNULL(p.PRODUCTS_0, '') AS PRODUCTS_0
 FROM {schema}.SDELIVERY d
 LEFT JOIN {schema}.BPDLVCUST c
     ON d.BPAADD_0 = c.BPAADD_0
@@ -262,6 +263,20 @@ LEFT JOIN {schema}.SALESREP r
 LEFT JOIN {schema}.BPADDRESS a
     ON c.BPCNUM_0 = a.BPANUM_0
    AND c.BPAADD_0 = a.BPAADD_0
+-- One row per DO with every SDELIVERYD line item ("<description> x<qty>")
+-- concatenated together — SDELIVERYD is a one-to-many detail table (each DO
+-- can have several product lines), so it's pre-aggregated here rather than
+-- joined directly into the main SELECT DISTINCT, which would fan out one
+-- SDELIVERY row per line item and break every weight/route aggregate above.
+-- STRING_AGG requires SQL Server 2017+; if the real server predates that,
+-- this fails loudly with a clear "not a recognized function" error rather
+-- than silently returning wrong data.
+LEFT JOIN (
+    SELECT SDHNUM_0,
+           STRING_AGG(CONCAT(ITMDES_0, ' x', QTY_0), '; ') AS PRODUCTS_0
+    FROM {schema}.SDELIVERYD
+    GROUP BY SDHNUM_0
+) p ON d.SDHNUM_0 = p.SDHNUM_0
 WHERE d.SDHTYP_0 <> 'LOAN'
   AND d.STOFCY_0 = '1SA'
   AND (d.SIHNUM_0 IS NULL OR LTRIM(RTRIM(d.SIHNUM_0)) = '')
@@ -409,7 +424,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     filtered_df['INVOICE_DATE_FORMATTED'] = pd.to_datetime(
         filtered_df['INVOICE_DATE'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
 
-    for col in ['ZDOREMARKS_0', 'ZLONGITUD_0', 'ZDISTANCE_0', 'ZDROPPOINT_0']:
+    for col in ['ZDOREMARKS_0', 'ZLONGITUD_0', 'ZDISTANCE_0', 'ZDROPPOINT_0', 'PRODUCTS_0']:
         if col not in filtered_df.columns:
             filtered_df[col] = ''
 
@@ -449,6 +464,7 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
         'ETD': filtered_df['ETD_FORMATTED'],
         'SALES REP': filtered_df['REPNAM_0'],
         'DROPPOINT': filtered_df['ZDROPPOINT_0'],
+        'PRODUCTS': filtered_df['PRODUCTS_0'],
     })
 
     # NOTE: rows are intentionally NOT dropped just because ETD is unset (the

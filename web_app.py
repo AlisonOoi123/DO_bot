@@ -429,6 +429,7 @@ def _board_json(sess) -> dict:
             "distance": str(it.get("DISTANCE", "")),
             "date": str(it.get("DATE", "")),
             "remarks": str(_rm) if pd.notna(_rm := it.get("REMARKS")) else "",
+            "products": str(it.get("PRODUCTS", "")),
             "lorry": assigned_plate,
             "reason": _reason,
             "manualOnly": _is_manual_only,
@@ -3260,6 +3261,7 @@ function boardCardEl(o){
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
+      ${o.products?`<div class="b-meta" style="color:var(--brand);font-weight:700">${esc(o.products)}</div>`:''}
       ${o.reason?`<div class="b-meta" style="color:var(--bad)">${esc(o.reason)}</div>`:''}
       ${o._warned?`<div class="b-warn">⚠️ ${esc(o._warned)}</div>`:''}
     </div>`;
