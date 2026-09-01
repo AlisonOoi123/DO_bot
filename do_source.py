@@ -473,16 +473,11 @@ def report_to_xlsx_bytes(report_df: pd.DataFrame) -> bytes:
 # to production Sage X3 tables rather than just reading from them — treat
 # any change here with the same care as the read query's own history (see
 # the module docstring's cross-check notes).
-#
-# UNCONFIRMED: the exact ZLORRY date-column name. The user's own screenshot
-# of a raw `SELECT * FROM ZLORRY` showed the header as "ACTUAL_D.DATE",
-# which isn't a legal bare SQL Server column identifier — almost certainly
-# either an underscore ("ACTUAL_D_DATE") that got mangled in the screenshot/
-# copy, or a bracketed name. Using "ACTUAL_D_DATE" as the best-effort guess;
-# if the real column name differs, every write below will fail loudly with
-# a SQL "Invalid column name" error (never silently write to the wrong
-# column) — fix _ZLORRY_DATE_COL below to match once confirmed.
-_ZLORRY_DATE_COL = "ACTUAL_D_DATE"
+# Confirmed via INFORMATION_SCHEMA.COLUMNS: the real column name is
+# literally "ACTUAL_D.DATE" (a period inside the identifier, not an
+# underscore) — needs bracket-quoting in T-SQL or the dot parses as a
+# schema/table separator.
+_ZLORRY_DATE_COL = "[ACTUAL_D.DATE]"
 
 
 def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = None) -> dict:
