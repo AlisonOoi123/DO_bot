@@ -1357,6 +1357,29 @@ def api_board_move_code():
     return _with_cookie({"ok": True, "moved": moved, "board": _board_json(sess)}, sid)
 
 
+@app.route("/api/board/drop-all", methods=["POST"])
+def api_board_drop_all():
+    """Drop every DO currently assigned to ANY lorry back into Unassigned in
+    one click — the bulk, whole-board version of drop-lane."""
+    sid = _active_user_sid()
+    sess = bot.get_session(sid)
+    assigned_do_numbers = [
+        str(it.get("DO NUMBER", "")) for it in sess.get("items", []) or []
+        if it.get("LORRY") and it.get("LORRY") not in _SENTINELS
+    ]
+    _reassert_na_manual_only(sess, assigned_do_numbers)
+    dropped = 0
+    for it in sess.get("items", []) or []:
+        lorry = it.get("LORRY")
+        if not lorry or lorry in _SENTINELS:
+            continue
+        it["LORRY"] = "NO_LORRY"
+        sess.setdefault("assigned", {})[str(it.get("DO NUMBER", ""))] = "NO_LORRY"
+        dropped += 1
+    sess.pop("export_bytes", None)
+    return _with_cookie({"ok": True, "dropped": dropped, "board": _board_json(sess)}, sid)
+
+
 @app.route("/api/board/drop-lane", methods=["POST"])
 def api_board_drop_lane():
     """Drop every DO currently assigned to one lorry back into Unassigned in
@@ -2429,6 +2452,7 @@ _PAGE = r"""<!doctype html>
         <div class="board-lanes-tools">
           <button class="mini-btn" id="board-collapse-all">Collapse all lorries</button>
           <button class="mini-btn" id="board-expand-all">Expand all</button>
+          <button class="mini-btn" id="board-drop-all" style="margin-left:auto;border-color:var(--bad);color:var(--bad)" title="Drop every DO on every lorry back to Unassigned">🗑️ Drop all</button>
         </div>
         <div class="board-lanes" id="board-lanes"></div>
       </div>
@@ -3507,6 +3531,16 @@ $('#board-collapse-all').onclick=()=>{
   renderBoard();
 };
 $('#board-expand-all').onclick=()=>{ boardCollapsedLanes.clear(); renderBoard(); };
+$('#board-drop-all').onclick=async()=>{
+  const total = (BOARD?.orders||[]).filter(o=>o.lorry).length;
+  if(!total){ boardToast('Nothing assigned to drop.'); return; }
+  if(!confirm(`Drop all ${total} assigned DO(s) across every lorry back to Unassigned?`)) return;
+  const d=await jpost('/api/board/drop-all',{});
+  if(!d.ok){ boardToast(d.message||d.error||'Drop failed'); await loadBoard(); return; }
+  boardToast(`${d.dropped} DO(s) dropped back to Unassigned.`);
+  if(d.board){ BOARD=d.board; }
+  renderBoard();
+};
 $('#board-pool-collapse-all').onclick=()=>{ boardOpenRoutes.clear(); renderBoard(); };
 $('#board-pool-expand-all').onclick=()=>{
   if(BOARD){
