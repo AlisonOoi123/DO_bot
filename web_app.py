@@ -1567,17 +1567,34 @@ def api_download():
 
 @app.route("/api/board/download-unassigned")
 def api_download_unassigned():
-    """TEMPORARY debug tool — every DO NOT currently on a real lorry plate,
-    whatever the reason (still unassigned, or excluded as NOT_TODAY/
-    OTHER_USER/PAST_DATE/WRONG_TRIP/REMARKS_SKIP/OUT_SOURCE), one row each,
-    with the reason plainly labelled — for cross-checking the fetch/
-    classification pipeline against an external reference report. Remove
-    once that's no longer needed."""
+    """TEMPORARY debug tool — every DO NOT currently on a real lorry plate
+    (still unassigned, or excluded as NOT_TODAY/OTHER_USER/PAST_DATE/
+    WRONG_TRIP/REMARKS_SKIP/OUT_SOURCE), for cross-checking the fetch/
+    classification pipeline against an external reference report. Same
+    column layout as the main export (NO/DATE/DO NUMBER/CODE/ROUTE/
+    CUSTOMER NAME/BRANCH/GROSS WEIGHT/REMARKS/VALIDATED/INVOICE NO/
+    INVOICE DATE/SITE/LICENSE/DRIVER/LORRY ASST1/LORRY ASST2/DISTANCE/
+    LONGITUD/POSCODE/CITY/STATE/SHIP_DETAIL/ETD/SALES REP), by explicit
+    request — no ADD/TRIP columns (those are this planner's chosen
+    plan-for date/trip, not a per-row fact) and no extra REASON column.
+    Remove this endpoint once it's no longer needed."""
     sid = _active_user_sid()
     sess = bot.get_session(sid)
-    items = sess.get("items", []) or []
-    if not items:
-        return _with_cookie({"error": "Nothing fetched yet."}, sid, 400)
+    export_df = _get_export_df(sess)
+    if export_df is None:
+        return _with_cookie({"error": "Nothing to export yet."}, sid, 400)
+
+    columns = [c for c in export_df.columns if c not in ("ADD", "TRIP")]
+    if "LICENSE" in export_df.columns:
+        _blank = {"", "nan", "none", "no_lorry", "split", "skipped"}
+        # fillna BEFORE astype(str): on an object-dtype column, .astype(str)
+        # doesn't reliably stringify NaN (a real pandas gotcha) -- without
+        # this a genuinely-blank LICENSE row silently fails the blank check
+        # below and gets wrongly treated as if it had a real plate.
+        plate_col = export_df["LICENSE"].fillna("").astype(str).str.strip()
+        unassigned_df = export_df[plate_col.str.lower().isin(_blank)]
+    else:
+        unassigned_df = export_df
 
     from openpyxl import Workbook
     from openpyxl.styles import Font
@@ -1585,24 +1602,13 @@ def api_download_unassigned():
     wb = Workbook()
     ws = wb.active
     ws.title = "UNASSIGNED"
-    headers = ["DO NUMBER", "CODE", "ROUTE", "CUSTOMER NAME", "DATE", "WEIGHT", "REASON", "REMARKS"]
-    ws.append(headers)
+    ws.append(columns)
     for cell in ws[1]:
         cell.font = Font(bold=True)
-    rows = 0
-    for it in items:
-        lorry = it.get("LORRY")
-        if lorry and lorry not in _SENTINELS:
-            continue   # has a real plate — not what this tool is for
-        reason = lorry if lorry else "NO_LORRY"
-        ws.append([
-            it.get("DO NUMBER", ""), it.get("CODE", ""), it.get("ROUTE", ""),
-            it.get("CUSTOMER NAME", ""), it.get("DATE", ""),
-            round(float(it.get("WEIGHT", 0) or 0), 3), reason, it.get("REMARKS", ""),
-        ])
-        rows += 1
-    for col_idx, h in enumerate(headers, start=1):
-        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = max(12, min(40, len(h) + 2))
+    for _, row in unassigned_df.iterrows():
+        ws.append([None if pd.isna(row[c]) else row[c] for c in columns])
+    for col_idx, h in enumerate(columns, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = max(10, min(30, len(str(h)) + 2))
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1612,6 +1618,26 @@ def api_download_unassigned():
         download_name="Unassigned_DOs.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+def _get_export_df(sess):
+    """The main export as a DataFrame — sess["export_bytes"], rebuilt via
+    bot._export_result if missing, with column names stripped. Shared by
+    _print_excel_bytes and the unassigned-DOs download so both read from
+    the same single source of truth. Returns None if there's nothing to
+    export yet."""
+    data = sess.get("export_bytes")
+    if not data:
+        try:
+            bot._export_result(sess)
+            data = sess.get("export_bytes")
+        except Exception:
+            data = None
+    if not data:
+        return None
+    export_df = pd.read_excel(io.BytesIO(data), sheet_name=0)
+    export_df.columns = [str(c).strip() for c in export_df.columns]
+    return export_df
 
 
 def _print_excel_bytes(sess) -> bytes | None:
@@ -1626,18 +1652,10 @@ def _print_excel_bytes(sess) -> bytes | None:
     from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font
 
-    data = sess.get("export_bytes")
-    if not data:
-        try:
-            bot._export_result(sess)
-            data = sess.get("export_bytes")
-        except Exception:
-            data = None
-    if not data:
+    export_df = _get_export_df(sess)
+    if export_df is None:
         return None
 
-    export_df = pd.read_excel(io.BytesIO(data), sheet_name=0)
-    export_df.columns = [str(c).strip() for c in export_df.columns]
     if "DRIVER" in export_df.columns:
         export_df["DRIVER"] = ""   # always blank on the print sheet
     columns = list(export_df.columns)
@@ -1645,7 +1663,10 @@ def _print_excel_bytes(sess) -> bytes | None:
     by_plate: dict[str, "pd.DataFrame"] = {}
     if "LICENSE" in export_df.columns:
         _blank = {"", "nan", "none", "no_lorry", "split", "skipped"}
-        plate_col = export_df["LICENSE"].astype(str).str.strip()
+        # fillna BEFORE astype(str) — see _get_export_df's caller in
+        # api_download_unassigned for why: .astype(str) alone doesn't
+        # reliably stringify NaN on an object-dtype column.
+        plate_col = export_df["LICENSE"].fillna("").astype(str).str.strip()
         mask = ~plate_col.str.lower().isin(_blank)
         for plate, g in export_df[mask].groupby(plate_col[mask]):
             by_plate[str(plate)] = g
