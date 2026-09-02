@@ -1669,9 +1669,12 @@ def _print_excel_bytes(sess) -> bytes | None:
     assigned lorries only), then one sheet per lorry that actually has DOs
     assigned, each with the SAME full column set as the main Download
     export (NO/DATE/ADD/TRIP/DO NUMBER/.../SALES REP) filtered to that
-    plate's own rows — the export bytes are the single source of truth for
-    both, so the two never drift apart. Idle/unused lorries are skipped
-    entirely. Returns None if there's nothing to export yet."""
+    plate's own rows, plus one extra AI_Assign column appended at the very
+    end (Yes/No — same definition as the SDELIVERY.ZAIASSIGN_0 write: Yes
+    only if the DO is still on exactly the plate the last AI Assign run put
+    it on) — the export bytes are the single source of truth for both, so
+    the two never drift apart. Idle/unused lorries are skipped entirely.
+    Returns None if there's nothing to export yet."""
     from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font
 
@@ -1695,6 +1698,8 @@ def _print_excel_bytes(sess) -> bytes | None:
             by_plate[str(plate)] = g
 
     snap_rows = [r for r in _snapshot_rows(sess) if r["DONE"] == "✓"]
+    ai_snapshot = sess.get("_ai_plate_snapshot") or {}
+    sheet_columns = columns + ["AI_Assign"]
 
     wb = Workbook()
     ws = wb.active
@@ -1718,12 +1723,15 @@ def _print_excel_bytes(sess) -> bytes | None:
             name = f"{base_name[:28]}_{i}"
         _used_names.add(name)
         pws = wb.create_sheet(name)
-        pws.append(columns)
+        pws.append(sheet_columns)
         for cell in pws[1]:
             cell.font = Font(bold=True)
         for _, row in by_plate[plate].iterrows():
-            pws.append([None if pd.isna(row[c]) else row[c] for c in columns])
-        for col_idx, h in enumerate(columns, start=1):
+            do_num = str(row.get("DO NUMBER", "")).strip()
+            ai_val = "Yes" if do_num and ai_snapshot.get(do_num) == plate else "No"
+            values = [None if pd.isna(row[c]) else row[c] for c in columns] + [ai_val]
+            pws.append(values)
+        for col_idx, h in enumerate(sheet_columns, start=1):
             pws.column_dimensions[pws.cell(row=1, column=col_idx).column_letter].width = max(10, min(30, len(str(h)) + 2))
 
     buf = io.BytesIO()
