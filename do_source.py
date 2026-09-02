@@ -520,16 +520,15 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
         and SDELIVERY.ARVDAT_0.
     trip: the Trip number as a string ("1".."4") — ZLORRY.TRIP.
 
-    SDELIVERY.ZLICENSE_0/ARVDAT_0 are written ONLY for assigned DOs (by
-    explicit request — unassigned DOs must never be touched, even to
-    clear a stale prior plate). A DO with no plate this save is simply
+    SDELIVERY.ZLICENSE_0/ARVDAT_0/ZAIASSIGN_0 are written ONLY for assigned
+    DOs (by explicit request — unassigned DOs must never be touched, even
+    to clear a stale prior plate). A DO with no plate this save is simply
     skipped; whatever SDELIVERY already holds for it is left alone.
 
-    ai_assigned on each row is currently unused here — SDELIVERY.AI_Assign
-    was dropped from the schema (temporarily, per the user), so the write
-    is disabled below rather than removed outright; re-enable by adding
-    `AI_Assign = :ai_assign` back to the UPDATE once the column exists
-    again.
+    ZAIASSIGN_0 (confirmed via SSMS — the real column, not the earlier
+    guessed "AI_Assign" name) is written 'Yes'/'No' per the caller's own
+    ai_assigned flag — never NULL, matching this DB's usual blank-string
+    convention for char columns (same reasoning as ZLICENSE_0).
 
     ZLORRY.TON (converted to KG here — callers pass weight_kg already) is
     the SUMMED weight of everything assigned to that plate for this exact
@@ -584,10 +583,16 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
                 text(f"""
                     UPDATE {SCHEMA_NAME}.SDELIVERY
                     SET ZLICENSE_0 = :plate,
-                        ARVDAT_0 = :add_date
+                        ARVDAT_0 = :add_date,
+                        ZAIASSIGN_0 = :ai_assign
                     WHERE SDHNUM_0 = :do_number
                 """),
-                {"plate": plate, "add_date": add_date, "do_number": do_number},
+                {
+                    "plate": plate,
+                    "add_date": add_date,
+                    "ai_assign": "Yes" if r.get("ai_assigned") else "No",
+                    "do_number": do_number,
+                },
             )
             dos_written += 1
 
