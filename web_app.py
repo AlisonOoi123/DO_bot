@@ -1493,21 +1493,26 @@ def api_board_ai_assign():
 
 @app.route("/api/board/refetch", methods=["POST"])
 def api_board_refetch():
-    """Pull fresh DOs from the live DB and merge in ONLY the ones not already
-    on this board — unlike AI Assign, this must never disturb anything the
-    planner has already assigned or left in the unassigned pool. DOs update
-    continuously in the source system, so a planner mid-way through a board
-    needs a way to pick up newly-appeared DOs without losing their progress.
+    """Pull fresh DOs from the live DB and merge them in — unlike AI Assign,
+    this must never disturb anything the planner has already assigned or
+    left in the unassigned pool. DOs update continuously in the source
+    system, so a planner mid-way through a board needs a way to pick up
+    newly-appeared DOs AND any master-data change on DOs already on the
+    board (e.g. a customer's route code flipped to NA in the Warehouse
+    Route & Remarks Update portal after this board was first fetched)
+    without losing their progress.
 
     Approach: snapshot every item's current real-plate assignment by DO
-    NUMBER, append only the genuinely new rows to the original raw sheet,
-    re-parse the combined file the normal deferred way (assign_now=False,
-    same as a fresh fetch — new rows land in Unassigned, nothing auto-fits),
-    then restore the snapshot onto the DO numbers that already existed. Old
-    rows re-classify identically to before (same day, same data) since
-    nothing about them changed, so restoring only the ones that were
-    actually assigned a real plate is sufficient to make the refetch a
-    no-op for everything except the new DOs."""
+    NUMBER, then rebuild the raw sheet DO-by-DO — a DO still present in the
+    fresh fetch uses the FRESH row (picking up any route/remarks/distance/
+    droppoint/etc. change), a DO that's fallen out of the live feed entirely
+    (already invoiced, aged out, etc.) falls back to its last-known row so
+    it doesn't just vanish, and a DO never seen before is added new. Re-parse
+    the combined file the normal deferred way (assign_now=False, same as a
+    fresh fetch — everything lands in Unassigned, nothing auto-fits), then
+    restore the snapshot onto the DO numbers that already existed. Runs on
+    every refetch, even when no brand-new DO shows up, since a route change
+    on an existing DO wouldn't otherwise be a 'new' row at all."""
     sid = _active_user_sid()
     sess = bot.get_session(sid)
     old_raw = sess.get("raw_df")
@@ -1519,22 +1524,18 @@ def api_board_refetch():
         return _with_cookie({"error": f"Could not fetch DOs from the system: {e}"}, sid, 500)
     _diagnostics = dict(do_source.LAST_FETCH_DIAGNOSTICS)
 
-    _known = set(old_raw["DO NUMBER"].astype(str).str.strip())
+    old_raw_do = old_raw["DO NUMBER"].astype(str).str.strip()
+    _known = set(old_raw_do)
     fresh_df = fresh_df.copy()
     fresh_df["DO NUMBER"] = fresh_df["DO NUMBER"].astype(str).str.strip()
     new_rows = fresh_df[~fresh_df["DO NUMBER"].isin(_known)]
-    if new_rows.empty:
-        # No new DOs, so no re-parse happens here — but the classification
-        # breakdown from whenever this board was first built (Fetch DOs ->
-        # Use, or the last refetch that DID bring in new rows) is still
-        # sitting in the session and still explains the board's current
-        # total, so surface it rather than only the SQL-side numbers.
-        return _with_cookie({
-            "new_count": 0,
-            "board": _board_json(sess),
-            "diagnostics": _diagnostics,
-            "parse_diagnostics": sess.get("_last_parse_diagnostics"),
-        }, sid)
+
+    # Known DOs that are STILL in the live feed get the fresh row (route
+    # etc. refreshed); known DOs that fell out of the live feed keep their
+    # last-known row so they don't silently disappear from the board.
+    fresh_known = fresh_df[fresh_df["DO NUMBER"].isin(_known)]
+    refreshed_dos = set(fresh_known["DO NUMBER"])
+    old_raw_stale = old_raw[~old_raw_do.isin(refreshed_dos)]
 
     # Snapshot: DO NUMBER -> its current real lorry plate, for every item
     # that's actually assigned right now (drag-and-drop, a prior AI Assign,
@@ -1551,7 +1552,11 @@ def api_board_refetch():
     _prev_ai_snapshot = dict(sess.get("_ai_plate_snapshot") or {})
 
     combined = pd.concat(
-        [old_raw, new_rows.reindex(columns=old_raw.columns, fill_value="")],
+        [
+            old_raw_stale,
+            fresh_known.reindex(columns=old_raw.columns, fill_value=""),
+            new_rows.reindex(columns=old_raw.columns, fill_value=""),
+        ],
         ignore_index=True,
     )
     combined_bytes = do_source.report_to_xlsx_bytes(combined)
@@ -1563,6 +1568,12 @@ def api_board_refetch():
             it["LORRY"] = _prev_assigned[do_num]
             if do_num in _prev_ai_snapshot:
                 sess.setdefault("_ai_plate_snapshot", {})[do_num] = _prev_ai_snapshot[do_num]
+    # Restoring a DO's prior plate above doesn't know WHY _run_dos_upload
+    # just cleared it — if a route refresh turned this DO's customer into an
+    # NA-route (manual-only) one, blindly restoring its old plate would
+    # silently undo that enforcement. Manual-only must always have the
+    # final say, so re-apply it after restoration.
+    _force_manual_only_unassigned(sess)
 
     outcome["new_count"] = int(len(new_rows))
     outcome["board"] = _board_json(sess) if sess.get("items") else None
