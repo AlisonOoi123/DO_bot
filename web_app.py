@@ -2156,6 +2156,11 @@ _PAGE = r"""<!doctype html>
     font-family:ui-monospace,Menlo,monospace}
   .board-route-body{display:none;flex-direction:column;gap:6px;padding:2px 8px 8px}
   .board-route.open .board-route-body{display:flex}
+  .board-specials-toggle{font-size:11px;color:#C11C84;font-weight:700;cursor:pointer;
+    user-select:none;white-space:nowrap;flex-shrink:0}
+  .board-specials-toggle:hover{text-decoration:underline}
+  .board-specials-panel{padding:6px 11px;font-size:11px;color:#C11C84;font-weight:700;
+    font-family:ui-monospace,Menlo,monospace;border-bottom:1px solid var(--line)}
   .board-lanes-tools{display:flex;gap:8px;margin-bottom:10px}
   .board-pool-aging{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
   .board-pool-aging .aging-pill{font-size:11px;font-weight:700;color:var(--bad);
@@ -3200,7 +3205,7 @@ function renderResult(r){
 
 // ==================== Drag-and-drop board ====================
 let BOARD=null;
-let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set();
+let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set(), boardOpenSpecialGroups=new Set();
 let boardMaximizedPlate=null;
 let boardDrag=null, boardGhost=null;
 let routeDragCandidate=null, routeDrag=null, routeGhost=null, routeDragJustHappened=false;
@@ -3324,6 +3329,72 @@ const BOARD_ROUTE_COLORS=['#5ab0ff','#c58bff','#ffd166','#7ee8b2','#ff9e7d',
 // list — everything else stays normal weight, by explicit request.
 const BOARD_BOLD_ITMREFS = new Set(['SS007','SS005','SS006','BL002','BL004',
   'AG001','KM101-1','KM101-2','CK102','CK107','CK004','CD001','KP065']);
+
+// Parses one raw "ITMREF|description xqty" product line (see do_source.py)
+// into its parts — shared by the per-card product list and the route/lane
+// special-product roll-up below, so both agree on what "qty" and "bold"
+// mean for a given line.
+function parseProductLine(raw){
+  const bar = raw.indexOf('|');
+  const ref = bar===-1 ? '' : raw.slice(0,bar).trim();
+  const rest = (bar===-1 ? raw : raw.slice(bar+1)).trim();
+  const m = rest.match(/^(.*)\sx(\d+(?:\.\d+)?)$/);
+  return {
+    ref,
+    label: m ? m[1].trim() : rest,
+    qty: m ? parseFloat(m[2]) : null,
+    bold: BOARD_BOLD_ITMREFS.has(ref),
+  };
+}
+
+// Sums quantity per highlight-list item code across every DO in `orders` —
+// used for both a route's pool group and a lorry lane, so the planner can
+// see at a glance which special products (and how much of each) a group
+// carries without expanding every card individually.
+function aggregateSpecialProducts(orders){
+  const totals = new Map();   // ref -> {label, qty}
+  orders.forEach(o=>{
+    if(!o.products) return;
+    o.products.split(';').map(p=>p.trim()).filter(Boolean).forEach(raw=>{
+      const item = parseProductLine(raw);
+      if(!item.bold || !item.ref) return;
+      const cur = totals.get(item.ref) || {label: item.label, qty: 0};
+      cur.qty += (item.qty || 0);
+      totals.set(item.ref, cur);
+    });
+  });
+  return [...totals.values()].sort((a,b)=>b.qty-a.qty);
+}
+
+// Builds the collapsed "▸ N special products" toggle (always shown when any
+// exist) plus its expandable breakdown panel (only when the group's own key
+// is in boardOpenSpecialGroups) — shared by route pool headers, Manual
+// Assign Only group headers, and lorry lane headers. Caller wires the
+// toggle's click handler (needs stopPropagation so it doesn't also
+// collapse/expand the parent section) and inserts panelHtml as a sibling of
+// the header, matching the existing *-body element pattern.
+function specialProductsBadge(key, orders){
+  const specials = aggregateSpecialProducts(orders);
+  if(!specials.length) return {toggleHtml:'', panelHtml:''};
+  const open = boardOpenSpecialGroups.has(key);
+  const toggleHtml = `<span class="board-specials-toggle" data-specialkey="${esc(key)}">`+
+    `${open?'&#9662;':'&#9656;'} ${specials.length} special product${specials.length===1?'':'s'}</span>`;
+  const panelHtml = open
+    ? `<div class="board-specials-panel">${specials.map(s=>`<div>&bull; ${esc(s.label)}: ${s.qty}</div>`).join('')}</div>`
+    : '';
+  return {toggleHtml, panelHtml};
+}
+function wireSpecialsToggle(container){
+  const el = container.querySelector('.board-specials-toggle');
+  if(!el) return;
+  el.addEventListener('click', e=>{
+    e.stopPropagation();
+    const key = el.dataset.specialkey;
+    boardOpenSpecialGroups.has(key) ? boardOpenSpecialGroups.delete(key) : boardOpenSpecialGroups.add(key);
+    renderBoard();
+  });
+}
+
 function boardRouteColor(route){
   const idx=(BOARD.routes||[]).findIndex(r=>r.route===route);
   return BOARD_ROUTE_COLORS[(idx<0?0:idx)%BOARD_ROUTE_COLORS.length];
@@ -3403,14 +3474,18 @@ function renderBoard(){
     totalUn+=list.length;
     const div=document.createElement('div');
     div.className='board-route'+(boardOpenRoutes.has(rt.route)?' open':'');
+    const {toggleHtml, panelHtml} = specialProductsBadge('RT:'+rt.route, list);
     div.innerHTML=`
       <div class="board-route-head">
         <span class="board-route-chev">&#9654;</span>
         <span class="board-route-dot" style="background:${boardRouteColor(rt.route)}"></span>
         <span class="board-route-code">${esc(rt.route)}</span>
         <span class="board-route-meta">${list.length} DO &middot; ${fmtT(rt.weight)}</span>
+        ${toggleHtml}
       </div>
+      ${panelHtml}
       <div class="board-route-body"></div>`;
+    wireSpecialsToggle(div);
     const _head=div.querySelector('.board-route-head');
     _head.onclick=()=>{
       if(routeDragJustHappened){ routeDragJustHappened=false; return; }
@@ -3448,14 +3523,18 @@ function renderBoard(){
     const key='MO:'+mo.code;
     const div=document.createElement('div');
     div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
+    const {toggleHtml: moToggleHtml, panelHtml: moPanelHtml} = specialProductsBadge('MOS:'+mo.code, list);
     div.innerHTML=`
       <div class="board-route-head">
         <span class="board-route-chev">&#9654;</span>
         <span class="board-route-dot" style="background:#f59e0b"></span>
         <span class="board-route-code">${esc(mo.code)} - ${esc(mo.customer)}</span>
         <span class="board-route-meta">${list.length} DO &middot; ${fmtT(mo.weight)}</span>
+        ${moToggleHtml}
       </div>
+      ${moPanelHtml}
       <div class="board-route-body"></div>`;
+    wireSpecialsToggle(div);
     const _moHead=div.querySelector('.board-route-head');
     _moHead.onclick=()=>{
       if(routeDragJustHappened){ routeDragJustHappened=false; return; }
@@ -3505,6 +3584,7 @@ function renderBoard(){
     const lane=document.createElement('section');
     lane.className='board-lane'+(collapsed?' collapsed':'')+(isOn?'':' lane-off')+(maximized?' board-lane-maximized':'');
     if(isOn) lane.dataset.zone=t.plate;
+    const {toggleHtml: laneSpecialsToggle, panelHtml: laneSpecialsPanel} = specialProductsBadge('LN:'+t.plate, list);
     lane.innerHTML=`
       <div class="board-lane-head">
         <span class="board-lane-chev">&#9660;</span>
@@ -3514,13 +3594,16 @@ function renderBoard(){
         <button class="lane-drop-btn" title="Drop all of this lorry's DOs back to Unassigned" ${list.length?'':'disabled'}>&#128465;</button>
         <span class="board-lane-count">${list.length} DO${list.length===1?'':'s'}</span>
         <span class="board-lane-drops" title="Dropping points — distinct customer + drop point combinations on this lorry">${t.droppingPoints||0} drop${(t.droppingPoints||0)===1?'':'s'}</span>
+        ${laneSpecialsToggle}
         <span class="board-lane-load" style="color:${over?'var(--bad)':'var(--ink)'}">${fmtT(load)} / ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}${t.capacity!=null?' &middot; '+pctReal+'%':''}</span>
       </div>
+      ${laneSpecialsPanel}
       <div class="board-lane-naik">naik limit ${t.capacity!=null?t.capacity.toFixed(2)+'T':'—'}</div>
       <div class="board-cap-track"><div class="board-cap-fill ${fillClass}" style="width:${pct}%"></div></div>
       <div class="board-lane-body"></div>`;
+    wireSpecialsToggle(lane);
     lane.querySelector('.board-lane-head').onclick=(e)=>{
-      if(e.target.closest('.lane-toggle') || e.target.closest('.lane-max-btn') || e.target.closest('.lane-drop-btn')) return;
+      if(e.target.closest('.lane-toggle') || e.target.closest('.lane-max-btn') || e.target.closest('.lane-drop-btn') || e.target.closest('.board-specials-toggle')) return;
       collapsed?boardCollapsedLanes.delete(t.plate):boardCollapsedLanes.add(t.plate);
       renderBoard();
     };
