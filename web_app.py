@@ -454,7 +454,8 @@ def _board_json(sess) -> dict:
     # more than N days past their own DATE — cumulative thresholds (a DO
     # 10 days old counts toward over3, over5, AND over7), so each number
     # answers "how many are at least this stale" on its own.
-    _aging = {"over3": 0, "over5": 0, "over7": 0}
+    _aging = {"over3": 0, "over5": 0, "over7": 0,
+              "over3_dos": [], "over5_dos": [], "over7_dos": []}
     _today_ts = pd.Timestamp(datetime.now().date())
     for _o in orders:
         if _o["lorry"]:
@@ -463,9 +464,17 @@ def _board_json(sess) -> dict:
         if pd.isna(_dt):
             continue
         _age = (_today_ts - _dt).days
-        if _age > 7: _aging["over7"] += 1
-        if _age > 5: _aging["over5"] += 1
-        if _age > 3: _aging["over3"] += 1
+        _entry = {"do": _o["do"], "date": _o["date"],
+                  "customer": _o.get("customer", ""), "route": _o.get("route", "")}
+        if _age > 7:
+            _aging["over7"] += 1
+            _aging["over7_dos"].append(_entry)
+        if _age > 5:
+            _aging["over5"] += 1
+            _aging["over5_dos"].append(_entry)
+        if _age > 3:
+            _aging["over3"] += 1
+            _aging["over3_dos"].append(_entry)
 
     return {
         "orders": orders,
@@ -2176,10 +2185,13 @@ _PAGE = r"""<!doctype html>
   .board-specials-panel{padding:6px 11px;font-size:11px;color:#C11C84;font-weight:700;
     font-family:ui-monospace,Menlo,monospace;border-bottom:1px solid var(--line)}
   .board-lanes-tools{display:flex;gap:8px;margin-bottom:10px}
-  .board-pool-aging{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .board-pool-aging{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
   .board-pool-aging .aging-pill{font-size:11px;font-weight:700;color:var(--bad);
     background:color-mix(in srgb, var(--bad) 14%, var(--card2));border:1px solid var(--bad);
-    border-radius:20px;padding:3px 10px}
+    border-radius:20px;padding:3px 10px;align-self:flex-start;cursor:pointer;user-select:none}
+  .board-pool-aging .aging-pill:hover{background:color-mix(in srgb, var(--bad) 22%, var(--card2))}
+  .board-aging-panel{padding:6px 4px 2px 10px;font-size:11px;color:var(--muted);
+    font-family:ui-monospace,Menlo,monospace;display:flex;flex-direction:column;gap:2px}
   .mini-btn{background:var(--card2);border:1px solid var(--line);color:var(--muted);
     border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer}
   .mini-btn:hover{color:var(--ink);border-color:var(--brand)}
@@ -3219,7 +3231,7 @@ function renderResult(r){
 
 // ==================== Drag-and-drop board ====================
 let BOARD=null;
-let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set(), boardOpenSpecialGroups=new Set();
+let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set(), boardOpenSpecialGroups=new Set(), boardOpenAgingGroups=new Set();
 let boardMaximizedPlate=null;
 let boardDrag=null, boardGhost=null;
 let routeDragCandidate=null, routeDrag=null, routeGhost=null, routeDragJustHappened=false;
@@ -3572,12 +3584,31 @@ function renderBoard(){
   wrap.appendChild(moWrap);
   $('#board-pool-label').textContent=`UNASSIGNED · ${totalUn} DO${totalUn===1?'':'s'}`;
   const _aging=BOARD.aging||{};
-  const _agingParts=[
-    _aging.over7?`<span class="aging-pill">More than 7 days: ${_aging.over7} DO${_aging.over7===1?'':'s'}</span>`:'',
-    _aging.over5?`<span class="aging-pill">More than 5 days: ${_aging.over5} DO${_aging.over5===1?'':'s'}</span>`:'',
-    _aging.over3?`<span class="aging-pill">More than 3 days: ${_aging.over3} DO${_aging.over3===1?'':'s'}</span>`:'',
-  ].filter(Boolean);
+  const _agingRows=[
+    [7, 'over7', _aging.over7, _aging.over7_dos],
+    [5, 'over5', _aging.over5, _aging.over5_dos],
+    [3, 'over3', _aging.over3, _aging.over3_dos],
+  ].filter(r=>r[2]);
+  const _agingParts=_agingRows.map(([n, key, count, dos])=>{
+    const open=boardOpenAgingGroups.has(key);
+    const toggle=`<span class="aging-pill" data-agingkey="${key}">`+
+      `${open?'&#9662;':'&#9656;'} More than ${n} days: ${count} DO${count===1?'':'s'}</span>`;
+    const panel=open
+      ? `<div class="board-aging-panel">${(dos||[]).map(d=>
+          `<div>&bull; <b>${esc(d.do)}</b> &mdash; ${esc(d.date)} &middot; ${esc(d.customer)} &middot; ${esc(d.route)}</div>`
+        ).join('')}</div>`
+      : '';
+    return toggle+panel;
+  });
   $('#board-pool-aging').innerHTML=_agingParts.join('');
+  $('#board-pool-aging').querySelectorAll('.aging-pill').forEach(el=>{
+    el.addEventListener('click', e=>{
+      e.stopPropagation();
+      const key=el.dataset.agingkey;
+      boardOpenAgingGroups.has(key) ? boardOpenAgingGroups.delete(key) : boardOpenAgingGroups.add(key);
+      renderBoard();
+    });
+  });
   const totalAssigned = BOARD.orders.filter(o=>o.lorry).length;
   $('#board-assigned-stat').innerHTML = `Assigned <b>${totalAssigned}</b> / ${BOARD.orders.length} DO${BOARD.orders.length===1?'':'s'}`;
 
