@@ -1537,6 +1537,20 @@ def api_board_refetch():
     refreshed_dos = set(fresh_known["DO NUMBER"])
     old_raw_stale = old_raw[~old_raw_do.isin(refreshed_dos)]
 
+    # old_raw carries bot.py's own derived "WEIGHT(T)" column, added to
+    # sess["raw_df"] in place during the first parse — it's not part of the
+    # raw fetch schema. Reindexing fresh rows onto old_raw's FULL column set
+    # (as done below) would pull that column along blank, which then fools
+    # _handle_excel_upload's own format detection (IS_NEW_FORMAT checks
+    # "WEIGHT(T)" not in df.columns) into treating the whole re-parse as
+    # OLD format and skipping its GROSS WEIGHT -> WEIGHT(T) computation
+    # entirely -- silently zeroing every DO's weight, not just the refreshed
+    # ones. Reindexing onto the raw fetch schema (old_raw's columns minus
+    # this internal one) instead keeps every refetch correctly detected as
+    # NEW format, same as the very first fetch always was.
+    _raw_columns = [c for c in old_raw.columns if c != "WEIGHT(T)"]
+    old_raw_stale = old_raw_stale[_raw_columns]
+
     # Snapshot: DO NUMBER -> its current real lorry plate, for every item
     # that's actually assigned right now (drag-and-drop, a prior AI Assign,
     # or a manual pick) — this is exactly what must survive the refetch.
@@ -1554,8 +1568,8 @@ def api_board_refetch():
     combined = pd.concat(
         [
             old_raw_stale,
-            fresh_known.reindex(columns=old_raw.columns, fill_value=""),
-            new_rows.reindex(columns=old_raw.columns, fill_value=""),
+            fresh_known.reindex(columns=_raw_columns, fill_value=""),
+            new_rows.reindex(columns=_raw_columns, fill_value=""),
         ],
         ignore_index=True,
     )
