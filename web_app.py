@@ -1042,10 +1042,9 @@ def api_dos_fetch():
             raise ValueError
     except (TypeError, ValueError):
         return _with_cookie({"error": "ETD window must be a whole number of days (0 or more)."}, sid, 400)
-    # 0 or blank both mean "no ETD filter — fetch everything", not "only
-    # today's ETD" — a window of exactly zero days isn't a useful choice.
-    if _etd_days == 0:
-        _etd_days = None
+    # 0 means "today's ETD only" (a zero-day window around today, i.e.
+    # ETD == today); blank/omitted means no ETD filter at all — fetch
+    # everything regardless of ETD.
     # Remembered so _handle_excel_upload can widen its past-date cutoff to
     # match — a DO within the window the user explicitly asked for shouldn't
     # get excluded as "too old" just because its own DATE trails its ETD.
@@ -2308,7 +2307,7 @@ _PAGE = r"""<!doctype html>
     <div class="msg hidden" id="login-msg"></div>
     <div class="tp-etd-row hidden" id="tp-etd-row">
       <label for="etd-days-input">1&#41; ETD window: &plusmn;
-        <input type="number" id="etd-days-input" min="0" step="1" value="0" placeholder="ALL"> day(s) &mdash; 0 or blank = all
+        <input type="number" id="etd-days-input" min="0" step="1" value="" placeholder="ALL"> day(s) &mdash; 0 = today only, blank = all
       </label>
     </div>
     <div class="tp-toggle-section hidden" id="tp-toggle-section">
@@ -2648,9 +2647,11 @@ function showBoardWithError(msg){
 }
 
 function _resetEtdDays(){
-  // Always defaults to 0 (= all) on every login/restore — by explicit
-  // request it must never remember a previously-typed ETD window.
-  $('#etd-days-input').value = '0';
+  // Always defaults to blank (= all, no ETD filter) on every login/restore —
+  // by explicit request it must never remember a previously-typed ETD
+  // window. 0 is a real, deliberate choice (today's ETD only), so it must
+  // never be the silent default.
+  $('#etd-days-input').value = '';
 }
 
 // Login + today's lorries + trip day happen automatically — fast, no
@@ -2976,7 +2977,7 @@ async function fetchAndAssign(){
       showBoardWithError(
         `The system returned 0 DOs for ${selUser}` +
         (etdDays!=null?` with the ETD window set to ±${etdDays} day(s)`:'') +
-        `. Double-check the ETD window (0 or blank = all), the Today/Tomorrow ` +
+        `. Double-check the ETD window (0 = today only, blank = all), the Today/Tomorrow ` +
         `pick, and that today's DOs are actually in the system for ${selUser}'s routes.` +
         _diagMsg
       );

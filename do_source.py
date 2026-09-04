@@ -365,7 +365,8 @@ def fetch_delivery_report(config_path: str = None, etd_days: int = None) -> pd.D
     [today - etd_days, today + etd_days] inclusive — a symmetric window
     the user picks in the portal (e.g. etd_days=2 with today=26/8 keeps
     ETD 24/8 through 28/8, catching DOs whose ETD already slipped a
-    couple of days as well as ones coming up). None (default) applies no
+    couple of days as well as ones coming up). etd_days=0 collapses that
+    window to today only (ETD == today). None (default) applies no
     ETD-range filter at all — every still-pending DO from this year is
     fetched, matching this file's default behaviour before this window
     was made user-configurable."""
