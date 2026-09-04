@@ -533,12 +533,14 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
          "ai_assigned": bool}
     add_date: the "Assign for" date (a datetime.date) — ZLORRY.<date col>
         and SDELIVERY.ARVDAT_0.
-    trip: the Trip number as a string ("1".."4") — ZLORRY.TRIP.
+    trip: the Trip number as a string ("1".."4") — ZLORRY.TRIP and
+        SDELIVERY.ZTRIPNUMBER_0.
 
-    SDELIVERY.ZLICENSE_0/ARVDAT_0/ZAIASSIGN_0 are written ONLY for assigned
-    DOs (by explicit request — unassigned DOs must never be touched, even
-    to clear a stale prior plate). A DO with no plate this save is simply
-    skipped; whatever SDELIVERY already holds for it is left alone.
+    SDELIVERY.ZLICENSE_0/ARVDAT_0/ZAIASSIGN_0/ZTRIPNUMBER_0 are written
+    ONLY for assigned DOs (by explicit request — unassigned DOs must never
+    be touched, even to clear a stale prior plate). A DO with no plate this
+    save is simply skipped; whatever SDELIVERY already holds for it is left
+    alone.
 
     ZAIASSIGN_0 (confirmed via SSMS — the real column, not the earlier
     guessed "AI_Assign" name) is written 'Yes'/'No' per the caller's own
@@ -599,13 +601,15 @@ def save_board_to_erp(rows: list[dict], add_date, trip: str, config_path: str = 
                     UPDATE {SCHEMA_NAME}.SDELIVERY
                     SET ZLICENSE_0 = :plate,
                         ARVDAT_0 = :add_date,
-                        ZAIASSIGN_0 = :ai_assign
+                        ZAIASSIGN_0 = :ai_assign,
+                        ZTRIPNUMBER_0 = :trip
                     WHERE SDHNUM_0 = :do_number
                 """),
                 {
                     "plate": plate,
                     "add_date": add_date,
                     "ai_assign": "Yes" if r.get("ai_assigned") else "No",
+                    "trip": trip,
                     "do_number": do_number,
                 },
             )
