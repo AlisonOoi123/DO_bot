@@ -496,6 +496,20 @@ def report_to_xlsx_bytes(report_df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def fetch_special_product_itemrefs(config_path: str = None) -> list[str]:
+    """Item codes (ITMMASTER.ITMREF_0) belonging to category TCLCOD_0='MA' —
+    these are treated as "special products" on the lorry board (bold,
+    highlighted, rolled up per route/lane) on top of the fixed hand-picked
+    list already baked into the board UI. Raises on any DB/config failure;
+    the caller decides how to surface that (typically: fall back to the
+    fixed list only, and keep whatever was last successfully fetched)."""
+    config = _load_config(config_path)
+    engine = _build_engine(config)
+    query = f"SELECT DISTINCT ITMREF_0 FROM {SCHEMA_NAME}.ITMMASTER WHERE TCLCOD_0 = 'MA'"
+    df = pd.read_sql(query, engine)
+    return sorted({str(v).strip() for v in df['ITMREF_0'].dropna() if str(v).strip()})
+
+
 # ── Write path: save the board's assignments back to the ERP ────────────────
 # By explicit request. This is the only place in the whole app that writes
 # to production Sage X3 tables rather than just reading from them — treat

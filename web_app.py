@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import io
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -359,6 +360,29 @@ def _fleet_lists(sess) -> dict:
     }
 
 
+_SPECIAL_PRODUCT_CODE_CACHE: dict = {"codes": [], "ts": 0.0}
+_SPECIAL_PRODUCT_CODE_TTL = 1800  # 30 min — /api/board is hit on every drag/drop,
+# far too often to query ITMMASTER live each time; this reference list
+# (item category "MA") barely changes, so a half-hour-stale cache is fine.
+
+
+def _special_product_codes() -> list[str]:
+    """ITMMASTER item codes in category TCLCOD_0='MA', cached for
+    _SPECIAL_PRODUCT_CODE_TTL seconds. A DB hiccup falls back to whatever
+    was last fetched (or an empty list on the very first call) rather than
+    ever breaking board rendering."""
+    now = time.monotonic()
+    if now - _SPECIAL_PRODUCT_CODE_CACHE["ts"] < _SPECIAL_PRODUCT_CODE_TTL and _SPECIAL_PRODUCT_CODE_CACHE["ts"]:
+        return _SPECIAL_PRODUCT_CODE_CACHE["codes"]
+    try:
+        codes = do_source.fetch_special_product_itemrefs()
+        _SPECIAL_PRODUCT_CODE_CACHE["codes"] = codes
+        _SPECIAL_PRODUCT_CODE_CACHE["ts"] = now
+    except Exception:
+        pass
+    return _SPECIAL_PRODUCT_CODE_CACHE["codes"]
+
+
 def _board_json(sess) -> dict:
     """Drag-and-drop board view: every DO (assigned or not) plus every lorry
     with its current capacity, shaped for the board UI. Unassigned DOs are
@@ -479,6 +503,7 @@ def _board_json(sess) -> dict:
     return {
         "orders": orders,
         "aging": _aging,
+        "specialProductCodes": _special_product_codes(),
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
         "manual_only": sorted(manual_only.values(), key=lambda m: m["code"]),
         "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates,
@@ -3352,10 +3377,14 @@ function fmtT(w){ return w.toFixed(3)+'T'; }
 
 const BOARD_ROUTE_COLORS=['#5ab0ff','#c58bff','#ffd166','#7ee8b2','#ff9e7d',
   '#8fd3ff','#f2a6d8','#b6e37a','#ffc98a','#9fb8ff'];
-// Only these item codes (SDELIVERYD.ITMREF_0) render bold in the product
-// list — everything else stays normal weight, by explicit request.
-const BOARD_BOLD_ITMREFS = new Set(['SS007','SS005','SS006','BL002','BL004',
+// Item codes (SDELIVERYD.ITMREF_0) that render bold in the product list —
+// everything else stays normal weight, by explicit request. Fixed hand-
+// picked codes, unioned every board render (see renderBoard) with
+// BOARD.specialProductCodes — every ITMMASTER item under category 'MA',
+// fetched server-side (see do_source.fetch_special_product_itemrefs).
+const BOARD_BOLD_ITMREFS_FIXED = new Set(['SS007','SS005','SS006','BL002','BL004',
   'AG001','KM101-1','KM101-2','CK102','CK107','CK004','CD001','KP065']);
+let BOARD_BOLD_ITMREFS = new Set(BOARD_BOLD_ITMREFS_FIXED);
 
 // Parses one raw "ITMREF|description xqty" product line (see do_source.py)
 // into its parts — shared by the per-card product list and the route/lane
@@ -3493,6 +3522,7 @@ function boardCardEl(o){
 
 function renderBoard(){
   if(!BOARD) return;
+  BOARD_BOLD_ITMREFS = new Set([...BOARD_BOLD_ITMREFS_FIXED, ...(BOARD.specialProductCodes||[])]);
   const wrap=$('#board-routes'); wrap.innerHTML='';
   let totalUn=0;
   BOARD.routes.forEach(rt=>{
