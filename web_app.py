@@ -3485,6 +3485,21 @@ function boardOrdersManualOnlySection(code, isZna){
 }
 function boardOrdersOnLorry(plate){ return BOARD.orders.filter(o=>o.lorry===plate); }
 
+// Stable-sorts `groups` so entries currently expanded (their boardOpenRoutes
+// key present) come before collapsed ones — cuts the drag distance from an
+// expanded group down to a lorry lane, since it's no longer buried wherever
+// it happened to fall alphabetically. `keyFn` maps a group to its
+// boardOpenRoutes key. Ties (all-open from "Expand all", or the untouched
+// default of all-collapsed) preserve the array's original order, which the
+// server already provides ascending — so this needs no separate "expand
+// all -> ascending" branch, that falls out for free.
+function sortGroupsExpandedFirst(groups, keyFn){
+  return groups
+    .map((g, i)=>({g, i, open: boardOpenRoutes.has(keyFn(g))}))
+    .sort((a, b)=> (b.open - a.open) || (a.i - b.i))
+    .map(x=>x.g);
+}
+
 // Renders one of the two NA/ZNA drop zones into `wrap` (parent of the
 // normal route groups) — shared so the two sections stay identical apart
 // from their label/data source. Both sections share the 'MO' drop-zone
@@ -3504,7 +3519,7 @@ function renderMoSection(wrap, label, isZna){
   hdr.textContent=label;
   moWrap.appendChild(hdr);
   let moCount=0;
-  moGroups.forEach(mo=>{
+  sortGroupsExpandedFirst(moGroups, mo=>keyPrefix+mo.code).forEach(mo=>{
     const list=boardOrdersManualOnlySection(mo.code, isZna);
     if(!list.length) return;
     moCount+=list.length;
@@ -3699,7 +3714,14 @@ function renderBoard(){
   BOARD_BOLD_ITMREFS = new Set([...BOARD_BOLD_ITMREFS_FIXED, ...(BOARD.specialProductCodes||[])]);
   const wrap=$('#board-routes'); wrap.innerHTML='';
   let totalUn=0;
-  BOARD.routes.forEach(rt=>{
+  // Expanded groups bubble to the top of the Unassigned pool (and the
+  // NA/ZNA sections — see renderMoSection) so the planner doesn't have to
+  // drag a card all the way down from wherever it happened to sort
+  // alphabetically. A stable sort on "is it open" alone naturally falls
+  // back to the server's own ascending order among ties, so this also
+  // covers "Expand all" (everything ties open -> ascending) with no extra
+  // branch needed.
+  sortGroupsExpandedFirst(BOARD.routes, rt=>rt.route).forEach(rt=>{
     const list=boardOrdersInPool(rt.route);
     if(!list.length) return;
     totalUn+=list.length;
