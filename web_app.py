@@ -393,6 +393,7 @@ def _board_json(sess) -> dict:
     caps = {l["plate"]: l["capacity"] for l in _fl["lorries"]}
     staging_caps = {l["plate"]: l["capacity"] for l in _fl["staging"]}
     _off_plates = {l["plate"] for l in _fl["lorries"] if not l["on"]}
+    _sync_na_zna(sess)
     items = sess.get("items", []) or []
     engine = sess.get("engine")
 
@@ -417,7 +418,14 @@ def _board_json(sess) -> dict:
 
     orders = []
     routes: dict[str, dict] = {}
-    manual_only: dict[str, dict] = {}
+    # Split into two — NA and ZNA are shown as separate sections (see
+    # renderBoard) rather than one combined "MANUAL ASSIGN ONLY" — bucketed
+    # by each order's own live ROUTE; anything manually forced in that
+    # isn't literally NA/ZNA (dragged onto the zone by hand) defaults to
+    # the NA bucket, matching the old single-section behaviour for that
+    # edge case.
+    manual_only_na: dict[str, dict] = {}
+    manual_only_zna: dict[str, dict] = {}
     # Dropping points per lane: distinct (CODE, DROPPOINT) pairs among that
     # plate's assigned DOs — BPDLVCUST.ZDROPPOINT_0 per customer (BPCNUM_0),
     # by explicit request. Two DOs for the SAME customer at the SAME drop
@@ -460,7 +468,8 @@ def _board_json(sess) -> dict:
         })
         if assigned_plate is None and _is_manual_only:
             _mo_code = code.strip().upper()
-            mo = manual_only.setdefault(_mo_code, {
+            _mo_bucket = manual_only_zna if route.strip().upper() == "ZNA" else manual_only_na
+            mo = _mo_bucket.setdefault(_mo_code, {
                 "code": code,
                 "customer": str(it.get("CUSTOMER NAME", "")),
                 "dos": 0, "weight": 0.0,
@@ -505,7 +514,8 @@ def _board_json(sess) -> dict:
         "aging": _aging,
         "specialProductCodes": _special_product_codes(),
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
-        "manual_only": sorted(manual_only.values(), key=lambda m: m["code"]),
+        "manual_only_na": sorted(manual_only_na.values(), key=lambda m: m["code"]),
+        "manual_only_zna": sorted(manual_only_zna.values(), key=lambda m: m["code"]),
         "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates,
                      "droppingPoints": len(_drop_points.get(p, ()))}
                     for p, c in sorted(caps.items())],
@@ -931,15 +941,22 @@ def _reset_items_to_unassigned(sess: dict) -> None:
             it["LORRY"] = "NO_LORRY"
 
 
+# Route values with no real assigned route — data-driven off the ERP's
+# DRN_0 via do_source.ROUTE_MAP (see the Warehouse Route & Remarks Update
+# portal), not a hardcoded list of customers. A DO on either of these can
+# never be usefully auto-assigned, so it's always manual-assign-only and
+# always shown to BOTH planners (see _handle_excel_upload's visibility fix
+# and _sync_na_zna below) — neither one "owns" a route that doesn't exist.
+_NA_LIKE_ROUTES = {"NA", "ZNA"}
+
+
 def _base_manual_only_codes(sess: dict) -> set[str]:
-    """Customer codes whose live ROUTE resolved to "NA" — data-driven off
-    the ERP's DRN_0 via do_source.ROUTE_MAP (see the Warehouse Route &
-    Remarks Update portal), not a hardcoded list. A customer with no route
-    assigned can never be usefully auto-assigned, so it's always excluded
-    from AI Assign by default."""
+    """Customer codes whose live ROUTE resolved to NA or ZNA. A customer
+    with no route assigned can never be usefully auto-assigned, so it's
+    always excluded from AI Assign by default."""
     codes = set()
     for it in sess.get("items", []) or []:
-        if str(it.get("ROUTE", "")).strip().upper() == "NA":
+        if str(it.get("ROUTE", "")).strip().upper() in _NA_LIKE_ROUTES:
             code = str(it.get("CODE", "")).strip().upper()
             if code:
                 codes.add(code)
@@ -964,16 +981,16 @@ def _effective_manual_only_codes(sess: dict) -> set[str]:
 
 def _reassert_na_manual_only(sess: dict, do_numbers) -> None:
     """Call right before unassigning any DO (single cancel or a lane-level
-    bulk drop): if its live ROUTE is still "NA", re-flag its customer code
-    as manual-only so it lands back in MANUAL ASSIGN ONLY, not plain
+    bulk drop): if its live ROUTE is still NA or ZNA, re-flag its customer
+    code as manual-only so it lands back in the NA/ZNA section, not plain
     Unassigned — even if this code's group was released earlier in the
-    session (e.g. dragged out via its header). The route is still NA, so
-    it still needs a human to place it."""
+    session (e.g. dragged out via its header). The route is still NA/ZNA,
+    so it still needs a human to place it."""
     do_numbers = set(do_numbers)
     for it in sess.get("items", []) or []:
         if str(it.get("DO NUMBER", "")).strip() not in do_numbers:
             continue
-        if str(it.get("ROUTE", "")).strip().upper() != "NA":
+        if str(it.get("ROUTE", "")).strip().upper() not in _NA_LIKE_ROUTES:
             continue
         code = str(it.get("CODE", "")).strip().upper()
         if code:
@@ -993,6 +1010,70 @@ def _force_manual_only_unassigned(sess: dict) -> None:
         lorry = it.get("LORRY")
         if lorry and lorry not in _SENTINELS:
             it["LORRY"] = "NO_LORRY"
+
+
+def _sync_na_zna(sess: dict) -> None:
+    """NA/ZNA-route DOs have no owning planner and are shown on BOTH ABI's
+    and VIVIAN's boards (see _handle_excel_upload's visibility fix) —
+    whichever one assigns or unassigns one must be reflected on the OTHER
+    planner's board too, so the two can't both grab the same DO. Called at
+    the top of _board_json, so it runs on every single board read —
+    covering every mutating endpoint's own board-json response AND plain
+    polling GETs, without needing a bespoke sync call in each endpoint.
+
+    Reconciles this session's items against the one shared record
+    (bot._load/_save_na_zna_assignments) using a per-DO watermark
+    (sess["_na_zna_synced"]): if this session's own local plate for a DO
+    differs from what it last agreed with the shared store, that's a local
+    change (a drag happened here) and gets PUBLISHED; otherwise, if the
+    shared store has moved on, that's the OTHER planner's change and gets
+    ADOPTED. Without the watermark, adopting indiscriminately would keep
+    silently undoing a planner's own just-made unassign the next time this
+    runs — the exact race the watermark exists to break.
+
+    Adopting a real plate also releases that code's manual-only override
+    (same as a manual drag-onto-lorry already does — see move-code and
+    api_board_move) so _force_manual_only_unassigned doesn't immediately
+    strip the just-adopted plate back off on this session's next re-parse;
+    adopting "now unassigned" re-flags the override so the freed DO lands
+    back in the NA/ZNA section here too, not plain Unassigned."""
+    watermark = sess.setdefault("_na_zna_synced", {})
+    shared = bot._load_na_zna_assignments()
+    changed_shared = False
+    for it in sess.get("items", []) or []:
+        if str(it.get("ROUTE", "")).strip().upper() not in _NA_LIKE_ROUTES:
+            continue
+        do_num = str(it.get("DO NUMBER", "")).strip()
+        if not do_num:
+            continue
+        lorry = it.get("LORRY")
+        local_plate = lorry if (lorry and lorry not in _SENTINELS) else None
+        last_known = watermark.get(do_num)
+
+        if local_plate != last_known:
+            # Changed here (by this session) since the last sync — publish.
+            if local_plate:
+                shared[do_num] = local_plate
+            else:
+                shared.pop(do_num, None)
+            changed_shared = True
+            watermark[do_num] = local_plate
+        else:
+            shared_plate = shared.get(do_num)
+            if shared_plate != local_plate:
+                # The OTHER planner changed it since our last sync — adopt.
+                it["LORRY"] = shared_plate if shared_plate else "NO_LORRY"
+                watermark[do_num] = shared_plate
+                code = str(it.get("CODE", "")).strip().upper()
+                if code:
+                    overrides = sess.setdefault("_manual_only_override", {})
+                    # Assigned -> release the code (False) so the adopted
+                    # plate isn't immediately force-unassigned again;
+                    # unassigned -> re-flag it (True) so it lands back in
+                    # the NA/ZNA section, not plain Unassigned.
+                    overrides[code] = not bool(shared_plate)
+    if changed_shared:
+        bot._save_na_zna_assignments(shared)
 
 
 def _run_dos_upload(sid: str, sess: dict, fb: bytes, assign_now: bool = False) -> dict:
@@ -1321,6 +1402,18 @@ def api_board_move():
     outcome = bot.board_move(sess, do, plate)
     if not outcome.get("ok"):
         return _with_cookie(outcome, sid, 400)
+    if plate:
+        # Dragging a single manual-only-flagged DO straight onto a lorry
+        # (not via the group header — see move-code) must ALSO release its
+        # code's override, the same as move-code already does — otherwise
+        # the very next _force_manual_only_unassigned pass (next refetch or
+        # AI Assign) would silently strip this plate right back off.
+        for it in sess.get("items", []) or []:
+            if str(it.get("DO NUMBER", "")).strip() == do:
+                code = str(it.get("CODE", "")).strip().upper()
+                if code:
+                    sess.setdefault("_manual_only_override", {})[code] = False
+                break
     outcome["board"] = _board_json(sess)
     return _with_cookie(outcome, sid)
 
@@ -3382,8 +3475,77 @@ async function loadBoard(){
 }
 
 function boardOrdersInPool(route){ return BOARD.orders.filter(o=>o.route===route && !o.lorry && !o.manualOnly); }
-function boardOrdersManualOnly(code){ return BOARD.orders.filter(o=>o.code===code && !o.lorry && o.manualOnly); }
+// Matches _board_json's own NA/ZNA bucketing rule (route === 'ZNA' -> ZNA
+// section, else NA) so a card always renders in the same section its own
+// live route belongs to, even for the rare customer code whose DOs are a
+// mix of NA and ZNA routes.
+function boardOrdersManualOnlySection(code, isZna){
+  return BOARD.orders.filter(o=>o.code===code && !o.lorry && o.manualOnly &&
+    (String(o.route||'').trim().toUpperCase()==='ZNA')===isZna);
+}
 function boardOrdersOnLorry(plate){ return BOARD.orders.filter(o=>o.lorry===plate); }
+
+// Renders one of the two NA/ZNA drop zones into `wrap` (parent of the
+// normal route groups) — shared so the two sections stay identical apart
+// from their label/data source. Both sections share the 'MO' drop-zone
+// value (dropping a DO onto either still just flags its customer code
+// manual-only — see the 'MO' branch in the drag-drop handler) but use
+// distinct boardOpenRoutes key prefixes so their per-customer collapse
+// state (collapsed by default, like before) is tracked independently.
+// Returns how many DOs it rendered, for the pool's total count.
+function renderMoSection(wrap, label, isZna){
+  const moGroups=(isZna ? BOARD.manual_only_zna : BOARD.manual_only_na)||[];
+  const keyPrefix=isZna ? 'MOZ:' : 'MON:';
+  const moWrap=document.createElement('div');
+  moWrap.dataset.zone='MO';
+  moWrap.className='board-mo-zone';
+  const hdr=document.createElement('div');
+  hdr.className='board-pool-section-hdr';
+  hdr.textContent=label;
+  moWrap.appendChild(hdr);
+  let moCount=0;
+  moGroups.forEach(mo=>{
+    const list=boardOrdersManualOnlySection(mo.code, isZna);
+    if(!list.length) return;
+    moCount+=list.length;
+    const key=keyPrefix+mo.code;
+    const div=document.createElement('div');
+    div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
+    const {toggleHtml: moToggleHtml, panelHtml: moPanelHtml} = specialProductsBadge('MOS:'+key, list);
+    div.innerHTML=`
+      <div class="board-route-head">
+        <span class="board-route-chev">&#9654;</span>
+        <span class="board-route-dot" style="background:#f59e0b"></span>
+        <span class="board-route-code">${esc(mo.code)} - ${esc(mo.customer)}</span>
+        <span class="board-route-meta">${list.length} DO &middot; ${fmtT(mo.weight)}</span>
+        ${moToggleHtml}
+      </div>
+      ${moPanelHtml}
+      <div class="board-route-body"></div>`;
+    wireSpecialsToggle(div);
+    const _moHead=div.querySelector('.board-route-head');
+    _moHead.onclick=()=>{
+      if(routeDragJustHappened){ routeDragJustHappened=false; return; }
+      boardOpenRoutes.has(key)?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
+      renderBoard();
+    };
+    _moHead.addEventListener('pointerdown', e=>{
+      if(e.target.closest('.board-route-chev')) return;
+      routeDragCandidate={kind:'mo', key:mo.code, startX:e.clientX, startY:e.clientY, count:list.length, weight:mo.weight};
+    });
+    const body=div.querySelector('.board-route-body');
+    list.forEach(o=>body.appendChild(boardCardEl(o)));
+    moWrap.appendChild(div);
+  });
+  if(!moCount){
+    const empty=document.createElement('div');
+    empty.className='board-empty';
+    empty.textContent='Drag a DO here to exclude it from AI Assign';
+    moWrap.appendChild(empty);
+  }
+  wrap.appendChild(moWrap);
+  return moCount;
+}
 function boardSumKg(list){ return list.reduce((s,o)=>s+o.weight,0); }
 function fmtT(w){ return w.toFixed(3)+'T'; }
 
@@ -3569,62 +3731,16 @@ function renderBoard(){
     list.forEach(o=>body.appendChild(boardCardEl(o)));
     wrap.appendChild(div);
   });
-  // Manual-assign-only customers (live ROUTE == "NA", plus any this
-  // session has dragged in/out) — AI Assign never touches these; shown as
-  // their own drop zone below the normal route groups so the planner
-  // remembers to place them by hand. Drag a single DO onto this zone to
-  // flag its whole customer code; drag a group's header back onto the
-  // Unassigned pool to release it for AI Assign again.
-  const moGroups=BOARD.manual_only||[];
-  const moWrap=document.createElement('div');
-  moWrap.dataset.zone='MO';
-  moWrap.className='board-mo-zone';
-  const hdr=document.createElement('div');
-  hdr.className='board-pool-section-hdr';
-  hdr.textContent='MANUAL ASSIGN ONLY';
-  moWrap.appendChild(hdr);
-  let moCount=0;
-  moGroups.forEach(mo=>{
-    const list=boardOrdersManualOnly(mo.code);
-    if(!list.length) return;
-    moCount+=list.length;
-    totalUn+=list.length;
-    const key='MO:'+mo.code;
-    const div=document.createElement('div');
-    div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
-    const {toggleHtml: moToggleHtml, panelHtml: moPanelHtml} = specialProductsBadge('MOS:'+mo.code, list);
-    div.innerHTML=`
-      <div class="board-route-head">
-        <span class="board-route-chev">&#9654;</span>
-        <span class="board-route-dot" style="background:#f59e0b"></span>
-        <span class="board-route-code">${esc(mo.code)} - ${esc(mo.customer)}</span>
-        <span class="board-route-meta">${list.length} DO &middot; ${fmtT(mo.weight)}</span>
-        ${moToggleHtml}
-      </div>
-      ${moPanelHtml}
-      <div class="board-route-body"></div>`;
-    wireSpecialsToggle(div);
-    const _moHead=div.querySelector('.board-route-head');
-    _moHead.onclick=()=>{
-      if(routeDragJustHappened){ routeDragJustHappened=false; return; }
-      boardOpenRoutes.has(key)?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
-      renderBoard();
-    };
-    _moHead.addEventListener('pointerdown', e=>{
-      if(e.target.closest('.board-route-chev')) return;
-      routeDragCandidate={kind:'mo', key:mo.code, startX:e.clientX, startY:e.clientY, count:list.length, weight:mo.weight};
-    });
-    const body=div.querySelector('.board-route-body');
-    list.forEach(o=>body.appendChild(boardCardEl(o)));
-    moWrap.appendChild(div);
-  });
-  if(!moCount){
-    const empty=document.createElement('div');
-    empty.className='board-empty';
-    empty.textContent='Drag a DO here to exclude it from AI Assign';
-    moWrap.appendChild(empty);
-  }
-  wrap.appendChild(moWrap);
+  // NA / ZNA — customers whose live ROUTE has no real route assigned (plus
+  // any code this session has manually dragged in/out). Shown to BOTH
+  // planners and kept in sync between them (see _sync_na_zna) since
+  // neither one owns a route that doesn't exist. AI Assign never touches
+  // these; each is its own drop zone below the normal route groups so the
+  // planner remembers to place them by hand. Drag a single DO onto either
+  // zone to flag its whole customer code; drag a group's header back onto
+  // the Unassigned pool to release it for AI Assign again.
+  totalUn += renderMoSection(wrap, 'NA', false);
+  totalUn += renderMoSection(wrap, 'ZNA', true);
   $('#board-pool-label').textContent=`UNASSIGNED · ${totalUn} DO${totalUn===1?'':'s'}`;
   const _aging=BOARD.aging||{};
   const _agingRows=[
@@ -3735,7 +3851,8 @@ $('#board-pool-collapse-all').onclick=()=>{ boardOpenRoutes.clear(); renderBoard
 $('#board-pool-expand-all').onclick=()=>{
   if(BOARD){
     BOARD.routes.forEach(rt=>boardOpenRoutes.add(rt.route));
-    (BOARD.manual_only||[]).forEach(mo=>boardOpenRoutes.add('MO:'+mo.code));
+    (BOARD.manual_only_na||[]).forEach(mo=>boardOpenRoutes.add('MON:'+mo.code));
+    (BOARD.manual_only_zna||[]).forEach(mo=>boardOpenRoutes.add('MOZ:'+mo.code));
   }
   renderBoard();
 };

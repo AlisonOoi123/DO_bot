@@ -1105,7 +1105,6 @@ def _resolve_history_path() -> str:
             return p
     return HISTORY_PATH_OLD  # fallback even if missing — engine will warn
 DAILY_LOG_PATH = os.path.join(_DATA_DIR, "daily_assignments.json")
-CUSTOMER_ROUTE_OWNER_PATH = os.path.join(_DATA_DIR, "customer_route_owner.json")
 
 # _POSTCODE_STATE_RANGES imported from assignment_config
 
@@ -1188,27 +1187,30 @@ def get_assigned_today() -> set:
     return {p for p in _load_daily_log()["assigned"] if p and p.strip()}
 
 
-def _load_customer_route_owner() -> dict:
-    """{ CODE: "ABI"|"VIVIAN" } — the most recent planner whose fetch/upload
-    saw a REAL (non-NA) route for this customer code. An NA route (no route
-    assigned in the Warehouse Route & Remarks Update portal) has no route
-    prefix to check against the ABI/VIVIAN ROUTE sheets, so this is the
-    fallback for keeping an NA customer visible to whichever planner
-    actually owns it instead of it silently flipping to "everyone" or
-    "nobody". Persists indefinitely (not reset daily) — ownership doesn't
-    expire just because a day passed."""
-    if os.path.exists(CUSTOMER_ROUTE_OWNER_PATH):
+NA_ZNA_ASSIGNMENTS_PATH = os.path.join(_DATA_DIR, "na_zna_assignments.json")
+
+
+def _load_na_zna_assignments() -> dict:
+    """{ DO_NUMBER: plate } — NA/ZNA-route DOs have no owning planner and
+    are shown on BOTH ABI's and VIVIAN's boards (see _handle_excel_upload);
+    this is the one shared record of which plate either of them has picked
+    for a given one, so web_app.py's _sync_na_zna can keep both boards
+    agreeing on it. Reset daily alongside every other session (see
+    _midnight_reset_loop) — an NA/ZNA assignment has no meaning across a
+    day boundary."""
+    if os.path.exists(NA_ZNA_ASSIGNMENTS_PATH):
         try:
-            with open(CUSTOMER_ROUTE_OWNER_PATH, "r") as f:
+            with open(NA_ZNA_ASSIGNMENTS_PATH, "r") as f:
                 return json.load(f)
         except Exception:
             pass
     return {}
 
 
-def _save_customer_route_owner(mapping: dict):
-    with open(CUSTOMER_ROUTE_OWNER_PATH, "w") as f:
+def _save_na_zna_assignments(mapping: dict):
+    with open(NA_ZNA_ASSIGNMENTS_PATH, "w") as f:
         json.dump(mapping, f, indent=2)
+
 
 def record_assignments_today(plates: list[str], user: str | None = None):
     """Add newly confirmed plates to today's log, recording WHO assigned each
@@ -1728,6 +1730,10 @@ def _midnight_reset_loop():
         sessions.clear()
         _dirty_sessions.clear()
         _clear_persisted_sessions()
+        try:
+            _save_na_zna_assignments({})
+        except Exception:
+            pass
 
 # Start the background thread once when bot.py is imported
 _reset_thread = threading.Thread(target=_midnight_reset_loop, daemon=True)
@@ -4278,15 +4284,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 }
             except Exception:
                 _prefill_cap_map = {}
-        # Last-known-owner fallback for NA-route customers (see
-        # _load_customer_route_owner) — a route of "NA" has no prefix to
-        # check against the ABI/VIVIAN ROUTE sheets, so ownership falls
-        # back to whichever planner's fetch most recently saw a REAL route
-        # for that customer code. Updates collected during the loop below
-        # and persisted once at the end (not per-row — this runs on every
-        # re-parse, so writing per-row would mean a lot of needless disk I/O).
-        _customer_route_owner = _load_customer_route_owner()
-        _route_owner_updates: dict[str, str] = {}
         for idx, row in raw.iterrows():
             route_str = str(row["ROUTE"]).strip()
             pfx = _extract_route_prefix(route_str)
@@ -4297,18 +4294,12 @@ def _handle_excel_upload(phone, sess, file_bytes):
             if pfx and not _route_belongs_to_user(pfx, _upload_user, _abi_route_prefixes):
                 _is_mine = False
                 _other_user_count += 1
-            elif pfx and _row_code:
-                # A real, determinable route — remember this planner as the
-                # code's current owner in case the route later flips to NA.
-                _route_owner_updates[_row_code] = _upload_user.strip().upper()
-            elif not pfx and route_str.strip().upper() == "NA" and _row_code:
-                _last_owner = _customer_route_owner.get(_row_code)
-                if _last_owner and _last_owner != _upload_user.strip().upper():
-                    _is_mine = False
-                    _other_user_count += 1
-                # No record on file at all (brand-new customer that's never
-                # had a real route) → stays visible to both rather than
-                # silently hiding a planner's genuinely new work.
+            # NA/ZNA routes have no owning planner at all — by explicit
+            # request they must always be visible to BOTH ABI and VIVIAN
+            # so either one can place them by hand (web_app.py's
+            # _sync_na_zna keeps whichever plate either planner picks in
+            # sync between the two boards). Never falls back to the old
+            # last-owner OTHER_USER check for these two route values.
 
             # Schedule check: route must be on today's SCHD sheet. An NA
             # route (empty pfx) has no weekday schedule to check at all —
@@ -4525,13 +4516,6 @@ def _handle_excel_upload(phone, sess, file_bytes):
                 _sched_notice.append(
                     f"⏭ *{_not_today_count} DO(s)* not on {_day_names[_tgt_wd]}'s route list — left unassigned."
                 )
-
-        if _route_owner_updates:
-            _customer_route_owner.update(_route_owner_updates)
-            try:
-                _save_customer_route_owner(_customer_route_owner)
-            except Exception:
-                pass
 
         sess["items"]      = items          # row-level item list
         sess["raw_df"]     = raw
