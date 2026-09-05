@@ -999,17 +999,35 @@ def _reassert_na_manual_only(sess: dict, do_numbers) -> None:
 
 def _force_manual_only_unassigned(sess: dict) -> None:
     """DOs for the effective manual-only customer codes must never carry a
-    real plate — even a fresh AI Assign run has to leave them for the
-    planner to place by hand. Same "undo at the web layer" approach as
-    _reset_items_to_unassigned, applied unconditionally (not just when
-    deferring AI assignment)."""
+    plate that the ENGINE put there (a fresh AI Assign run, or a pre-filled
+    source file) — the web layer's own "undo at the web layer" pass, since
+    bot.py's engine has no notion of _manual_only_override at all and will
+    happily place these if given the chance.
+
+    Does NOT strip a plate this specific DO was deliberately put on by a
+    human — tracked per-DO in sess["_manual_placement"] (set by
+    api_board_move, api_board_move_code, and _sync_na_zna's adopt branch),
+    independent of the code-level override. Without this per-DO check, a
+    single manually-placed DO for a manual-only code would get wiped again
+    on the very next re-parse; and releasing the whole CODE's override to
+    protect it (an earlier, wrong attempt at this fix) kicked that code's
+    still-unassigned siblings out of the NA/ZNA section entirely, since
+    override state also drives which section an unassigned DO displays
+    in. Per-DO tracking avoids both problems: the placed DO survives,
+    unplaced siblings stay correctly grouped, and the engine's own
+    attempts (never present in _manual_placement) still get undone."""
     codes = _effective_manual_only_codes(sess)
+    manual_placements = sess.get("_manual_placement") or {}
     for it in sess.get("items", []) or []:
         if str(it.get("CODE", "")).strip().upper() not in codes:
             continue
         lorry = it.get("LORRY")
-        if lorry and lorry not in _SENTINELS:
-            it["LORRY"] = "NO_LORRY"
+        if not lorry or lorry in _SENTINELS:
+            continue
+        do_num = str(it.get("DO NUMBER", "")).strip()
+        if manual_placements.get(do_num) == lorry:
+            continue
+        it["LORRY"] = "NO_LORRY"
 
 
 def _sync_na_zna(sess: dict) -> None:
@@ -1031,12 +1049,13 @@ def _sync_na_zna(sess: dict) -> None:
     silently undoing a planner's own just-made unassign the next time this
     runs — the exact race the watermark exists to break.
 
-    Adopting a real plate also releases that code's manual-only override
-    (same as a manual drag-onto-lorry already does — see move-code and
-    api_board_move) so _force_manual_only_unassigned doesn't immediately
-    strip the just-adopted plate back off on this session's next re-parse;
-    adopting "now unassigned" re-flags the override so the freed DO lands
-    back in the NA/ZNA section here too, not plain Unassigned."""
+    Adopting a real plate also records it in sess["_manual_placement"] (the
+    same per-DO "a human put it here" ledger api_board_move/move-code use)
+    so _force_manual_only_unassigned's undo pass leaves this specific DO
+    alone on the next re-parse — WITHOUT touching the code's manual-only
+    override, which would also affect this code's still-*unassigned*
+    siblings (an earlier, wrong version of this fix released the whole
+    code and kicked those siblings out of the NA/ZNA section entirely)."""
     watermark = sess.setdefault("_na_zna_synced", {})
     shared = bot._load_na_zna_assignments()
     changed_shared = False
@@ -1064,14 +1083,8 @@ def _sync_na_zna(sess: dict) -> None:
                 # The OTHER planner changed it since our last sync — adopt.
                 it["LORRY"] = shared_plate if shared_plate else "NO_LORRY"
                 watermark[do_num] = shared_plate
-                code = str(it.get("CODE", "")).strip().upper()
-                if code:
-                    overrides = sess.setdefault("_manual_only_override", {})
-                    # Assigned -> release the code (False) so the adopted
-                    # plate isn't immediately force-unassigned again;
-                    # unassigned -> re-flag it (True) so it lands back in
-                    # the NA/ZNA section, not plain Unassigned.
-                    overrides[code] = not bool(shared_plate)
+                if shared_plate:
+                    sess.setdefault("_manual_placement", {})[do_num] = shared_plate
     if changed_shared:
         bot._save_na_zna_assignments(shared)
 
@@ -1403,17 +1416,12 @@ def api_board_move():
     if not outcome.get("ok"):
         return _with_cookie(outcome, sid, 400)
     if plate:
-        # Dragging a single manual-only-flagged DO straight onto a lorry
-        # (not via the group header — see move-code) must ALSO release its
-        # code's override, the same as move-code already does — otherwise
-        # the very next _force_manual_only_unassigned pass (next refetch or
-        # AI Assign) would silently strip this plate right back off.
-        for it in sess.get("items", []) or []:
-            if str(it.get("DO NUMBER", "")).strip() == do:
-                code = str(it.get("CODE", "")).strip().upper()
-                if code:
-                    sess.setdefault("_manual_only_override", {})[code] = False
-                break
+        # Record that a HUMAN put this specific DO on this plate, so
+        # _force_manual_only_unassigned's undo pass (next refetch or AI
+        # Assign) leaves it alone even while its customer code is still
+        # flagged manual-only — without releasing the whole code (which
+        # would also affect this code's still-unassigned siblings).
+        sess.setdefault("_manual_placement", {})[do] = outcome.get("lorry")
     outcome["board"] = _board_json(sess)
     return _with_cookie(outcome, sid)
 
@@ -1489,7 +1497,10 @@ def api_board_move_code():
         if str(it.get("CODE", "")).strip().upper() != code:
             continue
         it["LORRY"] = plate if plate else "NO_LORRY"
-        sess.setdefault("assigned", {})[str(it.get("DO NUMBER", ""))] = it["LORRY"]
+        do_num = str(it.get("DO NUMBER", ""))
+        sess.setdefault("assigned", {})[do_num] = it["LORRY"]
+        if plate:
+            sess.setdefault("_manual_placement", {})[do_num] = plate
         moved += 1
     sess.pop("export_bytes", None)
     return _with_cookie({"ok": True, "moved": moved, "board": _board_json(sess)}, sid)
@@ -2294,6 +2305,9 @@ _PAGE = r"""<!doctype html>
   .board-pool-section-hdr{font-size:11px;letter-spacing:.08em;color:#f59e0b;
     font-weight:700;text-transform:uppercase;margin:14px 2px 10px;
     border-top:1px dashed var(--line);padding-top:12px}
+  .board-mo-section-hdr{cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px}
+  .board-mo-section-hdr .board-route-chev{font-size:9px}
+  .board-mo-section-count{letter-spacing:0;text-transform:none;font-weight:400;color:var(--muted)}
   .board-route{border:1px solid var(--line);border-radius:10px;margin-bottom:8px;
     overflow:hidden;background:var(--card2)}
   .board-route-head{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer}
@@ -3362,7 +3376,7 @@ function renderResult(r){
 
 // ==================== Drag-and-drop board ====================
 let BOARD=null;
-let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set(), boardOpenSpecialGroups=new Set(), boardOpenAgingGroups=new Set();
+let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set(), boardOpenSpecialGroups=new Set(), boardOpenAgingGroups=new Set(), boardOpenMoSections=new Set();
 let boardMaximizedPlate=null;
 let boardDrag=null, boardGhost=null;
 let routeDragCandidate=null, routeDrag=null, routeGhost=null, routeDragJustHappened=false;
@@ -3507,56 +3521,70 @@ function sortGroupsExpandedFirst(groups, keyFn){
 // manual-only — see the 'MO' branch in the drag-drop handler) but use
 // distinct boardOpenRoutes key prefixes so their per-customer collapse
 // state (collapsed by default, like before) is tracked independently.
-// Returns how many DOs it rendered, for the pool's total count.
+// The section itself is ALSO collapsed by default (boardOpenMoSections)
+// — showing just its title/count — separate from the per-customer state,
+// so opening one customer group doesn't require the whole section to stay
+// permanently expanded. Returns how many DOs it holds, for the pool's
+// total count (computed regardless of whether the section is expanded).
 function renderMoSection(wrap, label, isZna){
   const moGroups=(isZna ? BOARD.manual_only_zna : BOARD.manual_only_na)||[];
   const keyPrefix=isZna ? 'MOZ:' : 'MON:';
+  const moCount=moGroups.reduce((s,mo)=>s+boardOrdersManualOnlySection(mo.code, isZna).length, 0);
+  const sectionOpen=boardOpenMoSections.has(label);
+
   const moWrap=document.createElement('div');
   moWrap.dataset.zone='MO';
   moWrap.className='board-mo-zone';
   const hdr=document.createElement('div');
-  hdr.className='board-pool-section-hdr';
-  hdr.textContent=label;
+  hdr.className='board-pool-section-hdr board-mo-section-hdr';
+  hdr.innerHTML=`<span class="board-route-chev">${sectionOpen?'&#9660;':'&#9654;'}</span> ${esc(label)}`+
+    (moCount ? ` <span class="board-mo-section-count">&middot; ${moCount} DO${moCount===1?'':'s'}</span>` : '');
+  hdr.onclick=()=>{
+    boardOpenMoSections.has(label)?boardOpenMoSections.delete(label):boardOpenMoSections.add(label);
+    renderBoard();
+  };
   moWrap.appendChild(hdr);
-  let moCount=0;
-  sortGroupsExpandedFirst(moGroups, mo=>keyPrefix+mo.code).forEach(mo=>{
-    const list=boardOrdersManualOnlySection(mo.code, isZna);
-    if(!list.length) return;
-    moCount+=list.length;
-    const key=keyPrefix+mo.code;
-    const div=document.createElement('div');
-    div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
-    const {toggleHtml: moToggleHtml, panelHtml: moPanelHtml} = specialProductsBadge('MOS:'+key, list);
-    div.innerHTML=`
-      <div class="board-route-head">
-        <span class="board-route-chev">&#9654;</span>
-        <span class="board-route-dot" style="background:#f59e0b"></span>
-        <span class="board-route-code">${esc(mo.code)} - ${esc(mo.customer)}</span>
-        <span class="board-route-meta">${list.length} DO &middot; ${fmtT(mo.weight)}</span>
-        ${moToggleHtml}
-      </div>
-      ${moPanelHtml}
-      <div class="board-route-body"></div>`;
-    wireSpecialsToggle(div);
-    const _moHead=div.querySelector('.board-route-head');
-    _moHead.onclick=()=>{
-      if(routeDragJustHappened){ routeDragJustHappened=false; return; }
-      boardOpenRoutes.has(key)?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
-      renderBoard();
-    };
-    _moHead.addEventListener('pointerdown', e=>{
-      if(e.target.closest('.board-route-chev')) return;
-      routeDragCandidate={kind:'mo', key:mo.code, startX:e.clientX, startY:e.clientY, count:list.length, weight:mo.weight};
+
+  if(sectionOpen){
+    sortGroupsExpandedFirst(moGroups, mo=>keyPrefix+mo.code).forEach(mo=>{
+      const list=boardOrdersManualOnlySection(mo.code, isZna);
+      if(!list.length) return;
+      const key=keyPrefix+mo.code;
+      const div=document.createElement('div');
+      div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
+      const {toggleHtml: moToggleHtml, panelHtml: moPanelHtml} = specialProductsBadge('MOS:'+key, list);
+      div.innerHTML=`
+        <div class="board-route-head">
+          <span class="board-route-chev">&#9654;</span>
+          <span class="board-route-dot" style="background:#f59e0b"></span>
+          <span class="board-route-code">${esc(mo.code)} - ${esc(mo.customer)}</span>
+          <span class="board-route-meta">${list.length} DO &middot; ${fmtT(mo.weight)}</span>
+          ${moToggleHtml}
+        </div>
+        ${moPanelHtml}
+        <div class="board-route-body"></div>`;
+      wireSpecialsToggle(div);
+      const _moHead=div.querySelector('.board-route-head');
+      _moHead.onclick=(e)=>{
+        e.stopPropagation();
+        if(routeDragJustHappened){ routeDragJustHappened=false; return; }
+        boardOpenRoutes.has(key)?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
+        renderBoard();
+      };
+      _moHead.addEventListener('pointerdown', e=>{
+        if(e.target.closest('.board-route-chev')) return;
+        routeDragCandidate={kind:'mo', key:mo.code, startX:e.clientX, startY:e.clientY, count:list.length, weight:mo.weight};
+      });
+      const body=div.querySelector('.board-route-body');
+      list.forEach(o=>body.appendChild(boardCardEl(o)));
+      moWrap.appendChild(div);
     });
-    const body=div.querySelector('.board-route-body');
-    list.forEach(o=>body.appendChild(boardCardEl(o)));
-    moWrap.appendChild(div);
-  });
-  if(!moCount){
-    const empty=document.createElement('div');
-    empty.className='board-empty';
-    empty.textContent='Drag a DO here to exclude it from AI Assign';
-    moWrap.appendChild(empty);
+    if(!moCount){
+      const empty=document.createElement('div');
+      empty.className='board-empty';
+      empty.textContent='Drag a DO here to exclude it from AI Assign';
+      moWrap.appendChild(empty);
+    }
   }
   wrap.appendChild(moWrap);
   return moCount;
@@ -3869,12 +3897,13 @@ $('#board-drop-all').onclick=async()=>{
   if(d.board){ BOARD=d.board; }
   renderBoard();
 };
-$('#board-pool-collapse-all').onclick=()=>{ boardOpenRoutes.clear(); renderBoard(); };
+$('#board-pool-collapse-all').onclick=()=>{ boardOpenRoutes.clear(); boardOpenMoSections.clear(); renderBoard(); };
 $('#board-pool-expand-all').onclick=()=>{
   if(BOARD){
     BOARD.routes.forEach(rt=>boardOpenRoutes.add(rt.route));
     (BOARD.manual_only_na||[]).forEach(mo=>boardOpenRoutes.add('MON:'+mo.code));
     (BOARD.manual_only_zna||[]).forEach(mo=>boardOpenRoutes.add('MOZ:'+mo.code));
+    boardOpenMoSections.add('NA').add('ZNA');
   }
   renderBoard();
 };
