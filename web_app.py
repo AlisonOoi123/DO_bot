@@ -1073,10 +1073,24 @@ def _sync_na_zna(sess: dict) -> None:
     gone from the NA/ZNA section, not a play-by-play of who has it or on
     which lorry. Discarded again the moment it's adopted back to
     unassigned, so it displays normally (back in the NA/ZNA section) once
-    it's actually free."""
+    it's actually free.
+
+    Each shared-store entry also records WHICH planner made it
+    ({"plate": ..., "user": "ABI"|"VIVIAN"}), not just the plate — so a
+    fresh session for the SAME planner (logout/login, or the midnight
+    reset) can tell "my own leftover claim from before I reset" apart
+    from "the other planner's live assignment". Without that distinction,
+    a DO this exact planner had assigned but never saved to SQL would
+    reappear as belonging to a stranger and get silently hidden by the
+    adopt path below the moment they logged back in — even though nothing
+    the OTHER planner did ever changed. A fresh session's own stale
+    record is simply cleared instead of adopted, so the DO shows up
+    unassigned again like any other un-saved local edit lost on logout —
+    never invisible."""
     watermark = sess.setdefault("_na_zna_synced", {})
     shared = bot._load_na_zna_assignments()
     changed_shared = False
+    my_user = str(sess.get("user_id") or "").strip().upper()
     for it in sess.get("items", []) or []:
         if str(it.get("ROUTE", "")).strip().upper() not in _NA_LIKE_ROUTES:
             continue
@@ -1090,14 +1104,30 @@ def _sync_na_zna(sess: dict) -> None:
         if local_plate != last_known:
             # Changed here (by this session) since the last sync — publish.
             if local_plate:
-                shared[do_num] = local_plate
+                shared[do_num] = {"plate": local_plate, "user": my_user}
             else:
                 shared.pop(do_num, None)
             changed_shared = True
             watermark[do_num] = local_plate
         else:
-            shared_plate = shared.get(do_num)
+            record = shared.get(do_num)
+            # Back-compat: earlier versions stored a bare plate string with
+            # no user attribution — treat as "unknown owner", which falls
+            # through to the normal adopt path exactly as before.
+            if isinstance(record, str):
+                record = {"plate": record, "user": None}
+            shared_plate = record.get("plate") if record else None
+            shared_user = record.get("user") if record else None
             if shared_plate != local_plate:
+                if shared_plate and shared_user == my_user and local_plate is None:
+                    # My OWN prior claim, from a session that no longer
+                    # exists (I logged out/in, or the daily reset ran) --
+                    # not a live assignment by the other planner. Clear the
+                    # stale record rather than adopting/hiding it.
+                    shared.pop(do_num, None)
+                    changed_shared = True
+                    watermark[do_num] = None
+                    continue
                 # The OTHER planner changed it since our last sync — adopt.
                 it["LORRY"] = shared_plate if shared_plate else "NO_LORRY"
                 watermark[do_num] = shared_plate

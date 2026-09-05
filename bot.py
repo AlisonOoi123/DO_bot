@@ -1191,13 +1191,17 @@ NA_ZNA_ASSIGNMENTS_PATH = os.path.join(_DATA_DIR, "na_zna_assignments.json")
 
 
 def _load_na_zna_assignments() -> dict:
-    """{ DO_NUMBER: plate } — NA/ZNA-route DOs have no owning planner and
-    are shown on BOTH ABI's and VIVIAN's boards (see _handle_excel_upload);
-    this is the one shared record of which plate either of them has picked
-    for a given one, so web_app.py's _sync_na_zna can keep both boards
-    agreeing on it. Reset daily alongside every other session (see
+    """{ DO_NUMBER: {"plate": str, "user": "ABI"|"VIVIAN"} } — NA/ZNA-route
+    DOs have no owning planner and are shown on BOTH ABI's and VIVIAN's
+    boards (see _handle_excel_upload); this is the one shared record of
+    which plate either of them has picked for a given one (and who picked
+    it — see web_app.py's _sync_na_zna, which uses the user attribution to
+    tell a planner's own stale leftover from a reset session apart from
+    the OTHER planner's live assignment), so web_app.py can keep both
+    boards agreeing on it. Reset daily alongside every other session (see
     _midnight_reset_loop) — an NA/ZNA assignment has no meaning across a
-    day boundary."""
+    day boundary. Older entries may still be a bare plate string (before
+    user attribution existed) — callers treat that as "unknown owner"."""
     if os.path.exists(NA_ZNA_ASSIGNMENTS_PATH):
         try:
             with open(NA_ZNA_ASSIGNMENTS_PATH, "r") as f:
