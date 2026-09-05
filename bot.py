@@ -14,6 +14,7 @@ State flow:
 import io
 import json
 import os
+import pickle
 import re
 import threading
 import time
@@ -1725,6 +1726,8 @@ def _midnight_reset_loop():
         clear_daily_log()
         # Also clear all in-memory sessions so lorries are fresh for the new day
         sessions.clear()
+        _dirty_sessions.clear()
+        _clear_persisted_sessions()
 
 # Start the background thread once when bot.py is imported
 _reset_thread = threading.Thread(target=_midnight_reset_loop, daemon=True)
@@ -1732,11 +1735,85 @@ _reset_thread.start()
 
 
 # ── Conversation session store ────────────────────────────────────────────────
+# Sessions live in memory (the dict below) for speed, but are also mirrored to
+# disk so a planner's in-progress board survives the backend process itself
+# restarting (crash, redeploy, Windows service restart) -- by explicit
+# request, work must only ever be lost by the user's own action (closing the
+# tab / logging out), never by the server going away under them.
 sessions: dict[str, dict] = {}
+_dirty_sessions: set[str] = set()
+_SESSIONS_DIR = os.path.join(_DATA_DIR, "sessions")
+
+
+def _session_file_path(phone: str) -> str:
+    """Filesystem-safe path for a session's persisted copy. Session ids can
+    contain '::' (the base::user per-planner id -- see web_app._active_user_sid)
+    and ':' isn't a legal filename character on Windows, this app's
+    production host, so it's swapped out."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", phone)
+    return os.path.join(_SESSIONS_DIR, f"{safe}.pkl")
+
+
+def _persist_session(phone: str) -> None:
+    """Best-effort disk mirror of one session. Never raises -- a persistence
+    failure (disk full, an unpicklable object slipping into session state)
+    must never break the request that triggered it; it just means that one
+    session isn't durable until the next successful write."""
+    sess = sessions.get(phone)
+    if sess is None:
+        return
+    try:
+        os.makedirs(_SESSIONS_DIR, exist_ok=True)
+        path = _session_file_path(phone)
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(sess, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)   # atomic on both POSIX and Windows
+    except Exception:
+        pass
+
+
+def _load_session_from_disk(phone: str):
+    try:
+        path = _session_file_path(phone)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _clear_persisted_sessions() -> None:
+    """Companion to sessions.clear() in the midnight reset -- without this,
+    a browser reconnecting after midnight with an old cookie would silently
+    reload yesterday's board straight off disk, undoing the fresh start."""
+    try:
+        for fn in os.listdir(_SESSIONS_DIR):
+            if fn.endswith(".pkl") or fn.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(_SESSIONS_DIR, fn))
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        pass
+
+
+def flush_dirty_sessions() -> None:
+    """Persist every session touched since the last flush. Called once per
+    web request (see web_app.py's after_request hook) rather than on every
+    get_session() call -- that would persist on every board GET/poll too,
+    not just the moves/saves that actually change anything."""
+    phones = list(_dirty_sessions)
+    _dirty_sessions.clear()
+    for phone in phones:
+        _persist_session(phone)
+
 
 def get_session(phone: str) -> dict:
     if phone not in sessions:
-        sessions[phone] = {
+        restored = _load_session_from_disk(phone)
+        sessions[phone] = restored if restored is not None else {
             "state": "IDLE",
             "user_id": None,
             "engine": None,
@@ -1746,10 +1823,16 @@ def get_session(phone: str) -> dict:
             "unavailable": set(),   # marked unavailable this session
             "assigned": {},         # DO_NUMBER -> LORRY
         }
+    _dirty_sessions.add(phone)
     return sessions[phone]
 
 def reset_session(phone: str):
     sessions.pop(phone, None)
+    _dirty_sessions.discard(phone)
+    try:
+        os.remove(_session_file_path(phone))
+    except OSError:
+        pass
 
 
 # ── Message handlers ──────────────────────────────────────────────────────────

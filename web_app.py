@@ -610,6 +610,18 @@ def _guard():
             return _with_cookie({"error": "auth_required"}, _sid(), 401)
 
 
+@app.after_request
+def _persist_sessions(resp):
+    """Mirror any session touched by a state-changing request to disk, so a
+    planner's in-progress board survives the backend process restarting
+    (crash, redeploy, service restart) instead of only living in memory.
+    Skipped for GET (board polling, etc.) since those never change
+    anything -- no point re-persisting identical state on every read."""
+    if request.method != "GET" and request.path.startswith("/api/"):
+        bot.flush_dirty_sessions()
+    return resp
+
+
 @app.errorhandler(Exception)
 def _api_error_handler(e):
     """An unhandled exception in any /api/* endpoint used to fall through to
