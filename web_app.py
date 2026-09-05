@@ -32,7 +32,7 @@ from datetime import datetime
 
 import pandas as pd
 from flask import (
-    Flask, request, jsonify, send_file, make_response, Response, redirect,
+    Flask, request, jsonify, send_file, make_response, Response, redirect, g,
 )
 
 import bot   # the existing engine — reused as-is
@@ -113,37 +113,60 @@ def _is_authed(sess) -> bool:
 
 def _sid() -> str:
     """Return the caller's BASE (browser-cookie) session id, creating one if
-    absent. This identifies the browser/login only, not a specific
-    planner — see _active_user_sid() for the per-planner id that all real
-    engine/DO operations use."""
-    sid = request.cookies.get(_COOKIE)
-    if not sid:
-        sid = "web_" + secrets.token_hex(8)
-    return sid
+    absent. Cached per-request (flask.g) so every call within the same
+    request returns the identical value — _with_cookie below also calls
+    this directly, and without caching, a browser with no cookie yet would
+    get a freshly-random token on each call, so the value actually set in
+    the response could silently diverge from whatever was used for
+    session lookups earlier in the same request. Identifies the
+    browser/login only, not a specific planner — see _active_user_sid()
+    for the shared per-planner id real engine/DO operations use."""
+    if not hasattr(g, "_base_sid"):
+        sid = request.cookies.get(_COOKIE)
+        if not sid:
+            sid = "web_" + secrets.token_hex(8)
+        g._base_sid = sid
+    return g._base_sid
 
 
 def _active_user_sid() -> str:
-    """Per-planner session id for real engine/DO state: base::<user>. Every
-    endpoint that touches the engine, fetched DOs, the board, or lorry
-    toggles resolves its session through this — not _sid() directly — so
-    clicking the OTHER planner's tab and coming back doesn't wipe this
-    planner's in-progress work. The two planners share one browser cookie
-    (one login) but get fully independent engine state.
+    """Shared per-planner session id for real engine/DO state: literally
+    "planner::<user>" (e.g. "planner::ABI") — NOT tied to any one
+    browser's cookie. Every endpoint that touches the engine, fetched
+    DOs, the board, or lorry toggles resolves its session through this —
+    not _sid() directly — so the SAME planner logged in from a different
+    browser or device (by explicit request: ABI/VIVIAN may need the board
+    open on more than one device at once) sees and edits the exact same
+    live board, and logging out on one device never wipes it out from
+    under another (see /logout, which only clears this browser's own base
+    session, never a planner's shared one).
 
     Falls back to the bare base id before any planner tab has been picked
-    yet (matches the previous single-session behaviour for that window).
-    _with_cookie always recovers the base id by splitting on '::', so the
-    browser's cookie itself never becomes planner-specific."""
+    yet (matches the previous single-session behaviour for that window) —
+    genuinely browser-specific at that point, since no planner identity
+    exists yet to share.
+
+    No locking around the shared session dict: two devices dragging cards
+    for the same planner at the literal same instant could in principle
+    race on a compound read-modify-write. Accepted as low-risk for this
+    tool's pace (one human dragging one card at a time, not machine-speed
+    concurrent writers) rather than adding locking machinery no one asked
+    for."""
     base = _sid()
     outer = bot.get_session(base)
     user = outer.get("_active_user")
-    return f"{base}::{user}" if user else base
+    return f"planner::{user}" if user else base
 
 
 def _with_cookie(payload, sid, status=200):
+    """`sid` is accepted (and still passed by every caller) for signature
+    stability, but no longer used here: the response cookie must always be
+    THIS BROWSER's own base id (_sid()), never a shared "planner::<user>"
+    id (see _active_user_sid) — those two used to be derivable from each
+    other via a "::" split, but aren't any more now that planner sessions
+    are shared across browsers rather than namespaced under one."""
     resp = make_response(jsonify(payload), status)
-    base = sid.split("::", 1)[0]
-    resp.set_cookie(_COOKIE, base, samesite="Lax", max_age=60 * 60 * 8)
+    resp.set_cookie(_COOKIE, _sid(), samesite="Lax", max_age=60 * 60 * 8)
     return resp
 
 
@@ -682,11 +705,13 @@ def auth():
 @app.route("/logout", methods=["POST", "GET"])
 def logout():
     sid = _sid()
-    # Clears auth plus BOTH planners' in-progress engine state — each lives
-    # in its own base::<user> session (see _active_user_sid), so the plain
-    # base session alone isn't enough to wipe everything on logout.
-    for _u in ("ABI", "VIVIAN"):
-        bot.reset_session(f"{sid}::{_u}")
+    # Only this BROWSER's own base session is cleared — never a planner's
+    # shared "planner::ABI"/"planner::VIVIAN" session (see
+    # _active_user_sid). Planner sessions are shared across every browser
+    # or device that planner is logged in on, by explicit request, so
+    # logging out on one device must not wipe the board out from under any
+    # other device still using it; only the daily reset or an explicit
+    # reset/clear action touches planner state now.
     bot.reset_session(sid)
     resp = make_response(redirect("/"))
     resp.set_cookie(_COOKIE, sid, samesite="Lax", max_age=60 * 60 * 8)
@@ -758,7 +783,7 @@ def api_login():
     outer = bot.get_session(base)
     user = str((request.json or {}).get("user", "")).strip().upper()
     outer["_active_user"] = user
-    sid = f"{base}::{user}" if user else base
+    sid = f"planner::{user}" if user else base
     sess = bot.get_session(sid)
 
     if _planner_already_active(sess, user):
