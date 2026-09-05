@@ -435,9 +435,17 @@ def _board_json(sess) -> dict:
     # match) falls back to one shared point per customer code.
     _drop_points: dict[str, set] = {}
     _effective_mo_codes = _effective_manual_only_codes(sess)
+    _na_zna_adopted = sess.get("_na_zna_adopted") or set()
     for it in items:
         lorry = it.get("LORRY")
         if lorry in _NOT_MINE_TODAY:
+            continue
+        do_num = str(it.get("DO NUMBER", "")).strip()
+        if do_num in _na_zna_adopted:
+            # An NA/ZNA DO the OTHER planner assigned, synced in here only
+            # so this session's own bookkeeping stays consistent (see
+            # _sync_na_zna) — never shown on this board: no card, and no
+            # phantom lane for a plate that isn't even this planner's own.
             continue
         route = str(it.get("ROUTE", ""))
         code = str(it.get("CODE", ""))
@@ -1055,7 +1063,17 @@ def _sync_na_zna(sess: dict) -> None:
     alone on the next re-parse — WITHOUT touching the code's manual-only
     override, which would also affect this code's still-*unassigned*
     siblings (an earlier, wrong version of this fix released the whole
-    code and kicked those siblings out of the NA/ZNA section entirely)."""
+    code and kicked those siblings out of the NA/ZNA section entirely).
+
+    Also tracked in sess["_na_zna_adopted"] — DO numbers assigned by the
+    OTHER planner, not this one. _board_json omits these from orders/lanes
+    entirely (by explicit request: seeing your own board list a plate and
+    DO you never touched, taken from the OTHER planner's own fleet, was
+    more confusing than useful) — this planner just needs the DO to be
+    gone from the NA/ZNA section, not a play-by-play of who has it or on
+    which lorry. Discarded again the moment it's adopted back to
+    unassigned, so it displays normally (back in the NA/ZNA section) once
+    it's actually free."""
     watermark = sess.setdefault("_na_zna_synced", {})
     shared = bot._load_na_zna_assignments()
     changed_shared = False
@@ -1083,8 +1101,15 @@ def _sync_na_zna(sess: dict) -> None:
                 # The OTHER planner changed it since our last sync — adopt.
                 it["LORRY"] = shared_plate if shared_plate else "NO_LORRY"
                 watermark[do_num] = shared_plate
+                adopted = sess.setdefault("_na_zna_adopted", set())
                 if shared_plate:
                     sess.setdefault("_manual_placement", {})[do_num] = shared_plate
+                    # This planner didn't do the assigning — see _board_json,
+                    # which hides these from orders/lanes entirely rather
+                    # than showing the other planner's plate on this board.
+                    adopted.add(do_num)
+                else:
+                    adopted.discard(do_num)
     if changed_shared:
         bot._save_na_zna_assignments(shared)
 
@@ -3488,6 +3513,29 @@ async function loadBoard(){
   renderBoard();
 }
 
+// Picks up the OTHER planner's NA/ZNA moves without a manual "Refetch DOs"
+// — that button re-queries the live ERP (slow, and unrelated to seeing a
+// teammate's drag-and-drop), whereas the sync between ABI/VIVIAN already
+// happens server-side on every /api/board read (see _sync_na_zna); this
+// just re-reads it periodically instead of only on this planner's own
+// next action. Silent (no loading message, no error toast) and skipped
+// entirely while a drag is in progress or the tab isn't visible, so it
+// never yanks a card out from under the planner or wastes a poll no one
+// will see.
+async function pollBoard(){
+  if(!BOARD || boardDrag || routeDrag) return;
+  if(document.visibilityState !== 'visible') return;
+  try{
+    const r = await fetch('/api/board');
+    if(!r.ok) return;
+    const d = await r.json();
+    if(d.error) return;
+    BOARD = d;
+    renderBoard();
+  }catch(e){ /* transient network hiccup -- next tick will retry */ }
+}
+setInterval(pollBoard, 20000);
+
 function boardOrdersInPool(route){ return BOARD.orders.filter(o=>o.route===route && !o.lorry && !o.manualOnly); }
 // Matches _board_json's own NA/ZNA bucketing rule (route === 'ZNA' -> ZNA
 // section, else NA) so a card always renders in the same section its own
@@ -3514,6 +3562,22 @@ function sortGroupsExpandedFirst(groups, keyFn){
     .map(x=>x.g);
 }
 
+// Expanding a group (see sortGroupsExpandedFirst) moves it to the top of
+// its section, but the click that opened it can be anywhere further down
+// — without this the planner still has to scroll up by hand to see the
+// very thing they just opened. Called right after renderBoard() rebuilds
+// the DOM; `[data-groupkey]` is set on every route/NA/ZNA/section element
+// so this can find the new home of whatever was just toggled, by identity
+// rather than by (now stale) position. Only called when a group just
+// OPENED — jumping the view on collapse isn't what was asked for, and
+// would be disorienting since collapsing moves a group DOWN instead.
+function scrollGroupIntoView(key){
+  requestAnimationFrame(()=>{
+    const el = Array.from(document.querySelectorAll('[data-groupkey]')).find(e=>e.dataset.groupkey===key);
+    el?.scrollIntoView({behavior:'smooth', block:'nearest'});
+  });
+}
+
 // Renders one of the two NA/ZNA drop zones into `wrap` (parent of the
 // normal route groups) — shared so the two sections stay identical apart
 // from their label/data source. Both sections share the 'MO' drop-zone
@@ -3534,14 +3598,17 @@ function renderMoSection(wrap, label, isZna){
 
   const moWrap=document.createElement('div');
   moWrap.dataset.zone='MO';
+  moWrap.dataset.groupkey='SEC:'+label;
   moWrap.className='board-mo-zone';
   const hdr=document.createElement('div');
   hdr.className='board-pool-section-hdr board-mo-section-hdr';
   hdr.innerHTML=`<span class="board-route-chev">${sectionOpen?'&#9660;':'&#9654;'}</span> ${esc(label)}`+
     (moCount ? ` <span class="board-mo-section-count">&middot; ${moCount} DO${moCount===1?'':'s'}</span>` : '');
   hdr.onclick=()=>{
-    boardOpenMoSections.has(label)?boardOpenMoSections.delete(label):boardOpenMoSections.add(label);
+    const wasOpen=boardOpenMoSections.has(label);
+    wasOpen?boardOpenMoSections.delete(label):boardOpenMoSections.add(label);
     renderBoard();
+    if(!wasOpen) scrollGroupIntoView('SEC:'+label);
   };
   moWrap.appendChild(hdr);
 
@@ -3552,6 +3619,7 @@ function renderMoSection(wrap, label, isZna){
       const key=keyPrefix+mo.code;
       const div=document.createElement('div');
       div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
+      div.dataset.groupkey=key;
       const {toggleHtml: moToggleHtml, panelHtml: moPanelHtml} = specialProductsBadge('MOS:'+key, list);
       div.innerHTML=`
         <div class="board-route-head">
@@ -3568,8 +3636,10 @@ function renderMoSection(wrap, label, isZna){
       _moHead.onclick=(e)=>{
         e.stopPropagation();
         if(routeDragJustHappened){ routeDragJustHappened=false; return; }
-        boardOpenRoutes.has(key)?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
+        const wasOpen=boardOpenRoutes.has(key);
+        wasOpen?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
         renderBoard();
+        if(!wasOpen) scrollGroupIntoView(key);
       };
       _moHead.addEventListener('pointerdown', e=>{
         if(e.target.closest('.board-route-chev')) return;
@@ -3755,6 +3825,7 @@ function renderBoard(){
     totalUn+=list.length;
     const div=document.createElement('div');
     div.className='board-route'+(boardOpenRoutes.has(rt.route)?' open':'');
+    div.dataset.groupkey=rt.route;
     const {toggleHtml, panelHtml} = specialProductsBadge('RT:'+rt.route, list);
     div.innerHTML=`
       <div class="board-route-head">
@@ -3770,8 +3841,10 @@ function renderBoard(){
     const _head=div.querySelector('.board-route-head');
     _head.onclick=()=>{
       if(routeDragJustHappened){ routeDragJustHappened=false; return; }
-      boardOpenRoutes.has(rt.route)?boardOpenRoutes.delete(rt.route):boardOpenRoutes.add(rt.route);
+      const wasOpen=boardOpenRoutes.has(rt.route);
+      wasOpen?boardOpenRoutes.delete(rt.route):boardOpenRoutes.add(rt.route);
       renderBoard();
+      if(!wasOpen) scrollGroupIntoView(rt.route);
     };
     _head.addEventListener('pointerdown', e=>{
       if(e.target.closest('.board-route-chev')) return;
