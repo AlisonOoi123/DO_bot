@@ -520,12 +520,8 @@ def fetch_validation_status(do_numbers: list[str], config_path: str = None) -> d
     reason" — only the former should be dropped from the board rather
     than kept visible.
 
-    CFMFLG_0 is a 2-value Sage X3 local menu; this treats 2 as the "Yes,
-    validated" value (the standard convention for such flags: 1 = No,
-    2 = Yes) since it wasn't independently confirmed against real data —
-    verify with `SELECT SDHNUM_0, CFMFLG_0 FROM ENGSHENG.SDELIVERY WHERE
-    SDHNUM_0 = '<a DO you know is validated>'` and adjust the comparison
-    below if the real encoding differs.
+    CFMFLG_0 is a 2-value Sage X3 local menu, confirmed against real data:
+    2 = validated, 1 = not.
 
     Returns {} for an empty list without touching the DB. Raises on any
     DB/config failure, same as every other fetch here; the caller decides
