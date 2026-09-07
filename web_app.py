@@ -1913,7 +1913,15 @@ def api_board_refetch():
     outcome = _run_dos_upload(sid, sess, combined_bytes, assign_now=False)
     for it in sess.get("items", []) or []:
         do_num = str(it.get("DO NUMBER", "")).strip()
-        if do_num in _prev_assigned and it.get("LORRY") == "NO_LORRY":
+        # Restore regardless of what sentinel the fresh classification
+        # landed on (NO_LORRY, but just as often NOT_TODAY/PAST_DATE/
+        # WRONG_TRIP/OTHER_USER/etc. — the re-parse re-evaluates every row
+        # from scratch and has no memory of "this one's already assigned").
+        # A previously-assigned DO sticking on its plate no matter what is
+        # the whole point of this endpoint; checking only for NO_LORRY left
+        # it silently un-restored whenever re-classification picked any
+        # other reason instead.
+        if do_num in _prev_assigned and it.get("LORRY") != _prev_assigned[do_num]:
             it["LORRY"] = _prev_assigned[do_num]
             if do_num in _prev_ai_snapshot:
                 sess.setdefault("_ai_plate_snapshot", {})[do_num] = _prev_ai_snapshot[do_num]
