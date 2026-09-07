@@ -2567,11 +2567,11 @@ _PAGE = r"""<!doctype html>
   .lane-drop-btn:hover:not(:disabled){background:var(--bad);color:#fff}
   .lane-drop-btn:disabled{opacity:.3;cursor:not-allowed}
   .board-lanes.has-maximized{grid-template-columns:1fr}
-  .board-lane-maximized{padding:20px;min-height:60vh}
+  .board-lane-maximized{padding:20px;min-height:82vh}
   .board-lane-maximized .board-lane-plate{font-size:20px}
   .board-lane-maximized .board-lane-body{gap:10px}
   .board-lane-maximized .board-card{padding:10px 14px;font-size:13.5px}
-  .board-lane-body{display:flex;flex-direction:column;gap:6px;min-height:36px}
+  .board-lane-body{display:flex;flex-direction:column;gap:6px;min-height:220px}
   .board-empty{color:var(--muted);font-size:12.5px;font-style:italic;padding:6px 2px;opacity:.7}
   .board-card{display:flex;gap:8px;background:var(--card);border:1px solid var(--line);
     border-radius:8px;padding:7px 9px;cursor:grab;font-size:12.5px;touch-action:none;position:relative}
