@@ -3591,6 +3591,19 @@ function renderResult(r){
 
 // ==================== Drag-and-drop board ====================
 let BOARD=null;
+// DO numbers currently more than 3 days old and unassigned (see
+// _board_json's "aging" -- over3_dos is the broadest/cumulative bucket,
+// covering over5/over7 too) -- rebuilt at the top of every renderBoard()
+// so boardCardEl and boardOrdersInPool always see the current set without
+// needing it threaded through every call.
+let boardAgingSet=new Set();
+function boardDateSortVal(s){
+  const m=/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/.exec(String(s||'').trim());
+  if(!m) return Infinity;
+  let [, d, mo, y]=m.map(Number);
+  if(y<100) y+=2000;
+  return y*10000+mo*100+d;
+}
 let boardOpenRoutes=new Set(), boardCollapsedLanes=new Set(), boardOpenSpecialGroups=new Set(), boardOpenAgingGroups=new Set(), boardOpenMoSections=new Set();
 let boardMaximizedPlate=null;
 let boardDrag=null, boardGhost=null;
@@ -3726,7 +3739,22 @@ async function pollBoard(){
 }
 setInterval(pollBoard, 20000);
 
-function boardOrdersInPool(route){ return BOARD.orders.filter(o=>o.route===route && !o.lorry && !o.manualOnly); }
+function boardOrdersInPool(route){
+  // Aging DOs (see boardAgingSet) get priority: shown first, most-overdue
+  // (oldest date) first. Everything else keeps its normal ordering, just
+  // grouped by customer name, then date, ascending -- by explicit request,
+  // this is separate from the global date/DO-number sort _board_json
+  // already applies (which still governs every other section).
+  const list = BOARD.orders.filter(o=>o.route===route && !o.lorry && !o.manualOnly);
+  list.sort((a,b)=>{
+    const aAging=boardAgingSet.has(a.do), bAging=boardAgingSet.has(b.do);
+    if(aAging!==bAging) return aAging?-1:1;
+    if(aAging) return boardDateSortVal(a.date)-boardDateSortVal(b.date);
+    const c=(a.customer||'').localeCompare(b.customer||'');
+    return c || (boardDateSortVal(a.date)-boardDateSortVal(b.date));
+  });
+  return list;
+}
 // Matches _board_json's own NA/ZNA bucketing rule (route === 'ZNA' -> ZNA
 // section, else NA) so a card always renders in the same section its own
 // live route belongs to, even for the rare customer code whose DOs are a
@@ -4048,7 +4076,7 @@ function boardCardEl(o, showPlate){
   el.innerHTML=`
     <span class="b-stripe" style="background:${color}"></span>
     <div class="b-body">
-      <div class="b-top"><span class="b-id">${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}${plateBadge}${o.distance?`<span class="b-dist">${esc(o.distance)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
+      <div class="b-top"><span class="b-id"${boardAgingSet.has(o.do)?' style="color:var(--bad)"':''}>${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}${plateBadge}${o.distance?`<span class="b-dist">${esc(o.distance)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
@@ -4083,6 +4111,7 @@ function boardCardEl(o, showPlate){
 function renderBoard(){
   if(!BOARD) return;
   BOARD_BOLD_ITMREFS = new Set([...BOARD_BOLD_ITMREFS_FIXED, ...(BOARD.specialProductCodes||[])]);
+  boardAgingSet = new Set(((BOARD.aging||{}).over3_dos||[]).map(d=>d.do));
   const wrap=$('#board-routes'); wrap.innerHTML='';
   let totalUn=0;
   // Expanded groups bubble to the top of the Unassigned pool (and the
@@ -4155,7 +4184,7 @@ function renderBoard(){
       `${open?'&#9662;':'&#9656;'} More than ${n} days: ${count} DO${count===1?'':'s'}</span>`;
     const panel=open
       ? `<div class="board-aging-panel">${(dos||[]).map(d=>
-          `<div>&bull; <b>${esc(d.do)}</b> &mdash; ${esc(d.date)} &middot; ${esc(d.customer)} &middot; ${esc(d.route)}</div>`
+          `<div>&bull; <b style="color:var(--bad)">${esc(d.do)}</b> &mdash; ${esc(d.date)} &middot; ${esc(d.customer)} &middot; ${esc(d.route)}</div>`
         ).join('')}</div>`
       : '';
     return toggle+panel;
