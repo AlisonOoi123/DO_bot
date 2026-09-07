@@ -2333,7 +2333,7 @@ _PAGE = r"""<!doctype html>
   html,body{margin:0;padding:0}
   body{background:var(--bg);color:var(--ink);
     font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-    line-height:1.45;-webkit-text-size-adjust:100%}
+    line-height:1.45;-webkit-text-size-adjust:100%;zoom:1.15}
   .wrap{max-width:960px;margin:0 auto;padding:16px}
   header{display:flex;align-items:center;gap:10px;padding:8px 0 16px}
   header .logo{font-size:26px}
