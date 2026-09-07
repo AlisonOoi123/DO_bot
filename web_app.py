@@ -2567,7 +2567,7 @@ _PAGE = r"""<!doctype html>
   .lane-drop-btn:hover:not(:disabled){background:var(--bad);color:#fff}
   .lane-drop-btn:disabled{opacity:.3;cursor:not-allowed}
   .board-lanes.has-maximized{grid-template-columns:1fr}
-  .board-lane-maximized{padding:20px;min-height:82vh}
+  .board-lane-maximized{padding:20px;min-height:150vh}
   .board-lane-maximized .board-lane-plate{font-size:20px}
   .board-lane-maximized .board-lane-body{gap:10px}
   .board-lane-maximized .board-card{padding:10px 14px;font-size:13.5px}
