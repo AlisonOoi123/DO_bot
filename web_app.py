@@ -1847,7 +1847,28 @@ def api_board_refetch():
             _now_validated = {d for d, v in _validated_map.items() if v}
         except Exception:
             pass   # DB hiccup checking validation -- fail safe, keep showing it
-    old_raw_stale = old_raw[_fallen_out_mask & ~old_raw_do.isin(_now_validated)]
+
+    # Snapshot: DO NUMBER -> its current real lorry plate, for every item
+    # that's actually assigned right now (drag-and-drop, a prior AI Assign,
+    # or a manual pick) — this is exactly what must survive the refetch,
+    # and (see _keep_mask below) the one thing an ETD-window change must
+    # never filter out of the board even if it falls outside the window.
+    _prev_assigned = {
+        str(it.get("DO NUMBER", "")).strip(): it["LORRY"]
+        for it in sess["items"]
+        if it.get("LORRY") and it["LORRY"] not in _SENTINELS
+    }
+    _keep_mask = _fallen_out_mask & ~old_raw_do.isin(_now_validated)
+    if "etd_days" in _body:
+        # This call is also the mid-session "Fetch DOs" ETD-window change
+        # (see fetchAndAssign) — the whole point is to re-filter the LEFT
+        # side (unassigned/NA/ZNA) by the new window, so a DO that fell out
+        # only because it's now outside that window must actually drop out
+        # of those pools, not be kept around like a normal refetch would.
+        # DOs already on a real lorry are the one exception: the right side
+        # must never be disturbed by this, ETD change or not.
+        _keep_mask = _keep_mask & old_raw_do.isin(_prev_assigned)
+    old_raw_stale = old_raw[_keep_mask]
 
     # old_raw carries bot.py's own derived "WEIGHT(T)" column, added to
     # sess["raw_df"] in place during the first parse — it's not part of the
@@ -1863,14 +1884,6 @@ def api_board_refetch():
     _raw_columns = [c for c in old_raw.columns if c != "WEIGHT(T)"]
     old_raw_stale = old_raw_stale[_raw_columns]
 
-    # Snapshot: DO NUMBER -> its current real lorry plate, for every item
-    # that's actually assigned right now (drag-and-drop, a prior AI Assign,
-    # or a manual pick) — this is exactly what must survive the refetch.
-    _prev_assigned = {
-        str(it.get("DO NUMBER", "")).strip(): it["LORRY"]
-        for it in sess["items"]
-        if it.get("LORRY") and it["LORRY"] not in _SENTINELS
-    }
     # Preserved separately from _run_dos_upload's reset below (assign_now=
     # False wipes _ai_plate_snapshot since a normal fetch lands everything
     # unassigned) — restored alongside each DO's plate so a refetch doesn't
