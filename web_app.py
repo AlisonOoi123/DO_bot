@@ -441,6 +441,16 @@ def _board_json(sess) -> dict:
 
     orders = []
     routes: dict[str, dict] = {}
+    # DOs whose CURRENT lorry matches what was last written to SQL (see
+    # api_board_save) — grouped by route code like the Unassigned pool,
+    # shown as their own "Assigned DOs" section between Unassigned and
+    # NA/ZNA. By explicit request: only DOs actually saved show here, not
+    # merely dragged onto a lorry — an unsaved assignment still shows in
+    # its lorry lane, just not in this section. Dragging a DO to a
+    # DIFFERENT plate after saving (without re-saving) drops it back out
+    # of this section, since what's saved no longer matches what's shown.
+    assigned_dos: dict[str, dict] = {}
+    _saved_snapshot = sess.get("_saved_plate_snapshot") or {}
     # Split into two — NA and ZNA are shown as separate sections (see
     # renderBoard) rather than one combined "MANUAL ASSIGN ONLY" — bucketed
     # by each order's own live ROUTE; anything manually forced in that
@@ -473,11 +483,16 @@ def _board_json(sess) -> dict:
         route = str(it.get("ROUTE", ""))
         code = str(it.get("CODE", ""))
         assigned_plate = lorry if lorry and lorry not in _SENTINELS else None
+        _is_saved = bool(assigned_plate and _saved_snapshot.get(do_num) == assigned_plate)
+        weight = float(it.get("WEIGHT", 0) or 0)
+        weight = round(weight, 3) if pd.notna(weight) else 0.0
         if assigned_plate:
             _drop_points.setdefault(assigned_plate, set()).add(
                 (code.strip().upper(), str(it.get("DROPPOINT", "")).strip().upper()))
-        weight = float(it.get("WEIGHT", 0) or 0)
-        weight = round(weight, 3) if pd.notna(weight) else 0.0
+            if _is_saved:
+                _ad = assigned_dos.setdefault(route, {"route": route, "dos": 0, "weight": 0.0})
+                _ad["dos"] += 1
+                _ad["weight"] = round(_ad["weight"] + weight, 3)
         # A real reason (e.g. PAST_DATE) beats no explanation at
         # all for a pool card the AI deliberately skipped rather than one it
         # just couldn't fit anywhere (NO_LORRY etc. show no reason tag).
@@ -496,6 +511,7 @@ def _board_json(sess) -> dict:
             "lorry": assigned_plate,
             "reason": _reason,
             "manualOnly": _is_manual_only,
+            "saved": _is_saved,
         })
         if assigned_plate is None and _is_manual_only:
             _mo_code = code.strip().upper()
@@ -513,6 +529,19 @@ def _board_json(sess) -> dict:
             rt["weight"] = round(rt["weight"] + weight, 3)
         elif assigned_plate not in caps and assigned_plate in _all_caps:
             caps[assigned_plate] = _all_caps[assigned_plate]
+
+    # Every section (route pool, NA/ZNA, lorry lanes, Assigned DOs) reads
+    # its own card list by filtering this ONE flat list, and filter()
+    # preserves order -- so sorting it once here, by DATE ascending then
+    # DO NUMBER ascending, is enough to sort every section at once rather
+    # than needing the same sort repeated in each place a group gets
+    # built. Date is parsed dayfirst (matching every other date parse in
+    # this app); an unparseable date sorts last rather than breaking the
+    # whole sort.
+    def _order_sort_key(o):
+        _dt = pd.to_datetime(o["date"], dayfirst=True, errors="coerce")
+        return (_dt if pd.notna(_dt) else pd.Timestamp.max, o["do"])
+    orders.sort(key=_order_sort_key)
 
     # Aging breakdown for the unassigned pool: how many unassigned DOs are
     # more than N days past their own DATE — cumulative thresholds (a DO
@@ -545,6 +574,7 @@ def _board_json(sess) -> dict:
         "aging": _aging,
         "specialProductCodes": _special_product_codes(),
         "routes": sorted(routes.values(), key=lambda r: r["route"]),
+        "assigned_routes": sorted(assigned_dos.values(), key=lambda r: r["route"]),
         "manual_only_na": sorted(manual_only_na.values(), key=lambda m: m["code"]),
         "manual_only_zna": sorted(manual_only_zna.values(), key=lambda m: m["code"]),
         "lorries": [{"plate": p, "capacity": c, "on": p not in _off_plates,
@@ -1242,17 +1272,30 @@ def api_dos():
 # can download them to review/edit, and either re-upload that file through
 # the normal dropzone, or click "Use this" to proceed directly.
 # ─────────────────────────────────────────────────────────────────────────────
+def _parse_etd_days(raw):
+    """Validate+normalize an etd_days value from a request body: an int or
+    int-string -> int, ''/None -> None (no ETD filter at all). Raises
+    ValueError with a user-facing message otherwise. Shared by
+    /api/dos-fetch and /api/board/refetch — both accept this same
+    parameter, the latter so changing the ETD window mid-session (see
+    fetchAndAssign) doesn't need its own separate validation copy."""
+    try:
+        etd_days = int(raw) if raw not in (None, "") else None
+        if etd_days is not None and etd_days < 0:
+            raise ValueError
+        return etd_days
+    except (TypeError, ValueError):
+        raise ValueError("ETD window must be a whole number of days (0 or more).")
+
+
 @app.route("/api/dos-fetch", methods=["POST"])
 def api_dos_fetch():
     sid = _active_user_sid()
     sess = bot.get_session(sid)
-    _etd_days = (request.json or {}).get("etd_days")
     try:
-        _etd_days = int(_etd_days) if _etd_days not in (None, "") else None
-        if _etd_days is not None and _etd_days < 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        return _with_cookie({"error": "ETD window must be a whole number of days (0 or more)."}, sid, 400)
+        _etd_days = _parse_etd_days((request.json or {}).get("etd_days"))
+    except ValueError as e:
+        return _with_cookie({"error": str(e)}, sid, 400)
     # 0 means "today's ETD only" (a zero-day window around today, i.e.
     # ETD == today); blank/omitted means no ETD filter at all — fetch
     # everything regardless of ETD.
@@ -1741,12 +1784,32 @@ def api_board_refetch():
     fresh fetch — everything lands in Unassigned, nothing auto-fits), then
     restore the snapshot onto the DO numbers that already existed. Runs on
     every refetch, even when no brand-new DO shows up, since a route change
-    on an existing DO wouldn't otherwise be a 'new' row at all."""
+    on an existing DO wouldn't otherwise be a 'new' row at all.
+
+    Also doubles as the mid-session destination for the "Fetch DOs" button
+    itself (see fetchAndAssign): changing the ETD window and clicking
+    Fetch while a board is already up must only change what shows in the
+    LEFT-side pools, never disturb the right-side lorry lanes — exactly
+    what this endpoint already guarantees. An 'etd_days' key in the
+    request body (even null/blank, meaning "no filter") updates
+    sess["etd_days"] before fetching; omitting the key entirely reuses
+    whatever window was already set, matching the plain "Refetch DOs"
+    button's existing behaviour."""
     sid = _active_user_sid()
     sess = bot.get_session(sid)
     old_raw = sess.get("raw_df")
     if old_raw is None or not sess.get("items"):
         return _with_cookie({"error": "No board to refetch into — fetch or upload DOs first."}, sid, 400)
+    # get_json(silent=True): refetch historically took no body at all (the
+    # plain "Refetch DOs" button still sends none) — request.json would
+    # raise a 415 on a request with no JSON content-type instead of just
+    # treating it as "no etd_days provided".
+    _body = request.get_json(silent=True) or {}
+    if "etd_days" in _body:
+        try:
+            sess["etd_days"] = _parse_etd_days(_body.get("etd_days"))
+        except ValueError as e:
+            return _with_cookie({"error": str(e)}, sid, 400)
     try:
         fresh_df = do_source.fetch_delivery_report(etd_days=sess.get("etd_days"))
     except Exception as e:
@@ -2064,6 +2127,11 @@ def api_board_save():
         import traceback
         traceback.print_exc()
         return _with_cookie({"ok": False, "error": f"Save failed: {e}"}, sid, 500)
+    # Drives the "Assigned DOs" section (see _board_json) — a full replace,
+    # not a merge: _board_save_rows already returns every DO in scope, so
+    # this always reflects exactly what's actually saved right now, with
+    # nothing stale left over from an earlier save.
+    sess["_saved_plate_snapshot"] = {r["do_number"]: r["plate"] for r in rows if r["plate"]}
     return _with_cookie({"ok": True, **result}, sid)
 
 
@@ -2439,7 +2507,8 @@ _PAGE = r"""<!doctype html>
   .mini-btn{background:var(--card2);border:1px solid var(--line);color:var(--muted);
     border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer}
   .mini-btn:hover{color:var(--ink);border-color:var(--brand)}
-  .board-lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+  .board-lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;
+    align-items:start}
   .board-lane{background:var(--card2);border:1px solid var(--line);border-radius:12px;
     padding:12px;min-height:120px;transition:box-shadow .12s,border-color .12s}
   .board-lane.collapsed{min-height:0;padding:9px 12px}
@@ -2504,6 +2573,8 @@ _PAGE = r"""<!doctype html>
     color:var(--ink);font-size:12px}
   .board-card .b-dist{font-family:ui-monospace,Menlo,monospace;font-weight:600;
     color:var(--muted);font-size:11px}
+  .board-card .b-plate{font-family:ui-monospace,Menlo,monospace;font-weight:700;
+    color:var(--brand);font-size:11px}
   .board-card .b-kg{margin-left:auto;font-family:ui-monospace,Menlo,monospace;
     font-weight:700;font-size:12px;color:var(--ok);flex-shrink:0}
   .board-card .b-delete{display:inline-flex;align-items:center;justify-content:center;
@@ -2932,8 +3003,10 @@ async function autoLoadPlanner(user, autoFetch){
       show('#tp-toggle-section', true);
       show('#tp-fetch-row', true);
       await loadLorryToggles();
-      if(dl.needs_picking){ await showPickingList(); }
-      else if(dl.has_items){ showBoard(); }
+      // Picking List is hidden by explicit request (kept in the code, not
+      // removed, in case it's needed again) -- always land on the board
+      // once there's something to show it, regardless of needs_picking.
+      if(dl.has_items){ showBoard(); }
       return;
     }
 
@@ -3204,6 +3277,19 @@ async function fetchAndAssign(){
   }
   btn.disabled = true;
   try{
+    if(BOARD){
+      // Mid-session: the board's already up, so this must behave like
+      // Refetch (never disturb the right-side lorry lanes) but ALSO pick
+      // up the ETD window the user just changed -- refetch already
+      // guarantees the former; passing etd_days here gets it the latter.
+      setMsg('#login-msg', 'Fetching DOs… ', false);
+      const d = await jpost('/api/board/refetch', {etd_days: etdDays});
+      if(d.error){ setMsg('#login-msg', d.error, true); return; }
+      if(d.board){ BOARD=d.board; renderBoard(); }
+      setMsg('#login-msg', null);
+      showBoard();
+      return;
+    }
     setMsg('#login-msg', 'Fetching DOs from system… ', false);
     const df = await jpost('/api/dos-fetch', {etd_days: etdDays});
     if(df.error){ showBoardWithError(df.error); return; }
@@ -3241,7 +3327,7 @@ async function fetchAndAssign(){
       return;
     }
     setMsg('#login-msg', null);
-    await showPickingList();
+    showBoard();   // Picking List hidden by explicit request -- see above
   } finally {
     btn.disabled = false;
   }
@@ -3363,7 +3449,7 @@ function handleDosResponse(d){
     show('#card-dos',false); show('#card-offsched',true);
     return true;
   }
-  if(d.result){ show('#card-dos',false); showPickingList(); return true; }
+  if(d.result){ show('#card-dos',false); showBoard(); return true; }
   return false;
 }
 
@@ -3408,7 +3494,7 @@ $('#btn-dos-fetch-use').onclick=useFetchedDos;
 async function answerOffsched(assign){
   setMsg('#offsched-msg', assign?'Assigning off-schedule DOs… ':'Finalising… ');
   const d=await jpost('/api/offschedule',{assign});
-  if(d.result){ show('#card-offsched',false); showPickingList(); }
+  if(d.result){ show('#card-offsched',false); showBoard(); }
   else { setMsg('#offsched-msg', d.messages||d.error||'Something went wrong',true); }
 }
 document.getElementById('offsched-yes').onclick=()=>answerOffsched(true);
@@ -3657,6 +3743,83 @@ function scrollGroupIntoView(key){
 // Renders one of the two NA/ZNA drop zones into `wrap` (parent of the
 // normal route groups) — shared so the two sections stay identical apart
 // from their label/data source. Both sections share the 'MO' drop-zone
+function boardOrdersAssignedSection(route){
+  return BOARD.orders.filter(o=>o.route===route && o.lorry && o.saved);
+}
+
+// "Assigned DOs" — every DO whose current plate matches what was last
+// actually written to SQL (see api_board_save / _board_json's "saved"
+// flag), grouped by route code like the Unassigned pool, between
+// Unassigned and NA/ZNA. By explicit request: only SAVED assignments show
+// here — an assigned-but-not-yet-saved DO still shows in its lorry lane,
+// just not duplicated here, and re-dragging a saved DO onto a different
+// plate without re-saving drops it back out (since the two no longer
+// agree). Not a drop target itself (no data-zone) — cards here are
+// draggable OUT to reassign, same as any other card, but dropping
+// something ONTO this section doesn't mean anything. Section-level
+// collapse (boardOpenMoSections, key 'ASSIGNED') mirrors the NA/ZNA
+// sections'; per-route sub-groups collapse independently underneath it.
+function renderAssignedSection(wrap){
+  const groups=BOARD.assigned_routes||[];
+  const totalCount=groups.reduce((s,g)=>s+g.dos,0);
+  const sectionOpen=boardOpenMoSections.has('ASSIGNED');
+
+  const secWrap=document.createElement('div');
+  secWrap.dataset.groupkey='SEC:ASSIGNED';
+  secWrap.className='board-mo-zone';
+  const hdr=document.createElement('div');
+  hdr.className='board-pool-section-hdr board-mo-section-hdr';
+  hdr.innerHTML=`<span class="board-route-chev">${sectionOpen?'&#9660;':'&#9654;'}</span> ASSIGNED DOs`+
+    (totalCount ? ` <span class="board-mo-section-count">&middot; ${totalCount} DO${totalCount===1?'':'s'}</span>` : '');
+  hdr.onclick=()=>{
+    const wasOpen=boardOpenMoSections.has('ASSIGNED');
+    wasOpen?boardOpenMoSections.delete('ASSIGNED'):boardOpenMoSections.add('ASSIGNED');
+    renderBoard();
+    if(!wasOpen) scrollGroupIntoView('SEC:ASSIGNED');
+  };
+  secWrap.appendChild(hdr);
+
+  if(sectionOpen){
+    sortGroupsExpandedFirst(groups, g=>'ASG:'+g.route).forEach(g=>{
+      const list=boardOrdersAssignedSection(g.route);
+      if(!list.length) return;
+      const key='ASG:'+g.route;
+      const div=document.createElement('div');
+      div.className='board-route'+(boardOpenRoutes.has(key)?' open':'');
+      div.dataset.groupkey=key;
+      const {toggleHtml, panelHtml} = specialProductsBadge('ASGS:'+key, list);
+      div.innerHTML=`
+        <div class="board-route-head">
+          <span class="board-route-chev">&#9654;</span>
+          <span class="board-route-dot" style="background:${boardRouteColor(g.route)}"></span>
+          <span class="board-route-code">${esc(g.route)}</span>
+          <span class="board-route-meta">${list.length} DO &middot; ${fmtT(g.weight)}</span>
+          ${toggleHtml}
+        </div>
+        ${panelHtml}
+        <div class="board-route-body"></div>`;
+      wireSpecialsToggle(div);
+      const _head=div.querySelector('.board-route-head');
+      _head.onclick=()=>{
+        const wasOpen=boardOpenRoutes.has(key);
+        wasOpen?boardOpenRoutes.delete(key):boardOpenRoutes.add(key);
+        renderBoard();
+        if(!wasOpen) scrollGroupIntoView(key);
+      };
+      const body=div.querySelector('.board-route-body');
+      list.forEach(o=>body.appendChild(boardCardEl(o, true)));
+      secWrap.appendChild(div);
+    });
+    if(!totalCount){
+      const empty=document.createElement('div');
+      empty.className='board-empty';
+      empty.textContent='No saved assignments yet';
+      secWrap.appendChild(empty);
+    }
+  }
+  wrap.appendChild(secWrap);
+}
+
 // value (dropping a DO onto either still just flags its customer code
 // manual-only — see the 'MO' branch in the drag-drop handler) but use
 // distinct boardOpenRoutes key prefixes so their per-customer collapse
@@ -3819,7 +3982,12 @@ function boardRouteColor(route){
   return BOARD_ROUTE_COLORS[(idx<0?0:idx)%BOARD_ROUTE_COLORS.length];
 }
 
-function boardCardEl(o){
+// showPlate: true adds a small "-> PLATE" badge to the card's top row.
+// Cards rendered inside a lorry lane leave this off (the plate is already
+// obvious from which lane the card sits in); the Assigned DOs section
+// (grouped by route, not by lane) needs it since a card there could be on
+// any plate.
+function boardCardEl(o, showPlate){
   const el=document.createElement('div');
   el.className='board-card'+(o._warned?' warned':'');
   el.dataset.do=o.do;
@@ -3827,6 +3995,7 @@ function boardCardEl(o){
   const deleteBtn = o.lorry
     ? `<button class="b-delete" title="Remove from ${esc(o.lorry)} and return to unassigned">&times;</button>`
     : '';
+  const plateBadge = (showPlate && o.lorry) ? `<span class="b-plate">&rarr; ${esc(o.lorry)}</span>` : '';
   // Each raw item is "ITMREF_0|description xqty" (see do_source.py) — the
   // ref decides bold vs. normal weight per line, then gets stripped before
   // display. A part with no '|' (stale cached board data from before this
@@ -3851,7 +4020,7 @@ function boardCardEl(o){
   el.innerHTML=`
     <span class="b-stripe" style="background:${color}"></span>
     <div class="b-body">
-      <div class="b-top"><span class="b-id">${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}${o.distance?`<span class="b-dist">${esc(o.distance)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
+      <div class="b-top"><span class="b-id">${esc(o.do)}</span>${o.code?`<span class="b-code">${esc(o.code)}</span>`:''}${plateBadge}${o.distance?`<span class="b-dist">${esc(o.distance)}</span>`:''}<span class="b-kg">${fmtT(o.weight)}</span>${deleteBtn}</div>
       <div class="b-cust">${esc(o.customer)}</div>
       <div class="b-meta">${esc(o.route)} &middot; ${esc(o.date)}</div>
       ${o.remarks?`<div class="b-meta" style="color:var(--warn);font-weight:700">${esc(o.remarks)}</div>`:''}
@@ -3930,6 +4099,11 @@ function renderBoard(){
     list.forEach(o=>body.appendChild(boardCardEl(o)));
     wrap.appendChild(div);
   });
+  // Assigned DOs — see renderAssignedSection. Positioned between the
+  // normal route pool and NA/ZNA, by explicit request. Not counted into
+  // totalUn (the "UNASSIGNED" label) since these are, by definition,
+  // assigned.
+  renderAssignedSection(wrap);
   // NA / ZNA — customers whose live ROUTE has no real route assigned (plus
   // any code this session has manually dragged in/out). Shown to BOTH
   // planners and kept in sync between them (see _sync_na_zna) since
@@ -4050,9 +4224,10 @@ $('#board-pool-collapse-all').onclick=()=>{ boardOpenRoutes.clear(); boardOpenMo
 $('#board-pool-expand-all').onclick=()=>{
   if(BOARD){
     BOARD.routes.forEach(rt=>boardOpenRoutes.add(rt.route));
+    (BOARD.assigned_routes||[]).forEach(g=>boardOpenRoutes.add('ASG:'+g.route));
     (BOARD.manual_only_na||[]).forEach(mo=>boardOpenRoutes.add('MON:'+mo.code));
     (BOARD.manual_only_zna||[]).forEach(mo=>boardOpenRoutes.add('MOZ:'+mo.code));
-    boardOpenMoSections.add('NA').add('ZNA');
+    boardOpenMoSections.add('ASSIGNED').add('NA').add('ZNA');
   }
   renderBoard();
 };
@@ -4420,7 +4595,7 @@ async function boot(){
     setDayDate(_earliestAllowedDate());
     await updateTimeRestrictions();
     await loadLorryToggles();
-    if(d.needs_picking){ await showPickingList(); } else { showBoard(); }
+    showBoard();   // Picking List hidden by explicit request -- see above
     return;
   }
   if(validUsers.length){ autoLoadPlanner(validUsers[0]); }
