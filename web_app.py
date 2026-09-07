@@ -1799,7 +1799,17 @@ def api_board_refetch():
     sess = bot.get_session(sid)
     old_raw = sess.get("raw_df")
     if old_raw is None or not sess.get("items"):
-        return _with_cookie({"error": "No board to refetch into — fetch or upload DOs first."}, sid, 400)
+        # "no_board": the caller (see fetchAndAssign) uses this to decide
+        # whether to fall back to the first-time fetch/use flow -- driven by
+        # actual server session state rather than a client-side JS flag,
+        # which can be stale/null for a moment right after a planner switch
+        # (loadBoard()'s fetch hasn't resolved yet) and would otherwise
+        # wrongly route a mid-session Fetch through the destructive
+        # first-fetch path, wiping every existing lorry assignment.
+        return _with_cookie({
+            "error": "No board to refetch into — fetch or upload DOs first.",
+            "no_board": True,
+        }, sid, 400)
     # get_json(silent=True): refetch historically took no body at all (the
     # plain "Refetch DOs" button still sends none) — request.json would
     # raise a 415 on a request with no JSON content-type instead of just
@@ -3290,13 +3300,18 @@ async function fetchAndAssign(){
   }
   btn.disabled = true;
   try{
-    if(BOARD){
-      // Mid-session: the board's already up, so this must behave like
-      // Refetch (never disturb the right-side lorry lanes) but ALSO pick
-      // up the ETD window the user just changed -- refetch already
-      // guarantees the former; passing etd_days here gets it the latter.
-      setMsg('#login-msg', 'Fetching DOs… ', false);
-      const d = await jpost('/api/board/refetch', {etd_days: etdDays});
+    // Mid-session (a board already exists for this planner) must behave
+    // like Refetch (never disturb the right-side lorry lanes) but ALSO
+    // pick up the ETD window the user just changed. Whether that's the
+    // case is asked of the SERVER (via /api/board/refetch's own check),
+    // not read off the local BOARD variable -- BOARD can be stale/null
+    // for a moment right after switching planner tabs (loadBoard()'s
+    // fetch hasn't resolved yet), and trusting it wrongly routed a
+    // mid-session Fetch through the destructive first-fetch path below,
+    // wiping every existing lorry assignment.
+    setMsg('#login-msg', 'Fetching DOs… ', false);
+    const d = await jpost('/api/board/refetch', {etd_days: etdDays});
+    if(!d.no_board){
       if(d.error){ setMsg('#login-msg', d.error, true); return; }
       if(d.board){ BOARD=d.board; renderBoard(); }
       setMsg('#login-msg', null);
