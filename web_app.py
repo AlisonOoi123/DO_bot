@@ -1761,10 +1761,30 @@ def api_board_refetch():
 
     # Known DOs that are STILL in the live feed get the fresh row (route
     # etc. refreshed); known DOs that fell out of the live feed keep their
-    # last-known row so they don't silently disappear from the board.
+    # last-known row so they don't silently disappear from the board —
+    # UNLESS they've genuinely been validated (CFMFLG) in the meantime.
+    # The live feed already excludes not-yet-invoiced-style "still
+    # pending" filtering, so "fell out" alone doesn't distinguish "done,
+    # drop it" from "excluded for some other reason, keep it visible" — a
+    # targeted check on just this handful of DO numbers does. By explicit
+    # request: a saved,
+    # assigned DO sticks on the board indefinitely (surviving logout/login
+    # — see _active_user_sid) until it's either validated or the planner
+    # clears it by hand (drop-lane/drop-all/single cancel); the nightly
+    # reset is the only other thing that ever clears it, as a catch-all
+    # for anything genuinely never validated or cleaned up.
     fresh_known = fresh_df[fresh_df["DO NUMBER"].isin(_known)]
     refreshed_dos = set(fresh_known["DO NUMBER"])
-    old_raw_stale = old_raw[~old_raw_do.isin(refreshed_dos)]
+    _fallen_out_mask = ~old_raw_do.isin(refreshed_dos)
+    _fallen_out_dos = sorted(set(old_raw_do[_fallen_out_mask]))
+    _now_validated: set[str] = set()
+    if _fallen_out_dos:
+        try:
+            _validated_map = do_source.fetch_validation_status(_fallen_out_dos)
+            _now_validated = {d for d, v in _validated_map.items() if v}
+        except Exception:
+            pass   # DB hiccup checking validation -- fail safe, keep showing it
+    old_raw_stale = old_raw[_fallen_out_mask & ~old_raw_do.isin(_now_validated)]
 
     # old_raw carries bot.py's own derived "WEIGHT(T)" column, added to
     # sess["raw_df"] in place during the first parse — it's not part of the
@@ -1819,6 +1839,7 @@ def api_board_refetch():
     _force_manual_only_unassigned(sess)
 
     outcome["new_count"] = int(len(new_rows))
+    outcome["validated_removed_count"] = len(_now_validated)
     outcome["board"] = _board_json(sess) if sess.get("items") else None
     outcome["diagnostics"] = _diagnostics
     return _with_cookie(outcome, sid)
@@ -4292,7 +4313,11 @@ async function refetchDOs(){
     if(d.error){ setMsg('#board-msg', d.error, true); return; }
     if(d.board){ BOARD=d.board; renderBoard(); }
     const n=d.new_count||0;
-    setMsg('#board-msg', n ? `✅ Found ${n} new DO(s) — added to Unassigned.` : 'No new DOs found — everything is already on the board.', false);
+    const v=d.validated_removed_count||0;
+    const parts=[];
+    parts.push(n ? `✅ Found ${n} new DO(s) — added to Unassigned.` : 'No new DOs found — everything is already on the board.');
+    if(v) parts.push(`${v} validated DO${v===1?'':'s'} cleared off the board.`);
+    setMsg('#board-msg', parts.join(' '), false);
   } finally { btn.disabled=false; }
 }
 

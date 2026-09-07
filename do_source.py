@@ -510,6 +510,49 @@ def fetch_special_product_itemrefs(config_path: str = None) -> list[str]:
     return sorted({str(v).strip() for v in df['ITMREF_0'].dropna() if str(v).strip()})
 
 
+def fetch_validation_status(do_numbers: list[str], config_path: str = None) -> dict[str, bool]:
+    """{ DO_NUMBER: True } for every one of the given DO numbers whose real
+    Sage X3 "Validated" flag (SDELIVERY.CFMFLG, binding name isValidated —
+    confirmed via the field dictionary; distinct from INVFLG "Invoiced",
+    which this does NOT check) is set. Used by the refetch endpoint on DOs
+    that have fallen out of the live "still pending" feed to tell "this
+    one's genuinely done" apart from "temporarily excluded for some other
+    reason" — only the former should be dropped from the board rather
+    than kept visible.
+
+    CFMFLG is a 2-value Sage X3 local menu; this treats 2 as the "Yes,
+    validated" value (the standard convention for such flags: 1 = No,
+    2 = Yes) since it wasn't independently confirmed against real data —
+    verify with `SELECT SDHNUM_0, CFMFLG FROM ENGSHENG.SDELIVERY WHERE
+    SDHNUM_0 = '<a DO you know is validated>'` and adjust the comparison
+    below if the real encoding differs.
+
+    Returns {} for an empty list without touching the DB. Raises on any
+    DB/config failure, same as every other fetch here; the caller decides
+    how to surface that (the refetch endpoint treats a failure here as
+    "don't know, so don't drop anything" rather than losing real work)."""
+    if not do_numbers:
+        return {}
+    config = _load_config(config_path)
+    engine = _build_engine(config)
+    params = {f"do{i}": str(d) for i, d in enumerate(do_numbers)}
+    placeholders = ", ".join(f":{k}" for k in params)
+    query = text(f"""
+        SELECT SDHNUM_0, CFMFLG
+        FROM {SCHEMA_NAME}.SDELIVERY
+        WHERE SDHNUM_0 IN ({placeholders})
+    """)
+    df = pd.read_sql(query, engine, params=params)
+    result: dict[str, bool] = {}
+    for _, row in df.iterrows():
+        do_num = str(row["SDHNUM_0"]).strip()
+        try:
+            result[do_num] = int(row["CFMFLG"]) == 2
+        except (TypeError, ValueError):
+            result[do_num] = False
+    return result
+
+
 # ── Write path: save the board's assignments back to the ERP ────────────────
 # By explicit request. This is the only place in the whole app that writes
 # to production Sage X3 tables rather than just reading from them — treat
