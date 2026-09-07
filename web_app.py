@@ -1762,7 +1762,7 @@ def api_board_refetch():
     # Known DOs that are STILL in the live feed get the fresh row (route
     # etc. refreshed); known DOs that fell out of the live feed keep their
     # last-known row so they don't silently disappear from the board —
-    # UNLESS they've genuinely been validated (CFMFLG) in the meantime.
+    # UNLESS they've genuinely been validated (CFMFLG_0) in the meantime.
     # The live feed already excludes not-yet-invoiced-style "still
     # pending" filtering, so "fell out" alone doesn't distinguish "done,
     # drop it" from "excluded for some other reason, keep it visible" — a

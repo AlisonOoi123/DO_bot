@@ -512,7 +512,7 @@ def fetch_special_product_itemrefs(config_path: str = None) -> list[str]:
 
 def fetch_validation_status(do_numbers: list[str], config_path: str = None) -> dict[str, bool]:
     """{ DO_NUMBER: True } for every one of the given DO numbers whose real
-    Sage X3 "Validated" flag (SDELIVERY.CFMFLG, binding name isValidated —
+    Sage X3 "Validated" flag (SDELIVERY.CFMFLG_0, binding name isValidated —
     confirmed via the field dictionary; distinct from INVFLG "Invoiced",
     which this does NOT check) is set. Used by the refetch endpoint on DOs
     that have fallen out of the live "still pending" feed to tell "this
@@ -520,10 +520,10 @@ def fetch_validation_status(do_numbers: list[str], config_path: str = None) -> d
     reason" — only the former should be dropped from the board rather
     than kept visible.
 
-    CFMFLG is a 2-value Sage X3 local menu; this treats 2 as the "Yes,
+    CFMFLG_0 is a 2-value Sage X3 local menu; this treats 2 as the "Yes,
     validated" value (the standard convention for such flags: 1 = No,
     2 = Yes) since it wasn't independently confirmed against real data —
-    verify with `SELECT SDHNUM_0, CFMFLG FROM ENGSHENG.SDELIVERY WHERE
+    verify with `SELECT SDHNUM_0, CFMFLG_0 FROM ENGSHENG.SDELIVERY WHERE
     SDHNUM_0 = '<a DO you know is validated>'` and adjust the comparison
     below if the real encoding differs.
 
@@ -538,7 +538,7 @@ def fetch_validation_status(do_numbers: list[str], config_path: str = None) -> d
     params = {f"do{i}": str(d) for i, d in enumerate(do_numbers)}
     placeholders = ", ".join(f":{k}" for k in params)
     query = text(f"""
-        SELECT SDHNUM_0, CFMFLG
+        SELECT SDHNUM_0, CFMFLG_0
         FROM {SCHEMA_NAME}.SDELIVERY
         WHERE SDHNUM_0 IN ({placeholders})
     """)
@@ -547,7 +547,7 @@ def fetch_validation_status(do_numbers: list[str], config_path: str = None) -> d
     for _, row in df.iterrows():
         do_num = str(row["SDHNUM_0"]).strip()
         try:
-            result[do_num] = int(row["CFMFLG"]) == 2
+            result[do_num] = int(row["CFMFLG_0"]) == 2
         except (TypeError, ValueError):
             result[do_num] = False
     return result
